@@ -72,7 +72,8 @@ pub(crate) type KeepAlive = bool;
 pub(crate) struct Conn {
     pub client: TcpStream,
     pub local: SocketAddr,
-    listener: usize,
+    /// Address of the socket that accepted the connection.
+    listener: SocketAddr,
     served: bool,
     pub buf: Buf,
     pub ubuf: Buf,
@@ -112,7 +113,7 @@ fn host_key(raw: &[u8], out: &mut Vec<u8>) {
     out.extend(h.iter().map(u8::to_ascii_lowercase));
 }
 
-pub(crate) async fn serve(server: Arc<Server>, listener: usize, client: TcpStream) {
+pub(crate) async fn serve(server: Arc<Server>, listener: SocketAddr, client: TcpStream) {
     let _ = client.set_nodelay(true);
     let Ok(local) = client.local_addr() else {
         return;
@@ -221,7 +222,12 @@ impl Conn {
         }
 
         let host = (!self.host.is_empty()).then_some(&self.host[..]);
-        let Some(site) = active.rt.listeners[self.listener].site(host) else {
+        // The listener was removed by a swap after this connection was
+        // accepted. Its socket is closed; close the connection too.
+        let Some(listener) = active.rt.listener(self.listener) else {
+            return false;
+        };
+        let Some(site) = listener.site(host) else {
             return self.page(404).await;
         };
         let site = &active.rt.sites[site as usize];

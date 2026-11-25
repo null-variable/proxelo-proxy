@@ -9,11 +9,12 @@ The wire format between the two lives in
 
 ## Status
 
-Early development. `proxelo-proxy serve` serves HTTP/1.1 from a snapshot
-file: exact-host sites, exact and prefix routes with nginx `location` order,
+Early development. `proxelo-proxy run` receives snapshots from the control
+plane and serves them; `proxelo-proxy serve` serves a single snapshot file.
+Both serve HTTP/1.1: exact-host sites, exact and prefix routes with nginx `location` order,
 static files (`root`, `index`) and reverse proxying with smooth weighted round
 robin and keepalive upstream connections. TLS, HTTP/2, regex routes and
-snapshot delivery from the control plane are not built yet.
+the `--sim` dry-load mode are not built yet.
 
 Behaviour follows nginx defaults where the snapshot has no setting yet:
 timeouts (`client_header_timeout 60s`, `keepalive_timeout 75s`,
@@ -28,7 +29,8 @@ timeout` and the response headers nginx hides from upstreams.
 | `crates/proxy` | `proxelo-proxy` binary |
 | `crates/snapshot` | Validates snapshots and builds the runtime form (host and route lookup, resolved upstream targets) |
 | `crates/http1` | HTTP/1.1 codec: in-place parsing, strict framing, chunked decoding, path normalization |
-| `crates/server` | Accept loop, request handling, static files, proxying, upstream pools, snapshot swap |
+| `crates/server` | Accept loop, request handling, static files, proxying, upstream pools, snapshot swap, listening sockets that follow the snapshot |
+| `crates/sync` | Control plane client: receives snapshots over the control socket and acks them |
 | `fuzz` | `cargo fuzz` targets for the codec (separate workspace, nightly) |
 
 ## Build
@@ -38,7 +40,17 @@ cargo build --release
 ./target/release/proxelo-proxy version
 ./target/release/proxelo-proxy check snapshot.bin
 ./target/release/proxelo-proxy serve snapshot.bin --workers 4 --runtime per-core
+./target/release/proxelo-proxy run --data /var/lib/proxelo --socket /run/proxelo/control.sock
 ```
+
+`run` starts from the last-known-good snapshot in `<data>/proxy/lkg.snap` if
+there is one, connects to the control plane socket and reconnects with backoff
+whenever the stream ends. Each pushed snapshot is validated, built and swapped
+in, then written to the LKG file; a snapshot that fails (for example a
+listener address already in use) is acked as rejected and the previous one
+keeps serving. Listening sockets follow the snapshot: added addresses are
+bound before the swap, removed ones closed after it, unchanged ones stay open.
+Connections accepted on a removed address close at their next request.
 
 `check` builds the runtime form too, so it rejects anything `serve` would,
 including listener and target addresses that do not resolve.

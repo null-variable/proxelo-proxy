@@ -13,7 +13,7 @@ use proxelo_api::snapshot::v1::{
     self as ir, Action, HostMatch, Listener, PathMatch, ProxyAction, Route, Site, StaticAction,
     Target, Upstream, action, host_match, path_match,
 };
-use proxelo_server::Server;
+use proxelo_server::{Listeners, Server};
 use proxelo_snapshot::Runtime;
 
 fn route(kind: path_match::Kind, path: &str, action: action::Kind) -> Route {
@@ -55,7 +55,7 @@ fn snapshot(routes: Vec<Route>, upstreams: Vec<Upstream>) -> ir::Snapshot {
     ir::Snapshot {
         revision: 1,
         listeners: vec![Listener {
-            address: "127.0.0.1:0".into(),
+            address: free_addr().to_string(),
             ..Default::default()
         }],
         sites: vec![Site {
@@ -76,20 +76,30 @@ fn runtime(snap: &ir::Snapshot) -> Runtime {
     Runtime::build(snap).unwrap()
 }
 
-/// Starts the server on a background runtime and returns its address.
+/// A loopback address with a port nothing listens on right now.
+fn free_addr() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+/// Starts the server for `snap` on a background runtime and returns its
+/// address, the snapshot's first listener.
 fn start(snap: &ir::Snapshot) -> (Arc<Server>, SocketAddr) {
-    let server = Server::new(runtime(snap), 2);
-    let listener = proxelo_server::bind("127.0.0.1:0".parse().unwrap(), false, 0).unwrap();
-    let addr = listener.local_addr().unwrap();
-    let s = server.clone();
-    thread::spawn(move || {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(s.accept(0, listener))
-    });
+    let rt = runtime(snap);
+    let addr = rt.listeners[0].addrs[0];
+    let server = Server::new(Runtime::empty(), 2);
+    let workers = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut listeners = Listeners::new(vec![workers.handle().clone()], false);
+    listeners.apply(&server, rt).unwrap();
+    // The runtime and sockets live for the rest of the test process.
+    std::mem::forget(listeners);
+    std::mem::forget(workers);
     (server, addr)
 }
 
@@ -556,6 +566,7 @@ fn swap_keeps_serving_and_pools() {
         vec![upstream(&[b.addr], 4), upstream(&[a.addr], 4)],
     );
     next.revision = 2;
+    next.listeners = snap.listeners.clone();
     server.swap(runtime(&next));
     assert_eq!(server.active().rt.revision, 2);
 
@@ -572,4 +583,64 @@ fn swap_keeps_serving_and_pools() {
         1,
         "pool carried over the swap"
     );
+}
+
+#[test]
+fn apply_opens_and_closes_listeners() {
+    use path_match::Kind::Prefix;
+    let a = echo("a");
+    let first = snapshot(
+        vec![route(Prefix, "/", proxy(0))],
+        vec![upstream(&[a.addr], 4)],
+    );
+    let old_addr: SocketAddr = first.listeners[0].address.parse().unwrap();
+    let server = Server::new(Runtime::empty(), 1);
+    let workers = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut listeners = Listeners::new(vec![workers.handle().clone()], false);
+    listeners.apply(&server, runtime(&first)).unwrap();
+    assert_eq!(listeners.addrs(), vec![old_addr]);
+    let req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let mut held = client(old_addr);
+    held.write_all(req).unwrap();
+    assert!(read_response(&mut held).1.starts_with(b"a "));
+
+    // A snapshot whose listener uses an address that is taken changes
+    // nothing.
+    let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut bad = first.clone();
+    bad.revision = 2;
+    bad.listeners[0].address = taken.local_addr().unwrap().to_string();
+    assert!(listeners.apply(&server, runtime(&bad)).is_err());
+    assert_eq!(server.active().rt.revision, 1);
+    assert_eq!(listeners.addrs(), vec![old_addr]);
+
+    // Moving to a new address opens it and closes the old one.
+    let mut moved = first.clone();
+    moved.revision = 3;
+    let new_addr = free_addr();
+    moved.listeners[0].address = new_addr.to_string();
+    listeners.apply(&server, runtime(&moved)).unwrap();
+    assert_eq!(listeners.addrs(), vec![new_addr]);
+    let mut s = client(new_addr);
+    s.write_all(req).unwrap();
+    assert!(read_response(&mut s).1.starts_with(b"a "));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(old_addr).is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "old address still accepts"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    // A connection accepted on the removed address closes at its next
+    // request instead of being served by a listener that no longer exists.
+    held.write_all(req).unwrap();
+    let mut rest = Vec::new();
+    let _ = held.read_to_end(&mut rest);
+    assert!(rest.is_empty(), "{:?}", String::from_utf8_lossy(&rest));
 }

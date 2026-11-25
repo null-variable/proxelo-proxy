@@ -11,7 +11,7 @@ use proxelo_api::snapshot::v1::{
     self as ir, Action, Listener, PathMatch, ProxyAction, Route, Site, StaticAction, Target,
     Upstream, action, path_match,
 };
-use proxelo_server::Server;
+use proxelo_server::{Listeners, Server};
 use proxelo_snapshot::Runtime;
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
@@ -107,7 +107,11 @@ fn warm_requests_do_not_allocate() {
     let snap = ir::Snapshot {
         revision: 1,
         listeners: vec![Listener {
-            address: "127.0.0.1:0".into(),
+            address: TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .to_string(),
             ..Default::default()
         }],
         sites: vec![Site {
@@ -135,16 +139,16 @@ fn warm_requests_do_not_allocate() {
         ..Default::default()
     };
     proxelo_snapshot::validate(&snap).unwrap();
-    let server = Server::new(Runtime::build(&snap).unwrap(), 1);
-    let listener = proxelo_server::bind("127.0.0.1:0".parse().unwrap(), false, 0).unwrap();
-    let addr = listener.local_addr().unwrap();
-    thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(server.accept(0, listener))
-    });
+    let rt = Runtime::build(&snap).unwrap();
+    let addr = rt.listeners[0].addrs[0];
+    let server = Server::new(Runtime::empty(), 1);
+    let worker = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut listeners = Listeners::new(vec![worker.handle().clone()], false);
+    listeners.apply(&server, rt).unwrap();
+    thread::spawn(move || worker.block_on(std::future::pending::<()>()));
 
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

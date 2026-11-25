@@ -1,0 +1,20 @@
+[package]
+name = "proxelo-sync"
+description = "Receives snapshots from the Proxelo control plane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+hyper-util.workspace = true
+prost.workspace = true
+proxelo-api.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true

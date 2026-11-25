@@ -1,8 +1,11 @@
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use proxelo_server::Server;
+use proxelo_api::snapshot::v1::Snapshot;
+use proxelo_server::{Listeners, Server};
 use proxelo_snapshot::Runtime;
+use proxelo_sync::{Apply, Client};
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
@@ -16,11 +19,18 @@ const USAGE: &str = "\
 usage: proxelo-proxy <command>
 
 commands:
-  check <file>                validate a serialized snapshot
+  run [options]               serve snapshots pushed by the control plane
   serve <file> [options]      serve traffic from a serialized snapshot
+  check <file>                validate a serialized snapshot
   version                     print the version
 
-serve options:
+run options:
+  --data <dir>        data directory; the last-known-good snapshot is kept
+                      in <dir>/proxy/lkg.snap (default /var/lib/proxelo)
+  --socket <path>     control plane socket (default /run/proxelo/control.sock)
+  --node-id <id>      name reported to the control plane (default: host name)
+
+run and serve options:
   --workers <n>       worker threads (default: number of CPUs)
   --runtime <kind>    shared: one multi-threaded runtime (default)
                       per-core: one single-threaded runtime per worker";
@@ -31,6 +41,14 @@ enum RuntimeKind {
     PerCore,
 }
 
+struct Options {
+    workers: usize,
+    kind: RuntimeKind,
+    data: PathBuf,
+    socket: PathBuf,
+    node_id: Option<String>,
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -39,7 +57,7 @@ fn main() -> ExitCode {
             println!("proxelo-proxy {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        ["check", path] => match load(path) {
+        ["check", path] => match load(Path::new(path)) {
             Ok((snap, _)) => {
                 println!(
                     "ok: revision {}, {} listeners, {} sites, {} upstreams",
@@ -50,13 +68,14 @@ fn main() -> ExitCode {
                 );
                 ExitCode::SUCCESS
             }
-            Err(e) => {
-                eprintln!("{e}");
-                ExitCode::FAILURE
-            }
+            Err(e) => fail(&e),
         },
-        ["serve", path, opts @ ..] => match parse_serve(opts) {
-            Some((workers, kind)) => serve(path, workers, kind),
+        ["serve", path, opts @ ..] => match parse_options(opts, false) {
+            Some(o) => exit(serve(Path::new(path), &o)),
+            None => usage(),
+        },
+        ["run", opts @ ..] => match parse_options(opts, true) {
+            Some(o) => exit(run(o)),
             None => usage(),
         },
         _ => usage(),
@@ -68,138 +87,246 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
-fn parse_serve(mut opts: &[&str]) -> Option<(usize, RuntimeKind)> {
-    let mut workers = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let mut kind = RuntimeKind::Shared;
+fn fail(e: &str) -> ExitCode {
+    eprintln!("{e}");
+    ExitCode::FAILURE
+}
+
+fn exit(r: Result<(), String>) -> ExitCode {
+    match r {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(&e),
+    }
+}
+
+fn parse_options(mut opts: &[&str], run: bool) -> Option<Options> {
+    let mut o = Options {
+        workers: std::thread::available_parallelism().map_or(1, |n| n.get()),
+        kind: RuntimeKind::Shared,
+        data: PathBuf::from("/var/lib/proxelo"),
+        socket: PathBuf::from("/run/proxelo/control.sock"),
+        node_id: None,
+    };
     while let [flag, value, rest @ ..] = opts {
         match *flag {
-            "--workers" => workers = value.parse().ok().filter(|&n| n > 0)?,
+            "--workers" => o.workers = value.parse().ok().filter(|&n| n > 0)?,
             "--runtime" => {
-                kind = match *value {
+                o.kind = match *value {
                     "shared" => RuntimeKind::Shared,
                     "per-core" => RuntimeKind::PerCore,
                     _ => return None,
                 }
             }
+            "--data" if run => o.data = PathBuf::from(value),
+            "--socket" if run => o.socket = PathBuf::from(value),
+            "--node-id" if run && !value.is_empty() => o.node_id = Some((*value).to_owned()),
             _ => return None,
         }
         opts = rest;
     }
-    opts.is_empty().then_some((workers, kind))
+    opts.is_empty().then_some(o)
 }
 
 /// Reads, validates and builds a snapshot. Checking a snapshot builds it too,
 /// so `check` rejects what `serve` would reject.
-fn load(path: &str) -> Result<(proxelo_api::snapshot::v1::Snapshot, Runtime), String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    let snap = proxelo_snapshot::load(&bytes).map_err(|e| format!("{path}: {e}"))?;
-    let rt = Runtime::build(&snap).map_err(|e| format!("{path}: {e}"))?;
+fn load(path: &Path) -> Result<(Snapshot, Runtime), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    build(&bytes).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn build(bytes: &[u8]) -> Result<(Snapshot, Runtime), String> {
+    let snap = proxelo_snapshot::load(bytes).map_err(|e| e.to_string())?;
+    let rt = Runtime::build(&snap).map_err(|e| e.to_string())?;
     Ok((snap, rt))
 }
 
-fn serve(path: &str, workers: usize, kind: RuntimeKind) -> ExitCode {
-    let rt = match load(path) {
-        Ok((_, rt)) => rt,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    // Shared runtime: one socket per address, spread by the scheduler.
-    // Per-core: one SO_REUSEPORT socket per address and worker, so the kernel
-    // spreads connections and each stays on the thread that accepted it.
-    let per_worker = kind == RuntimeKind::PerCore;
-    let mut sockets: Vec<Vec<(usize, std::net::TcpListener)>> =
-        (0..if per_worker { workers } else { 1 })
-            .map(|_| Vec::new())
-            .collect();
-    for (i, l) in rt.listeners.iter().enumerate() {
-        for &addr in &l.addrs {
-            for slot in &mut sockets {
-                match proxelo_server::bind(addr, l.reuse_port || per_worker, l.backlog) {
-                    Ok(s) => slot.push((i, s)),
-                    Err(e) => {
-                        eprintln!("listeners[{i}]: bind {addr}: {e}");
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-        }
-    }
-    eprintln!(
-        "serving revision {} with {workers} workers ({})",
-        rt.revision,
-        if per_worker { "per-core" } else { "shared" }
-    );
-    let server = Server::new(rt, workers);
-
-    let result = if per_worker {
-        run_per_core(server, sockets)
-    } else {
-        run_shared(server, workers, sockets.pop().unwrap_or_default())
-    };
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("{e}");
-            ExitCode::FAILURE
-        }
-    }
+/// Worker runtimes. Shared: one multi-threaded runtime, sockets accepted on
+/// it and connections spread by its scheduler. Per-core: one single-threaded
+/// runtime per worker thread, each with its own SO_REUSEPORT sockets, so the
+/// kernel spreads connections and each stays on the thread that accepted it.
+struct Workers {
+    handles: Vec<tokio::runtime::Handle>,
+    // Kept alive for the life of the process.
+    _shared: Option<tokio::runtime::Runtime>,
 }
 
-fn run_shared(
-    server: Arc<Server>,
-    workers: usize,
-    sockets: Vec<(usize, std::net::TcpListener)>,
-) -> std::io::Result<()> {
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers)
-        .on_thread_start(move || {
-            proxelo_server::set_worker_id(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        })
-        .enable_all()
-        .build()?;
-    rt.block_on(async move {
-        for (i, s) in sockets {
-            tokio::spawn(server.clone().accept(i, s));
-        }
-        shutdown_signal().await
-    })
-}
-
-fn run_per_core(
-    server: Arc<Server>,
-    sockets: Vec<Vec<(usize, std::net::TcpListener)>>,
-) -> std::io::Result<()> {
-    let mut threads = Vec::new();
-    for (id, mine) in sockets.into_iter().enumerate() {
-        let server = server.clone();
+fn start_workers(n: usize, kind: RuntimeKind) -> std::io::Result<Workers> {
+    if kind == RuntimeKind::Shared {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(n)
+            .on_thread_start(move || {
+                proxelo_server::set_worker_id(
+                    next.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                );
+            })
+            .enable_all()
+            .build()?;
+        return Ok(Workers {
+            handles: vec![rt.handle().clone()],
+            _shared: Some(rt),
+        });
+    }
+    let mut handles = Vec::with_capacity(n);
+    for id in 0..n {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        threads.push(
-            std::thread::Builder::new()
-                .name(format!("worker-{id}"))
-                .spawn(move || {
-                    proxelo_server::set_worker_id(id);
-                    rt.block_on(async move {
-                        let mut tasks = Vec::new();
-                        for (i, s) in mine {
-                            tasks.push(tokio::spawn(server.clone().accept(i, s)));
-                        }
-                        for t in tasks {
-                            let _ = t.await;
-                        }
-                    });
-                })?,
-        );
+        handles.push(rt.handle().clone());
+        std::thread::Builder::new()
+            .name(format!("worker-{id}"))
+            .spawn(move || {
+                proxelo_server::set_worker_id(id);
+                // Runs the tasks spawned onto this worker until exit.
+                rt.block_on(std::future::pending::<()>());
+            })?;
     }
-    let main = tokio::runtime::Builder::new_current_thread()
+    Ok(Workers {
+        handles,
+        _shared: None,
+    })
+}
+
+fn describe(o: &Options) -> String {
+    format!(
+        "{} workers ({})",
+        o.workers,
+        if o.kind == RuntimeKind::PerCore {
+            "per-core"
+        } else {
+            "shared"
+        }
+    )
+}
+
+/// Serves one snapshot file until terminated.
+fn serve(path: &Path, o: &Options) -> Result<(), String> {
+    let (_, rt) = load(path)?;
+    let workers = start_workers(o.workers, o.kind).map_err(|e| e.to_string())?;
+    let revision = rt.revision;
+    let server = Server::new(Runtime::empty(), o.workers);
+    let mut listeners = Listeners::new(workers.handles, o.kind == RuntimeKind::PerCore);
+    listeners.apply(&server, rt).map_err(|e| e.to_string())?;
+    eprintln!("serving revision {revision} with {}", describe(o));
+    main_runtime()?
+        .block_on(shutdown_signal())
+        .map_err(|e| e.to_string())
+}
+
+/// Serves snapshots pushed by the control plane until terminated. Starts from
+/// the last-known-good snapshot when there is one, so traffic is served even
+/// while the control plane is down.
+fn run(o: Options) -> Result<(), String> {
+    let lkg = o.data.join("proxy").join("lkg.snap");
+    let workers = start_workers(o.workers, o.kind).map_err(|e| e.to_string())?;
+    let server = Server::new(Runtime::empty(), o.workers);
+    let mut node = Node {
+        server,
+        listeners: Listeners::new(workers.handles, o.kind == RuntimeKind::PerCore),
+        lkg,
+        revision: 0,
+        hash: Vec::new(),
+    };
+
+    match std::fs::read(&node.lkg) {
+        Ok(bytes) => match build(&bytes) {
+            Ok((snap, rt)) => match node.listeners.apply(&node.server, rt) {
+                Ok(()) => {
+                    node.revision = snap.revision;
+                    node.hash = snap.hash;
+                    eprintln!(
+                        "serving last-known-good revision {} from {}",
+                        node.revision,
+                        node.lkg.display()
+                    );
+                }
+                Err(e) => eprintln!("{}: {e}; waiting for the control plane", node.lkg.display()),
+            },
+            Err(e) => eprintln!("{}: {e}; waiting for the control plane", node.lkg.display()),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("no last-known-good snapshot; waiting for the control plane");
+        }
+        Err(e) => eprintln!("{}: {e}; waiting for the control plane", node.lkg.display()),
+    }
+    eprintln!("running with {}", describe(&o));
+
+    let client = Client {
+        socket: o.socket,
+        node_id: o.node_id.unwrap_or_else(hostname),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+    };
+    main_runtime()?.block_on(async move {
+        tokio::select! {
+            () = client.run(&mut node, |line| eprintln!("{line}")) => Ok(()),
+            r = shutdown_signal() => r.map_err(|e| e.to_string()),
+        }
+    })
+}
+
+/// The snapshot state of a running proxy.
+struct Node {
+    server: Arc<Server>,
+    listeners: Listeners,
+    lkg: PathBuf,
+    revision: u64,
+    hash: Vec<u8>,
+}
+
+impl Apply for Node {
+    fn active_revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn active_hash(&self) -> &[u8] {
+        &self.hash
+    }
+
+    fn apply(&mut self, snap: Snapshot, bytes: &[u8]) -> Result<(), String> {
+        proxelo_snapshot::validate(&snap).map_err(|e| e.to_string())?;
+        let rt = Runtime::build(&snap).map_err(|e| e.to_string())?;
+        self.listeners
+            .apply(&self.server, rt)
+            .map_err(|e| e.to_string())?;
+        self.revision = snap.revision;
+        self.hash = snap.hash;
+        // The snapshot is live either way; a failed write only means a
+        // restart without the control plane comes up on an older one.
+        if let Err(e) = write_atomic(&self.lkg, bytes) {
+            eprintln!("{}: {e}", self.lkg.display());
+        }
+        Ok(())
+    }
+}
+
+/// Writes `bytes` to `path` so that a crash leaves either the old file or the
+/// new one, never a torn file.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(dir)?.sync_all()
+}
+
+fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "proxy".to_owned())
+}
+
+fn main_runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?;
-    // Worker threads run until the process exits.
-    main.block_on(shutdown_signal())
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 async fn shutdown_signal() -> std::io::Result<()> {

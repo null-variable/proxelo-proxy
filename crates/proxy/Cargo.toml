@@ -18,6 +18,7 @@ mimalloc = { workspace = true, optional = true }
 proxelo-api.workspace = true
 proxelo-server.workspace = true
 proxelo-snapshot.workspace = true
+proxelo-sync.workspace = true
 tikv-jemallocator = { workspace = true, optional = true }
 tokio.workspace = true
 

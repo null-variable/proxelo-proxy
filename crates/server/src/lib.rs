@@ -8,6 +8,7 @@
 
 mod buf;
 mod conn;
+mod listeners;
 mod proxy;
 mod reply;
 mod static_file;
@@ -22,6 +23,7 @@ use arc_swap::ArcSwap;
 use proxelo_snapshot::Runtime;
 use socket2::{Domain, Protocol, Socket, Type};
 
+pub use listeners::{BindError, Listeners};
 pub use worker::set_id as set_worker_id;
 
 /// A snapshot with the upstream state built for it.
@@ -66,14 +68,19 @@ impl Server {
         self.active.store(Arc::new(build(rt, self.shards, &reuse)));
     }
 
-    /// Accepts connections on `listener` forever, serving them as listener
-    /// `index` of the snapshot. Must run inside a Tokio runtime.
-    pub async fn accept(self: Arc<Self>, index: usize, listener: TcpListener) -> io::Result<()> {
+    /// Accepts connections on `listener` forever. `addr` is the address the
+    /// socket was bound for; each request is served by the snapshot listener
+    /// with that address. Must run inside a Tokio runtime.
+    pub async fn accept(
+        self: Arc<Self>,
+        addr: SocketAddr,
+        listener: TcpListener,
+    ) -> io::Result<()> {
         let listener = tokio::net::TcpListener::from_std(listener)?;
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
-                    tokio::spawn(conn::serve(self.clone(), index, stream));
+                    tokio::spawn(conn::serve(self.clone(), addr, stream));
                 }
                 // Out of descriptors or memory: back off instead of spinning.
                 Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,

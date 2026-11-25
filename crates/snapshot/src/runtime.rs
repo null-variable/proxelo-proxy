@@ -229,6 +229,25 @@ impl Runtime {
     }
 }
 
+impl Runtime {
+    /// A runtime with nothing configured: no listeners, so no traffic. The
+    /// state of a proxy before its first snapshot.
+    pub fn empty() -> Self {
+        Self {
+            revision: 0,
+            listeners: Box::default(),
+            sites: Box::default(),
+            upstreams: Box::default(),
+        }
+    }
+
+    /// The listener bound to `addr`. Snapshots are small and a connection
+    /// looks this up once per request, so a scan beats a map here.
+    pub fn listener(&self, addr: SocketAddr) -> Option<&Listener> {
+        self.listeners.iter().find(|l| l.addrs.contains(&addr))
+    }
+}
+
 impl Listener {
     /// Finds the site for a Host value. `host` must be lowercase with any port
     /// and trailing dot removed.
