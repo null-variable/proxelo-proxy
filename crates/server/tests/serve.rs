@@ -259,15 +259,21 @@ fn dead_addr() -> SocketAddr {
     l.local_addr().unwrap()
 }
 
+/// The static file tree, written once: tests run in parallel and rewriting a
+/// file truncates it under a test that is serving it.
 fn www() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("proxelo-serve-{}", std::process::id()));
-    std::fs::create_dir_all(dir.join("docs")).unwrap();
-    std::fs::create_dir_all(dir.join("empty")).unwrap();
-    std::fs::write(dir.join("index.html"), "<h1>home</h1>").unwrap();
-    std::fs::write(dir.join("docs/index.html"), "docs").unwrap();
-    std::fs::write(dir.join("a b.txt"), "space").unwrap();
-    std::fs::write(dir.join("big.bin"), vec![7u8; 200_000]).unwrap();
-    dir
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("proxelo-serve-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        std::fs::write(dir.join("index.html"), "<h1>home</h1>").unwrap();
+        std::fs::write(dir.join("docs/index.html"), "docs").unwrap();
+        std::fs::write(dir.join("a b.txt"), "space").unwrap();
+        std::fs::write(dir.join("big.bin"), vec![7u8; 200_000]).unwrap();
+        dir
+    })
+    .clone()
 }
 
 #[test]
