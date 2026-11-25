@@ -78,8 +78,8 @@ timeout` and the response headers nginx hides from upstreams.
 ## Build
 
 ```sh
-cargo build --release      # builds the bundled PCRE2; links the system OpenSSL 3
-                           # (OPENSSL_DIR=$(brew --prefix openssl@3) on macOS)
+cargo build --release      # builds the bundled PCRE2; links OpenSSL 3 found by
+                           # pkg-config or Homebrew (or set OPENSSL_DIR)
 ./target/release/proxelo-proxy version
 ./target/release/proxelo-proxy check snapshot.bin
 ./target/release/proxelo-proxy serve snapshot.bin --workers 4 --runtime per-core
