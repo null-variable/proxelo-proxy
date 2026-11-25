@@ -4,7 +4,11 @@
 //! checks what the proxy depends on to serve traffic safely: every index points
 //! at an existing object and every match and action is fully specified.
 
+mod runtime;
+
 use std::fmt;
+
+pub use runtime::{Action, BuildError, Listener, Route, Runtime, Site, Target, Upstream};
 
 use prost::Message;
 use proxelo_api::snapshot::v1::{Snapshot, action, host_match, path_match};

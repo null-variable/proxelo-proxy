@@ -1,0 +1,22 @@
+[package]
+name = "proxelo-server"
+description = "Serves HTTP/1.1 traffic from the active snapshot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+proxelo-http1.workspace = true
+proxelo-snapshot.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+proxelo-api.workspace = true
+stats_alloc.workspace = true
+
+[lints]
+workspace = true

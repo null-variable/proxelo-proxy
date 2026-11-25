@@ -1,6 +1,6 @@
 [package]
 name = "proxelo-snapshot"
-description = "Loads a snapshot into the runtime form used by the proxy"
+description = "Validates snapshots and builds the runtime form the proxy serves from"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 proxelo-api.workspace = true
 prost.workspace = true
+foldhash.workspace = true
 
 [lints]
 workspace = true

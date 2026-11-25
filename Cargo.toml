@@ -12,6 +12,16 @@ publish = false
 [workspace.dependencies]
 proxelo-api = { git = "https://github.com/null-variable/proxelo-api", tag = "v0.0.1" }
 prost = "0.14"
+arc-swap = "1.9"
+foldhash = "0.2"
+memchr = "2.8"
+mimalloc = "0.1"
+socket2 = { version = "0.6", features = ["all"] }
+stats_alloc = "0.1"
+tikv-jemallocator = "0.7"
+tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "signal", "macros"] }
+proxelo-http1 = { path = "crates/http1" }
+proxelo-server = { path = "crates/server" }
 proxelo-snapshot = { path = "crates/snapshot" }
 
 [workspace.lints.rust]
