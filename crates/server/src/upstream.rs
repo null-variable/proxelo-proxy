@@ -159,6 +159,7 @@ mod tests {
 
     fn state(weights: &[u32]) -> State {
         let up = Upstream {
+            id: "up".into(),
             targets: weights
                 .iter()
                 .enumerate()

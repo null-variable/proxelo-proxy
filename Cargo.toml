@@ -10,9 +10,10 @@ repository = "https://github.com/null-variable/proxelo-proxy"
 publish = false
 
 [workspace.dependencies]
-proxelo-api = { git = "https://github.com/null-variable/proxelo-api", tag = "v0.2.0" }
+proxelo-api = { git = "https://github.com/null-variable/proxelo-api", tag = "v0.3.0" }
 prost = "0.14"
 arc-swap = "1.9"
+cel = { version = "0.16", default-features = false }
 foldhash = "0.2"
 hyper-util = { version = "0.1", features = ["tokio"] }
 memchr = "2.8"

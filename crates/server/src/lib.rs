@@ -8,10 +8,12 @@
 
 mod buf;
 mod conn;
+mod exchange;
 mod listeners;
 mod phases;
 mod proxy;
 mod reply;
+mod sim;
 mod static_file;
 mod upstream;
 mod worker;
@@ -25,6 +27,7 @@ use proxelo_snapshot::Runtime;
 use socket2::{Domain, Protocol, Socket, Type};
 
 pub use listeners::{BindError, Listeners};
+pub use sim::simulate;
 pub use worker::set_id as set_worker_id;
 
 /// A snapshot with the upstream state built for it.

@@ -61,7 +61,7 @@ impl Conn {
         // replayed: no body and a method that tolerates repetition
         // (`proxy_next_upstream error timeout` without `non_idempotent`).
         let replayable =
-            (self.req.body == Body::None || self.as_get) && idempotent(self.req.method);
+            (self.x.req.body == Body::None || self.x.as_get) && idempotent(self.x.req.method);
         let mut tried = 0u64;
         let mut status = 502;
         while let Some(i) = ups.pick(tried) {
@@ -92,11 +92,11 @@ impl Conn {
                 Ok(()) => return Ok(self.relay(up, pool, ups.keepalive).await),
                 Err(Fail::Client) => return Ok(false),
                 Err(Fail::BadBody) => {
-                    self.req.keep_alive = false;
+                    self.x.req.keep_alive = false;
                     return Ok(self.page(400).await);
                 }
                 Err(Fail::TooLarge) => {
-                    self.req.keep_alive = false;
+                    self.x.req.keep_alive = false;
                     return Ok(self.page(413).await);
                 }
                 Err(f) => {
@@ -119,7 +119,7 @@ impl Conn {
         if !matches!(self.body, BodyLeft::None) {
             // Part of the body went to a failed upstream; what is left cannot
             // be told apart from a next request.
-            self.req.keep_alive = false;
+            self.x.req.keep_alive = false;
         }
         Err(status)
     }
@@ -130,42 +130,42 @@ impl Conn {
     fn upstream_head(&mut self, target: SocketAddr, keepalive: bool) {
         let out = &mut self.out;
         out.clear();
-        if self.as_get {
+        if self.x.as_get {
             out.extend_from_slice(b"GET");
         } else {
-            out.extend_from_slice(self.req.method_span.get(&self.head));
+            out.extend_from_slice(self.x.req.method_span.get(&self.x.head));
         }
         out.push(b' ');
-        if self.uri_changed {
-            reply::push_uri_path(out, &self.path);
-            if !self.args.is_empty() {
+        if self.x.uri_changed {
+            reply::push_uri_path(out, &self.x.path);
+            if !self.x.args.is_empty() {
                 out.push(b'?');
-                out.extend_from_slice(&self.args);
+                out.extend_from_slice(&self.x.args);
             }
         } else {
-            out.extend_from_slice(self.req.target.get(&self.head));
+            out.extend_from_slice(self.x.req.target.get(&self.x.head));
         }
         out.extend_from_slice(b" HTTP/1.1\r\n");
         let mut has_host = false;
-        for h in self.req.headers.iter() {
+        for h in self.x.req.headers.iter() {
             // Expect is answered here, not by the upstream. A request an
             // error page turned into a GET has no body any more.
             if h.kind.is_hop_by_hop()
                 || h.kind == HeaderKind::Expect
-                || (self.as_get && h.kind == HeaderKind::ContentLength)
+                || (self.x.as_get && h.kind == HeaderKind::ContentLength)
             {
                 continue;
             }
             has_host |= h.kind == HeaderKind::Host;
-            out.extend_from_slice(h.name.get(&self.head));
+            out.extend_from_slice(h.name.get(&self.x.head));
             out.extend_from_slice(b": ");
-            out.extend_from_slice(h.value.get(&self.head));
+            out.extend_from_slice(h.value.get(&self.x.head));
             out.extend_from_slice(b"\r\n");
         }
         if !has_host {
             _ = write!(out, "Host: {target}\r\n");
         }
-        if self.req.body == Body::Chunked && !self.as_get {
+        if self.x.req.body == Body::Chunked && !self.x.as_get {
             out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
         }
         if !keepalive {
@@ -180,7 +180,7 @@ impl Conn {
         write_timeout(up, &self.out, SEND_TIMEOUT)
             .await
             .map_err(upstream_fail)?;
-        if self.req.expect_continue && !matches!(self.body, BodyLeft::None) && self.buf.end == 0 {
+        if self.x.req.expect_continue && !matches!(self.body, BodyLeft::None) && self.buf.end == 0 {
             write_timeout(
                 &mut self.client,
                 b"HTTP/1.1 100 Continue\r\n\r\n",
@@ -188,11 +188,11 @@ impl Conn {
             )
             .await
             .map_err(|_| Fail::Client)?;
-            self.req.expect_continue = false;
+            self.x.req.expect_continue = false;
         }
         self.pump_body(Some(up)).await?;
 
-        let head = self.req.method == Method::Head;
+        let head = self.x.req.method == Method::Head;
         self.ubuf.end = 0;
         loop {
             if self.ubuf.end > 0
@@ -221,8 +221,8 @@ impl Conn {
     /// Sends the upstream response to the client and pools the upstream
     /// connection when it is reusable.
     async fn relay(&mut self, mut up: TcpStream, pool: &Pool, pool_ok: bool) -> KeepAlive {
-        let client11 = self.req.version == Version::Http11;
-        let mut keep = self.req.keep_alive;
+        let client11 = self.x.req.version == Version::Http11;
+        let mut keep = self.x.req.keep_alive;
         let mode = match self.resp.body {
             Body::None => Mode::None,
             Body::Length(n) => Mode::Length(n),
@@ -242,8 +242,8 @@ impl Conn {
 
         let out = &mut self.out;
         out.clear();
-        if self.err_status != 0 {
-            reply::start(out, self.err_status, b"");
+        if self.x.err_status != 0 {
+            reply::start(out, self.x.err_status, b"");
         } else {
             reply::start(out, self.resp.status, self.resp.reason.get(&self.ubuf.data));
         }

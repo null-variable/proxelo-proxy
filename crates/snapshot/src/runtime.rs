@@ -12,6 +12,7 @@ use proxelo_api::snapshot::v1::{
     self as ir, action, error_page, host_match, path_match, rewrite, try_files,
 };
 
+use crate::cond::{Cond, Facts};
 use crate::template::Template;
 
 type Map<V> = HashMap<Box<[u8]>, V, FixedState>;
@@ -27,6 +28,7 @@ pub struct Runtime {
 
 #[derive(Debug)]
 pub struct Listener {
+    pub id: Box<str>,
     /// Every address the configured host:port resolved to.
     pub addrs: Box<[SocketAddr]>,
     pub reuse_port: bool,
@@ -78,7 +80,7 @@ impl Pattern {
     /// A match that needs more than [`MATCH_LIMIT`] steps fails instead of
     /// running on (ReDoS). PCRE2 takes the lower of this limit
     /// and one the pattern sets itself.
-    fn new(source: &str, caseless: bool) -> Result<Self, String> {
+    pub(crate) fn new(source: &str, caseless: bool) -> Result<Self, String> {
         let re = RegexBuilder::new()
             .caseless(caseless)
             .jit_if_available(true)
@@ -95,7 +97,7 @@ impl Pattern {
         &self.source
     }
 
-    fn is_match(&self, subject: &[u8]) -> Result<bool, MatchError> {
+    pub(crate) fn is_match(&self, subject: &[u8]) -> Result<bool, MatchError> {
         self.re.is_match(subject).map_err(|_| MatchError)
     }
 
@@ -145,10 +147,14 @@ impl Captures {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatchError;
 
+/// Routes sharing one path match: those with conditions in definition order,
+/// then the first one without.
+type Group = Box<[u32]>;
+
 #[derive(Debug)]
 struct Prefix {
     path: Box<[u8]>,
-    route: u32,
+    routes: Group,
     /// `^~`: when this is the longest match, regex routes are not checked.
     priority: bool,
 }
@@ -156,7 +162,7 @@ struct Prefix {
 /// The routes of one nesting level (nginx locations of one block).
 #[derive(Debug, Default)]
 struct Level {
-    exact: Map<u32>,
+    exact: Map<Group>,
     /// Prefix and priority prefix routes, longest first.
     prefixes: Box<[Prefix]>,
     /// Regex routes in definition order.
@@ -165,6 +171,7 @@ struct Level {
 
 #[derive(Debug)]
 pub struct Site {
+    pub id: Box<str>,
     top: Level,
     /// Every route: the tree in pre-order, then the named routes. Route
     /// numbers index this.
@@ -176,6 +183,8 @@ pub struct Site {
 
 #[derive(Debug)]
 pub struct Route {
+    pub id: Box<str>,
+    pub cond: Option<Cond>,
     pub action: Action,
     pub rewrites: Box<[Rewrite]>,
     pub error_pages: Box<[ErrorPage]>,
@@ -256,6 +265,7 @@ pub enum ErrorTarget {
 
 #[derive(Debug)]
 pub struct Upstream {
+    pub id: Box<str>,
     pub targets: Box<[Target]>,
     /// Idle connections kept per worker and target.
     pub keepalive_idle: u32,
@@ -337,6 +347,7 @@ impl Runtime {
             let addrs = resolve(&l.address)
                 .map_err(|error| BuildError::ListenerAddress { listener: i, error })?;
             listeners.push(Listener {
+                id: l.id.as_str().into(),
                 addrs,
                 reuse_port: l.reuse_port,
                 backlog: l.backlog,
@@ -377,6 +388,7 @@ impl Runtime {
                 b.routes.push(r);
             }
             sites.push(Site {
+                id: site.id.as_str().into(),
                 top,
                 rewrites: b.rewrites(&site.rewrites, "rewrites")?,
                 ret: match &site.r#return {
@@ -406,6 +418,7 @@ impl Runtime {
                 }));
             }
             upstreams.push(Upstream {
+                id: up.id.as_str().into(),
                 targets: targets.into(),
                 keepalive_idle: up.keepalive_idle,
             });
@@ -447,8 +460,8 @@ impl SiteBuilder {
     }
 
     fn level(&mut self, routes: &[ir::Route], field: &str) -> Result<Level, BuildError> {
-        let mut exact = Map::default();
-        let mut prefixes = Vec::new();
+        let mut exact: Map<Vec<u32>> = Map::default();
+        let mut prefixes: Vec<(Prefix, Vec<u32>)> = Vec::new();
         let mut regex = Vec::new();
         for (i, route) in routes.iter().enumerate() {
             let at = format!("{field}[{i}]");
@@ -456,15 +469,20 @@ impl SiteBuilder {
             let path = route.path.as_ref().expect("validated");
             let key: Box<[u8]> = path.value.as_bytes().into();
             match path.kind() {
-                path_match::Kind::Exact => {
-                    exact.entry(key).or_insert(r);
+                path_match::Kind::Exact => exact.entry(key).or_default().push(r),
+                kind @ (path_match::Kind::Prefix | path_match::Kind::PrefixPriority) => {
+                    match prefixes.iter_mut().find(|(p, _)| p.path == key) {
+                        Some((_, group)) => group.push(r),
+                        None => prefixes.push((
+                            Prefix {
+                                path: key,
+                                routes: Box::default(),
+                                priority: kind == path_match::Kind::PrefixPriority,
+                            },
+                            vec![r],
+                        )),
+                    }
                 }
-                kind @ (path_match::Kind::Prefix | path_match::Kind::PrefixPriority) => prefixes
-                    .push(Prefix {
-                        path: key,
-                        route: r,
-                        priority: kind == path_match::Kind::PrefixPriority,
-                    }),
                 kind @ (path_match::Kind::Regex | path_match::Kind::RegexCi) => {
                     let p = Pattern::new(&path.value, kind == path_match::Kind::RegexCi)
                         .map_err(|e| self.err(format!("{at}.path.value"), e))?;
@@ -479,15 +497,34 @@ impl SiteBuilder {
                 self.routes[r as usize].children = Some(children);
             }
         }
-        // Stable sort keeps definition order between equal prefixes, so the
-        // first one defined wins like a duplicate nginx location.
-        prefixes.sort_by_key(|p| std::cmp::Reverse(p.path.len()));
-        prefixes.dedup_by(|a, b| a.path == b.path);
+        prefixes.sort_by_key(|(p, _)| std::cmp::Reverse(p.path.len()));
+        let group = |g: Vec<u32>| self.group(g);
         Ok(Level {
-            exact,
-            prefixes: prefixes.into(),
+            exact: exact.into_iter().map(|(k, g)| (k, group(g))).collect(),
+            prefixes: prefixes
+                .into_iter()
+                .map(|(p, g)| Prefix {
+                    routes: group(g),
+                    ..p
+                })
+                .collect(),
             regex: regex.into(),
         })
+    }
+
+    /// Orders routes sharing a path: conditional ones in definition order,
+    /// then the first unconditional one, like a duplicate nginx location
+    /// where the first one wins.
+    fn group(&self, g: Vec<u32>) -> Group {
+        let plain = g
+            .iter()
+            .copied()
+            .find(|&r| self.routes[r as usize].cond.is_none());
+        g.iter()
+            .copied()
+            .filter(|&r| self.routes[r as usize].cond.is_some())
+            .chain(plain)
+            .collect()
     }
 
     /// Builds one route without its children.
@@ -519,6 +556,8 @@ impl SiteBuilder {
             None => unreachable!("validated"),
         };
         Ok(Route {
+            id: route.id.as_str().into(),
+            cond: Cond::build(route).map_err(|(f, e)| self.err(format!("{at}.{f}"), e))?,
             action,
             rewrites: self.rewrites(&route.rewrites, &format!("{at}.rewrites"))?,
             error_pages: self.error_pages(&route.error_pages, &format!("{at}.error_pages"))?,
@@ -711,33 +750,59 @@ impl Site {
     /// is `^~`, the regexes of this level are tried in definition order;
     /// otherwise the deepest prefix found wins. A regex match replaces
     /// `caps`.
-    pub fn route(&self, path: &[u8], caps: &mut Captures) -> Result<Option<u32>, MatchError> {
-        Ok(match self.find(&self.top, path, caps)? {
+    ///
+    /// Route conditions are checked once the path selected a route; a route
+    /// whose conditions fail is skipped as if its path did not match.
+    pub fn route(&self, f: &dyn Facts, caps: &mut Captures) -> Result<Option<u32>, MatchError> {
+        Ok(match self.find(&self.top, f, caps)? {
             Found::None => None,
             Found::Prefix(r) | Found::Final(r) => Some(r),
         })
     }
 
-    fn find(&self, level: &Level, path: &[u8], caps: &mut Captures) -> Result<Found, MatchError> {
-        if let Some(&r) = level.exact.get(path) {
+    /// The first route of `group` whose conditions hold.
+    fn pick(&self, group: &[u32], f: &dyn Facts) -> Result<Option<u32>, MatchError> {
+        for &r in group {
+            match &self.routes[r as usize].cond {
+                Some(c) if !c.holds(f)? => {}
+                _ => return Ok(Some(r)),
+            }
+        }
+        Ok(None)
+    }
+
+    fn find(&self, level: &Level, f: &dyn Facts, caps: &mut Captures) -> Result<Found, MatchError> {
+        let path = f.path();
+        if let Some(g) = level.exact.get(path)
+            && let Some(r) = self.pick(g, f)?
+        {
             return Ok(Found::Final(r));
         }
         let mut found = Found::None;
         let mut noregex = false;
-        if let Some(p) = level.prefixes.iter().find(|p| path.starts_with(&p.path)) {
-            found = Found::Prefix(p.route);
+        for p in level.prefixes.iter().filter(|p| path.starts_with(&p.path)) {
+            let Some(r) = self.pick(&p.routes, f)? else {
+                continue;
+            };
+            found = Found::Prefix(r);
             noregex = p.priority;
-            if let Some(children) = &self.routes[p.route as usize].children {
-                match self.find(children, path, caps)? {
+            if let Some(children) = &self.routes[r as usize].children {
+                match self.find(children, f, caps)? {
                     Found::Final(r) => return Ok(Found::Final(r)),
                     Found::Prefix(r) => found = Found::Prefix(r),
                     Found::None => {}
                 }
             }
+            break;
         }
         if !noregex {
             for (p, r) in &level.regex {
-                if p.captures(path, caps)? {
+                if p.captures(path, caps)?
+                    && self.routes[*r as usize]
+                        .cond
+                        .as_ref()
+                        .map_or(Ok(true), |c| c.holds(f))?
+                {
                     return Ok(Found::Final(*r));
                 }
             }
@@ -749,6 +814,36 @@ impl Site {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A GET for a path, without headers.
+    struct Path<'a, P: AsRef<[u8]> + ?Sized>(&'a P);
+
+    impl<P: AsRef<[u8]> + ?Sized> Facts for Path<'_, P> {
+        fn method(&self) -> &[u8] {
+            b"GET"
+        }
+        fn path(&self) -> &[u8] {
+            self.0.as_ref()
+        }
+        fn uri(&self) -> &[u8] {
+            self.0.as_ref()
+        }
+        fn args(&self) -> &[u8] {
+            b""
+        }
+        fn host(&self) -> &[u8] {
+            b""
+        }
+        fn scheme(&self) -> &[u8] {
+            b"http"
+        }
+        fn remote_addr(&self) -> std::net::IpAddr {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        }
+        fn find_header(&self, _: &mut dyn FnMut(&[u8], &[u8]) -> bool) -> bool {
+            false
+        }
+    }
     use proxelo_api::snapshot::v1::{
         Action as IrAction, HostMatch, Listener as IrListener, PathMatch, ProxyAction,
         Route as IrRoute, Site as IrSite, StaticAction, Target as IrTarget, Upstream as IrUpstream,
@@ -868,24 +963,27 @@ mod tests {
         );
         let rt = Runtime::build(&snap).unwrap();
         let s = &rt.sites[0];
-        assert_eq!(s.route(b"/", &mut Captures::default()), Ok(Some(0)));
+        assert_eq!(s.route(&Path(b"/"), &mut Captures::default()), Ok(Some(0)));
         assert_eq!(
-            s.route(b"/index.html", &mut Captures::default()),
+            s.route(&Path(b"/index.html"), &mut Captures::default()),
             Ok(Some(0))
         );
-        assert_eq!(s.route(b"/api", &mut Captures::default()), Ok(Some(0)));
         assert_eq!(
-            s.route(b"/api/", &mut Captures::default()),
+            s.route(&Path(b"/api"), &mut Captures::default()),
+            Ok(Some(0))
+        );
+        assert_eq!(
+            s.route(&Path(b"/api/"), &mut Captures::default()),
             Ok(Some(2)),
             "exact wins over prefix"
         );
         assert_eq!(
-            s.route(b"/api/x", &mut Captures::default()),
+            s.route(&Path(b"/api/x"), &mut Captures::default()),
             Ok(Some(1)),
             "first duplicate prefix wins"
         );
         assert_eq!(
-            s.route(b"/api/v1/x", &mut Captures::default()),
+            s.route(&Path(b"/api/v1/x"), &mut Captures::default()),
             Ok(Some(3)),
             "longest prefix wins"
         );
@@ -969,38 +1067,41 @@ mod tests {
         let rt = Runtime::build(&snap).unwrap();
         let s = &rt.sites[0];
         assert_eq!(
-            s.route(b"/logo.png", &mut Captures::default()),
+            s.route(&Path(b"/logo.png"), &mut Captures::default()),
             Ok(Some(5)),
             "exact before regex"
         );
         assert_eq!(
-            s.route(b"/static/a.php", &mut Captures::default()),
+            s.route(&Path(b"/static/a.php"), &mut Captures::default()),
             Ok(Some(1)),
             "^~ skips regex"
         );
         assert_eq!(
-            s.route(b"/static/deep/a.php", &mut Captures::default()),
+            s.route(&Path(b"/static/deep/a.php"), &mut Captures::default()),
             Ok(Some(2)),
             "longer plain prefix does not stop regex"
         );
         assert_eq!(
-            s.route(b"/images/a.PNG", &mut Captures::default()),
+            s.route(&Path(b"/images/a.PNG"), &mut Captures::default()),
             Ok(Some(3)),
             "regex beats prefix"
         );
         assert_eq!(
-            s.route(b"/a.png", &mut Captures::default()),
+            s.route(&Path(b"/a.png"), &mut Captures::default()),
             Ok(Some(3)),
             "first regex in order"
         );
-        assert_eq!(s.route(b"/a.Png", &mut Captures::default()), Ok(Some(3)));
         assert_eq!(
-            s.route(b"/a.PHP", &mut Captures::default()),
+            s.route(&Path(b"/a.Png"), &mut Captures::default()),
+            Ok(Some(3))
+        );
+        assert_eq!(
+            s.route(&Path(b"/a.PHP"), &mut Captures::default()),
             Ok(Some(0)),
             "~ is case-sensitive"
         );
         assert_eq!(
-            s.route(b"/images/a.gif", &mut Captures::default()),
+            s.route(&Path(b"/images/a.gif"), &mut Captures::default()),
             Ok(Some(4)),
             "longest prefix"
         );
@@ -1020,13 +1121,13 @@ mod tests {
         let mut path = b"/".to_vec();
         path.extend([b'a'; 40]);
         assert_eq!(
-            rt.sites[0].route(&path, &mut Captures::default()),
+            rt.sites[0].route(&Path(&path), &mut Captures::default()),
             Ok(Some(0))
         );
         path.push(b'b');
         let start = std::time::Instant::now();
         assert_eq!(
-            rt.sites[0].route(&path, &mut Captures::default()),
+            rt.sites[0].route(&Path(&path), &mut Captures::default()),
             Err(MatchError)
         );
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
@@ -1071,7 +1172,10 @@ mod tests {
             None,
         );
         let rt = Runtime::build(&snap).unwrap();
-        assert_eq!(rt.sites[0].route(b"/y", &mut Captures::default()), Ok(None));
+        assert_eq!(
+            rt.sites[0].route(&Path(b"/y"), &mut Captures::default()),
+            Ok(None)
+        );
     }
 
     #[test]

@@ -23,10 +23,16 @@ Both serve HTTP/1.1:
   `permanent`, captures `$1`..`$9`), `return`, `error_page` (internal
   redirect, named route or redirect, once per request) and `try_files`, with
   nginx variables such as `$uri`, `$args`, `$host` and `$arg_name`.
+- Route conditions after the path match: methods, headers, query arguments
+  and a CEL expression (standard library and network extension); routes with
+  the same path are tried in order, then the one without conditions.
+- `proxelo-proxy sim`: the dry-load helper the control plane uses to validate
+  snapshots and simulate requests with this engine (same parser, site lookup
+  and phases; proxying reports the upstream instead of connecting).
 - Static files (`root`, `index`) and reverse proxying with smooth weighted
   round robin and keepalive upstream connections.
 
-TLS, HTTP/2 and the `--sim` dry-load mode are not built yet.
+TLS and HTTP/2 are not built yet.
 
 Behaviour follows nginx defaults where the snapshot has no setting yet:
 timeouts (`client_header_timeout 60s`, `keepalive_timeout 75s`,
@@ -39,9 +45,9 @@ timeout` and the response headers nginx hides from upstreams.
 | Crate | Purpose |
 |---|---|
 | `crates/proxy` | `proxelo-proxy` binary |
-| `crates/snapshot` | Validates snapshots and builds the runtime form (host and route lookup with PCRE2, resolved upstream targets) |
+| `crates/snapshot` | Validates snapshots and builds the runtime form (host and route lookup with PCRE2, route conditions with CEL, templates, resolved upstream targets) |
 | `crates/http1` | HTTP/1.1 codec: in-place parsing, strict framing, chunked decoding, path normalization |
-| `crates/server` | Accept loop, request handling, static files, proxying, upstream pools, snapshot swap, listening sockets that follow the snapshot |
+| `crates/server` | Accept loop, request phases (shared with the simulator), static files, proxying, upstream pools, snapshot swap, listening sockets that follow the snapshot |
 | `crates/sync` | Control plane client: receives snapshots over the control socket and acks them |
 | `fuzz` | `cargo fuzz` targets for the codec (separate workspace, nightly) |
 

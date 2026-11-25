@@ -12,6 +12,7 @@ proxelo-api.workspace = true
 prost.workspace = true
 foldhash.workspace = true
 pcre2.workspace = true
+cel.workspace = true
 
 [lints]
 workspace = true

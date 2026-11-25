@@ -22,6 +22,9 @@ commands:
   run [options]               serve snapshots pushed by the control plane
   serve <file> [options]      serve traffic from a serialized snapshot
   check <file>                validate a serialized snapshot
+  sim                         dry-load helper for the control plane: reads
+                              length-delimited proxelo.sim.v1.SimRequest
+                              messages on stdin, answers SimResponse on stdout
   version                     print the version
 
 run options:
@@ -74,6 +77,7 @@ fn main() -> ExitCode {
             Some(o) => exit(serve(Path::new(path), &o)),
             None => usage(),
         },
+        ["sim"] => exit(sim()),
         ["run", opts @ ..] => match parse_options(opts, true) {
             Some(o) => exit(run(o)),
             None => usage(),
@@ -138,6 +142,85 @@ fn build(bytes: &[u8]) -> Result<(Snapshot, Runtime), String> {
     let snap = proxelo_snapshot::load(bytes).map_err(|e| e.to_string())?;
     let rt = Runtime::build(&snap).map_err(|e| e.to_string())?;
     Ok((snap, rt))
+}
+
+/// Runtimes the simulator keeps, by snapshot bytes: the active revision and
+/// a draft are compared back and forth without rebuilding either.
+const SIM_CACHE: usize = 4;
+
+/// The dry-load helper: loads snapshots exactly as `run` does
+/// and runs requests through the serving phases. One response per request
+/// message, until stdin closes.
+fn sim() -> Result<(), String> {
+    use std::io::Write;
+
+    use prost::Message;
+    use proxelo_api::sim::v1::{SimRequest, SimResponse};
+
+    let mut input = std::io::stdin().lock();
+    let mut output = std::io::stdout().lock();
+    // Snapshots are small; equal bytes are what makes a cached build reusable.
+    let mut cache: Vec<(Vec<u8>, Runtime)> = Vec::new();
+    while let Some(msg) = read_frame(&mut input).map_err(|e| e.to_string())? {
+        let req = SimRequest::decode(msg.as_slice()).map_err(|e| e.to_string())?;
+        let mut resp = SimResponse::default();
+        if let Some(i) = cache.iter().position(|(b, _)| *b == req.snapshot) {
+            let entry = cache.remove(i);
+            cache.push(entry);
+        } else {
+            match build(&req.snapshot) {
+                Ok((_, rt)) => {
+                    if cache.len() == SIM_CACHE {
+                        cache.remove(0);
+                    }
+                    cache.push((req.snapshot, rt));
+                }
+                Err(e) => resp.error = e,
+            }
+        }
+        if resp.error.is_empty()
+            && let Some((_, rt)) = cache.last()
+        {
+            resp.results = req
+                .requests
+                .iter()
+                .map(|r| proxelo_server::simulate(rt, r))
+                .collect();
+        }
+        output
+            .write_all(&resp.encode_length_delimited_to_vec())
+            .and_then(|()| output.flush())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Largest simulator message accepted, a bound on what a bad length prefix
+/// can make the helper allocate.
+const MAX_FRAME: u64 = 64 << 20;
+
+/// Reads one varint length-prefixed message; `None` at end of input.
+fn read_frame(r: &mut impl std::io::Read) -> std::io::Result<Option<Vec<u8>>> {
+    let mut len = 0u64;
+    for shift in (0..64).step_by(7) {
+        let mut b = [0u8];
+        if r.read(&mut b)? == 0 {
+            if shift == 0 {
+                return Ok(None);
+            }
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        len |= u64::from(b[0] & 0x7f) << shift;
+        if b[0] & 0x80 == 0 {
+            if len > MAX_FRAME {
+                return Err(std::io::Error::other("message too large"));
+            }
+            let mut msg = vec![0; len as usize];
+            r.read_exact(&mut msg)?;
+            return Ok(Some(msg));
+        }
+    }
+    Err(std::io::Error::other("bad length prefix"))
 }
 
 /// Worker runtimes. Shared: one multi-threaded runtime, sockets accepted on

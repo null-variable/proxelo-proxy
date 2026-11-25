@@ -9,15 +9,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use proxelo_http1::{
-    Body, ChunkedDecoder, Error as ParseError, Method, Request, Response, normalize_path,
-    parse_request, request_line_complete,
+    Body, ChunkedDecoder, Error as ParseError, Method, Response, parse_request, push_u64,
+    request_line_complete,
 };
-use proxelo_snapshot::{Captures, MatchError};
+use proxelo_snapshot::MatchError;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::buf::Buf;
+use crate::exchange::Exchange;
+use crate::phases::{Outcome, Phases};
 use crate::{Active, Server, reply};
 
 // nginx defaults.
@@ -68,60 +70,21 @@ pub(crate) type KeepAlive = bool;
 
 pub(crate) struct Conn {
     pub client: TcpStream,
-    pub local: SocketAddr,
-    pub peer: SocketAddr,
     /// Address of the socket that accepted the connection.
     listener: SocketAddr,
     served: bool,
     pub buf: Buf,
     pub ubuf: Buf,
-    /// The current request head, copied out of `buf` so pipelined bytes can
-    /// move up while the request is handled.
-    pub head: Vec<u8>,
-    pub req: Request,
     pub resp: Response,
     pub body: BodyLeft,
     pub out: Vec<u8>,
-    /// Lowercase host without port, empty when the request has none.
-    pub host: Vec<u8>,
-    /// Decoded, normalized path.
-    pub path: Vec<u8>,
-    /// Query string without `?`.
-    pub args: Vec<u8>,
-    pub scratch: Vec<u8>,
-    /// Expanded templates.
-    pub tmpl: Vec<u8>,
-    /// Groups of the last regex that matched in this request.
-    pub caps: Captures,
-    /// `path` or `args` differ from the request target.
-    pub uri_changed: bool,
-    /// An error page took over this request; another error is answered
-    /// directly.
-    pub error_paged: bool,
-    /// Status set by an error page for the final response, 0 for none.
-    pub err_status: u16,
-    /// An error page turned the request into a GET.
-    pub as_get: bool,
+    /// The request being handled.
+    pub x: Exchange,
 }
 
 /// nginx keeps the connection after an error page except for these.
 pub(crate) fn keeps_alive(status: u16) -> bool {
     !matches!(status, 400 | 413 | 414 | 500 | 501)
-}
-
-/// Lowercases `raw` into `out` without the port and a trailing dot.
-fn host_key(raw: &[u8], out: &mut Vec<u8>) {
-    let end = if raw.first() == Some(&b'[') {
-        raw.iter()
-            .position(|&c| c == b']')
-            .map_or(raw.len(), |i| i + 1)
-    } else {
-        raw.iter().position(|&c| c == b':').unwrap_or(raw.len())
-    };
-    let h = &raw[..end];
-    let h = h.strip_suffix(b".").unwrap_or(h);
-    out.clear();
-    out.extend(h.iter().map(u8::to_ascii_lowercase));
 }
 
 pub(crate) async fn serve(server: Arc<Server>, listener: SocketAddr, client: TcpStream) {
@@ -131,27 +94,14 @@ pub(crate) async fn serve(server: Arc<Server>, listener: SocketAddr, client: Tcp
     };
     let mut c = Conn {
         client,
-        local,
-        peer,
         listener,
         served: false,
         buf: Buf::new(),
         ubuf: Buf::new(),
-        head: Vec::new(),
-        req: Request::default(),
         resp: Response::default(),
         body: BodyLeft::None,
         out: Vec::new(),
-        host: Vec::new(),
-        path: Vec::new(),
-        args: Vec::new(),
-        scratch: Vec::new(),
-        tmpl: Vec::new(),
-        caps: Captures::default(),
-        uri_changed: false,
-        error_paged: false,
-        err_status: 0,
-        as_get: false,
+        x: Exchange::new(local, peer),
     };
     loop {
         match c.read_head().await {
@@ -175,7 +125,7 @@ impl Conn {
     /// connection ended or timed out; nginx closes silently then.
     async fn read_head(&mut self) -> Result<bool, ParseError> {
         loop {
-            if self.buf.end > 0 && parse_request(self.buf.filled(), &mut self.req)? {
+            if self.buf.end > 0 && parse_request(self.buf.filled(), &mut self.x.req)? {
                 return Ok(true);
             }
             if self.buf.end >= MAX_HEADER {
@@ -211,51 +161,97 @@ impl Conn {
     }
 
     async fn handle(&mut self, active: &Active) -> KeepAlive {
-        let head_len = self.req.head_len;
-        self.head.clear();
-        self.head.extend_from_slice(&self.buf.data[..head_len]);
+        let head_len = self.x.req.head_len;
+        self.x.head.clear();
+        self.x.head.extend_from_slice(&self.buf.data[..head_len]);
         self.buf.consume(head_len);
-        self.caps.clear();
-        self.uri_changed = false;
-        self.error_paged = false;
-        self.err_status = 0;
-        self.as_get = false;
-        self.body = match self.req.body {
+        self.body = match self.x.req.body {
             Body::Length(n) => BodyLeft::Length(n),
             Body::Chunked => BodyLeft::Chunked(ChunkedDecoder::new(), 0),
             Body::None | Body::Close => BodyLeft::None,
         };
 
-        if let Body::Length(n) = self.req.body
+        if let Body::Length(n) = self.x.req.body
             && n > MAX_BODY
         {
             return self.page(413).await;
         }
-        match self.req.host {
-            Some(h) => host_key(h.get(&self.head), &mut self.host),
-            None => self.host.clear(),
+        if let Err(status) = self.x.begin() {
+            return self.page(status).await;
         }
-        if normalize_path(self.req.path.get(&self.head), &mut self.path).is_err() {
-            return self.page(400).await;
-        }
-        self.args.clear();
-        let target = self.req.target.get(&self.head);
-        if let Some(q) = target.iter().position(|&c| c == b'?') {
-            self.args.extend_from_slice(&target[q + 1..]);
-        }
-
-        let host = (!self.host.is_empty()).then_some(&self.host[..]);
         // The listener was removed by a swap after this connection was
         // accepted. Its socket is closed; close the connection too.
         let Some(listener) = active.rt.listener(self.listener) else {
             return false;
         };
-        let site = match listener.site(host) {
+        let site = match listener.site(self.x.host()) {
             Ok(Some(site)) => site,
             Ok(None) => return self.page(404).await,
             Err(MatchError) => return self.page(500).await,
         };
-        self.run(active, &active.rt.sites[site as usize]).await
+        let mut phases = Phases::new(&active.rt.sites[site as usize], false);
+        loop {
+            return match phases.run(&mut self.x) {
+                Outcome::Proxy(u) => {
+                    // An error page made this a GET; its body is not sent on.
+                    if self.x.as_get && self.pump_body(None).await.is_err() {
+                        return false;
+                    }
+                    match self.proxy(&active.upstreams[u as usize]).await {
+                        Ok(keep) => keep,
+                        Err(status) => {
+                            phases.fail(status);
+                            continue;
+                        }
+                    }
+                }
+                Outcome::Text(status) => self.send_text(status).await,
+                Outcome::Redirect(status) => self.send_redirect(status).await,
+                Outcome::Page(status) => self.page(status).await,
+                Outcome::File(f, m) => self.send_file(f, &m).await,
+                Outcome::Directory => self.redirect_dir().await,
+                Outcome::Close => false,
+            };
+        }
+    }
+
+    /// Answers `status` with the body in `tmpl`.
+    async fn send_text(&mut self, status: u16) -> KeepAlive {
+        let status = self.x.status(status);
+        let keep = self.x.req.keep_alive;
+        let out = &mut self.out;
+        out.clear();
+        reply::start(out, status, b"");
+        if !self.x.tmpl.is_empty() {
+            out.extend_from_slice(b"Content-Type: text/plain\r\n");
+        }
+        out.extend_from_slice(b"Content-Length: ");
+        push_u64(out, self.x.tmpl.len() as u64);
+        out.extend_from_slice(b"\r\n");
+        reply::connection(out, keep);
+        out.extend_from_slice(b"\r\n");
+        if self.x.req.method != Method::Head {
+            out.extend_from_slice(&self.x.tmpl);
+        }
+        self.respond(keep).await
+    }
+
+    /// Redirects to the Location in `tmpl`, made absolute with the request
+    /// host and port when it is a path (nginx `absolute_redirect on`).
+    async fn send_redirect(&mut self, status: u16) -> KeepAlive {
+        let status = self.x.status(status);
+        let keep = self.x.req.keep_alive && keeps_alive(status);
+        let out = &mut self.out;
+        out.clear();
+        reply::start(out, status, b"");
+        out.extend_from_slice(b"Location: ");
+        if self.x.tmpl.starts_with(b"/") {
+            reply::push_origin(out, &self.x.host, self.x.local);
+        }
+        reply::push_header_value(out, &self.x.tmpl);
+        out.extend_from_slice(b"\r\n");
+        reply::page(out, status, keep, self.x.req.method == Method::Head);
+        self.respond(keep).await
     }
 
     /// Reads the rest of the request body. With `up` the bytes are forwarded
@@ -321,29 +317,15 @@ impl Conn {
     }
 
     pub async fn page(&mut self, status: u16) -> KeepAlive {
-        let keep = self.req.keep_alive && keeps_alive(status);
+        let keep = self.x.req.keep_alive && keeps_alive(status);
         self.out.clear();
         reply::start(&mut self.out, status, b"");
-        reply::page(&mut self.out, status, keep, self.req.method == Method::Head);
+        reply::page(
+            &mut self.out,
+            status,
+            keep,
+            self.x.req.method == Method::Head,
+        );
         self.respond(keep).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn host_keys() {
-        let mut out = Vec::new();
-        for (raw, want) in [
-            (&b"Example.COM"[..], &b"example.com"[..]),
-            (b"example.com:8080", b"example.com"),
-            (b"example.com.", b"example.com"),
-            (b"[::1]:80", b"[::1]"),
-        ] {
-            host_key(raw, &mut out);
-            assert_eq!(out, want);
-        }
     }
 }

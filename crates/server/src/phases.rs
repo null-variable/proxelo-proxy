@@ -3,9 +3,14 @@
 //! rewrites), precontent (try_files), content. Internal redirects re-enter at
 //! server_rewrite, `rewrite last` at find_route and named routes at rewrite,
 //! with the same request.
+//!
+//! The phases decide without network I/O and stop at an [`Outcome`]; serving
+//! sends it and the simulator reports it. Only a proxy outcome can come back:
+//! when the upstream fails, [`Phases::fail`] continues with the error pages.
 
 use std::ffi::OsStr;
-use std::io::Write as _;
+use std::fs::{File, Metadata};
+use std::io::{self, Write as _};
 use std::os::unix::ffi::OsStrExt;
 
 use proxelo_http1::{Method, push_u64};
@@ -14,14 +19,30 @@ use proxelo_snapshot::{
     Template, TryFiles, Var,
 };
 
-use crate::conn::{Conn, KeepAlive, keeps_alive};
-use crate::static_file::Static;
-use crate::{Active, reply};
+use crate::exchange::{Exchange, to_get};
 
 /// URI changes per request (rewrites that re-search the route and internal
 /// redirects) before answering 500, as nginx's "rewrite or internal
 /// redirection cycle".
 const MAX_URI_CHANGES: usize = 10;
+
+/// What the request ends with.
+pub(crate) enum Outcome {
+    /// `return` with a body, in `tmpl`.
+    Text(u16),
+    /// A redirect to the Location in `tmpl`; a path is made absolute.
+    Redirect(u16),
+    /// The built-in page for the status.
+    Page(u16),
+    /// A static file; its file system path is in `scratch`.
+    File(File, Metadata),
+    /// A directory without a trailing slash: 301 to the path with one.
+    Directory,
+    /// Proxy to this upstream.
+    Proxy(u32),
+    /// Close without a response (444).
+    Close,
+}
 
 enum Next {
     /// Internal redirect: site rewrites, then find the route.
@@ -32,7 +53,6 @@ enum Next {
     Route(u32, bool),
     /// The status is answered with the error pages in effect.
     Error(u16),
-    Done(KeepAlive),
 }
 
 /// Outcome of a list of rewrites.
@@ -47,103 +67,170 @@ enum Rw {
     Redirect(u16),
 }
 
+/// A phase either ends the request or moves it on.
+type Step = Result<Outcome, Next>;
+
 fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
-impl Conn {
-    pub(crate) async fn run(&mut self, active: &Active, site: &Site) -> KeepAlive {
-        let mut next = Next::Server;
-        let mut pages: &[ErrorPage] = &site.error_pages;
-        let mut changes = 0;
+/// Where a request is in the phases of one site.
+pub(crate) struct Phases<'s> {
+    site: &'s Site,
+    next: Next,
+    pages: &'s [ErrorPage],
+    changes: usize,
+    /// The route that produced the outcome, if any.
+    pub route: Option<u32>,
+    /// Steps taken, for the simulator. `None` when serving.
+    pub trace: Option<Vec<String>>,
+}
+
+impl<'s> Phases<'s> {
+    pub fn new(site: &'s Site, trace: bool) -> Self {
+        Self {
+            site,
+            next: Next::Server,
+            pages: &site.error_pages,
+            changes: 0,
+            route: None,
+            trace: trace.then(Vec::new),
+        }
+    }
+
+    fn note(&mut self, f: impl FnOnce() -> String) {
+        if let Some(t) = &mut self.trace {
+            t.push(f());
+        }
+    }
+
+    /// A proxy outcome failed with 502 or 504: the error pages apply.
+    pub fn fail(&mut self, status: u16) {
+        self.note(|| format!("upstream failed: {status}"));
+        self.next = Next::Error(status);
+    }
+
+    /// Counts a URI change; past the limit the request ends with 500.
+    fn too_many_changes(&mut self) -> bool {
+        self.changes += 1;
+        let over = self.changes > MAX_URI_CHANGES + 1;
+        if over {
+            self.note(|| "rewrite or internal redirection cycle".into());
+        }
+        over
+    }
+
+    /// Runs the phases until the request has an outcome.
+    pub fn run(&mut self, x: &mut Exchange) -> Outcome {
+        let site = self.site;
         loop {
-            next = match next {
-                Next::Done(keep) => return keep,
-                Next::Server => {
-                    changes += 1;
-                    if changes > MAX_URI_CHANGES + 1 {
-                        return self.page(500).await;
-                    }
-                    pages = &site.error_pages;
-                    match self.rewrite(&site.rewrites) {
-                        Ok(Rw::Continue | Rw::Changed) => match &site.ret {
-                            Some(r) => self.ret(r).await,
-                            None => Next::Find,
-                        },
-                        // `last` in a server block acts like `break`.
-                        Ok(Rw::Last | Rw::Break) => Next::Find,
-                        Ok(Rw::Redirect(s)) => Next::Done(self.send_redirect(s).await),
-                        Err(MatchError) => Next::Error(500),
-                    }
-                }
-                Next::Find => match site.route(&self.path, &mut self.caps) {
-                    Ok(Some(r)) => Next::Route(r, false),
-                    Ok(None) => Next::Error(404),
-                    Err(MatchError) => Next::Error(500),
-                },
-                Next::Route(r, named) => {
-                    let route = &site.routes[r as usize];
-                    pages = &route.error_pages;
-                    match self.rewrite(&route.rewrites) {
-                        // A named route is never searched for, so `last`
-                        // cannot leave it.
-                        Ok(Rw::Last | Rw::Changed) if !named => {
-                            changes += 1;
-                            if changes > MAX_URI_CHANGES + 1 {
-                                return self.page(500).await;
-                            }
-                            Next::Find
+            let step = match self.next {
+                Next::Server => self.server(x),
+                Next::Find => {
+                    // The route lookup reads the request and replaces the
+                    // captures, which live in it too.
+                    let mut caps = std::mem::take(&mut x.caps);
+                    let found = site.route(x, &mut caps);
+                    x.caps = caps;
+                    match found {
+                        Ok(Some(r)) => Err(Next::Route(r, false)),
+                        Ok(None) => {
+                            self.note(|| "no route".into());
+                            Err(Next::Error(404))
                         }
-                        Ok(Rw::Redirect(s)) => Next::Done(self.send_redirect(s).await),
-                        Ok(_) => self.content(active, &route.action).await,
-                        Err(MatchError) => Next::Error(500),
+                        Err(MatchError) => Err(Next::Error(500)),
                     }
                 }
-                Next::Error(status) => self.error_page(status, pages).await,
+                Next::Route(r, named) => self.route(x, r, named),
+                Next::Error(status) => self.error_page(x, status),
+            };
+            match step {
+                Ok(o) => return o,
+                Err(next) => self.next = next,
             }
         }
     }
 
-    async fn content(&mut self, active: &Active, action: &Action) -> Next {
-        match action {
-            Action::Return(r) => self.ret(r).await,
-            Action::Proxy { upstream } => {
-                match self.proxy(&active.upstreams[*upstream as usize]).await {
-                    Ok(keep) => Next::Done(keep),
-                    Err(status) => Next::Error(status),
+    fn server(&mut self, x: &mut Exchange) -> Step {
+        if self.too_many_changes() {
+            return Ok(Outcome::Page(500));
+        }
+        let site = self.site;
+        self.pages = &site.error_pages;
+        self.route = None;
+        match self.rewrite(x, &site.rewrites) {
+            Ok(Rw::Continue | Rw::Changed) => match &site.ret {
+                Some(r) => self.ret(x, r),
+                None => Err(Next::Find),
+            },
+            // `last` in a server block acts like `break`.
+            Ok(Rw::Last | Rw::Break) => Err(Next::Find),
+            Ok(Rw::Redirect(s)) => Ok(Outcome::Redirect(s)),
+            Err(MatchError) => Err(Next::Error(500)),
+        }
+    }
+
+    fn route(&mut self, x: &mut Exchange, r: u32, named: bool) -> Step {
+        let route = &self.site.routes[r as usize];
+        self.route = Some(r);
+        self.pages = &route.error_pages;
+        self.note(|| {
+            let kind = if named { "named route" } else { "route" };
+            format!("{kind} {}", route.id)
+        });
+        match self.rewrite(x, &route.rewrites) {
+            // A named route is never searched for, so `last` cannot leave it.
+            Ok(Rw::Last | Rw::Changed) if !named => {
+                if self.too_many_changes() {
+                    return Ok(Outcome::Page(500));
                 }
+                Err(Next::Find)
             }
+            Ok(Rw::Redirect(s)) => Ok(Outcome::Redirect(s)),
+            Ok(_) => self.content(x, &route.action),
+            Err(MatchError) => Err(Next::Error(500)),
+        }
+    }
+
+    fn content(&mut self, x: &mut Exchange, action: &Action) -> Step {
+        match action {
+            Action::Return(r) => self.ret(x, r),
+            Action::Proxy { upstream } => Ok(Outcome::Proxy(*upstream)),
             Action::Static {
                 root,
                 index,
                 try_files,
             } => {
-                if !matches!(self.req.method, Method::Get | Method::Head) {
-                    return Next::Error(405);
+                if !matches!(x.req.method, Method::Get | Method::Head) {
+                    return Err(Next::Error(405));
                 }
                 if let Some(t) = try_files
-                    && !self.try_files(root, t)
+                    && !self.try_files(x, root, t)
                 {
-                    return match &t.fallback {
+                    return Err(match &t.fallback {
                         Fallback::Uri(u) => {
                             // nginx keeps only the arguments the fallback
                             // names, as in "/index.php?$args".
-                            self.expand(u);
-                            self.set_uri(false);
+                            expand(x, u);
+                            set_uri(x, false);
+                            self.note(|| {
+                                format!("try_files fallback {}", String::from_utf8_lossy(&x.path))
+                            });
                             Next::Server
                         }
                         Fallback::Status(s) => Next::Error(*s),
                         Fallback::Route(r) => Next::Route(*r, true),
-                    };
+                    });
                 }
-                match self.resolve_static(root, index) {
+                match resolve_static(x, root, index) {
                     Static::Index => {
-                        self.uri_changed = true;
-                        Next::Server
+                        x.uri_changed = true;
+                        self.note(|| format!("index {}", String::from_utf8_lossy(&x.path)));
+                        Err(Next::Server)
                     }
-                    Static::File(f, m) => Next::Done(self.send_file(f, &m).await),
-                    Static::Directory => Next::Done(self.redirect_dir().await),
-                    Static::Status(s) => Next::Error(s),
+                    Static::File(f, m) => Ok(Outcome::File(f, m)),
+                    Static::Directory => Ok(Outcome::Directory),
+                    Static::Status(s) => Err(Next::Error(s)),
                 }
             }
         }
@@ -152,58 +239,60 @@ impl Conn {
     /// nginx error_page: the first page listing `status` turns the response
     /// into an internal redirect, a named route or a redirect, once per
     /// request (`recursive_error_pages off`).
-    async fn error_page(&mut self, status: u16, pages: &[ErrorPage]) -> Next {
-        let page = match pages.iter().find(|p| p.codes.contains(&status)) {
-            Some(p) if !self.error_paged => p,
-            _ => return Next::Done(self.page(status).await),
+    fn error_page(&mut self, x: &mut Exchange, status: u16) -> Step {
+        let page = match self.pages.iter().find(|p| p.codes.contains(&status)) {
+            Some(p) if !x.error_paged => p,
+            _ => return Ok(Outcome::Page(status)),
         };
-        self.error_paged = true;
+        x.error_paged = true;
         if let ErrorTarget::Uri(u) = &page.target {
-            self.expand(u);
-            if !self.tmpl.starts_with(b"/") {
+            expand(x, u);
+            if !x.tmpl.starts_with(b"/") {
                 let code = match page.status {
                     Some(s) if is_redirect(s) => s,
                     _ => 302,
                 };
-                return Next::Done(self.send_redirect(code).await);
+                return Ok(Outcome::Redirect(code));
             }
         }
-        self.err_status = page.status.unwrap_or(status);
+        x.err_status = page.status.unwrap_or(status);
         // The redirected request is a GET without a body, unless HEAD.
-        if self.req.method != Method::Head {
-            if self.pump_body(None).await.is_err() {
-                return Next::Done(false);
-            }
-            self.req.method = Method::Get;
-            self.as_get = true;
-        }
-        match &page.target {
+        to_get(x);
+        Err(match &page.target {
             ErrorTarget::Uri(_) => {
-                self.set_uri(false);
+                set_uri(x, false);
+                self.note(|| format!("error_page {status} {}", String::from_utf8_lossy(&x.path)));
                 Next::Server
             }
-            ErrorTarget::Route(r) => Next::Route(*r, true),
-        }
+            ErrorTarget::Route(r) => {
+                self.note(|| format!("error_page {status}"));
+                Next::Route(*r, true)
+            }
+        })
     }
 
     /// Runs rewrites against the current path. A match replaces the captures.
-    fn rewrite(&mut self, rules: &[Rewrite]) -> Result<Rw, MatchError> {
+    fn rewrite(&mut self, x: &mut Exchange, rules: &[Rewrite]) -> Result<Rw, MatchError> {
         let mut changed = false;
         for rule in rules {
-            if !rule.regex.captures(&self.path, &mut self.caps)? {
+            if !rule.regex.captures(&x.path, &mut x.caps)? {
                 continue;
             }
-            self.expand(&rule.replacement);
+            expand(x, &rule.replacement);
+            self.note(|| {
+                format!(
+                    "rewrite {} -> {}",
+                    rule.regex.source(),
+                    String::from_utf8_lossy(&x.tmpl)
+                )
+            });
             if rule.absolute || matches!(rule.flag, RewriteFlag::Redirect | RewriteFlag::Permanent)
             {
-                if rule.add_args && !self.args.is_empty() {
-                    let sep = if self.tmpl.contains(&b'?') {
-                        b'&'
-                    } else {
-                        b'?'
-                    };
-                    self.tmpl.push(sep);
-                    self.tmpl.extend_from_slice(&self.args);
+                if rule.add_args && !x.args.is_empty() {
+                    let sep = if x.tmpl.contains(&b'?') { b'&' } else { b'?' };
+                    x.tmpl.push(sep);
+                    let Exchange { tmpl, args, .. } = x;
+                    tmpl.extend_from_slice(args);
                 }
                 return Ok(Rw::Redirect(if rule.flag == RewriteFlag::Permanent {
                     301
@@ -211,7 +300,7 @@ impl Conn {
                     302
                 }));
             }
-            self.set_uri(rule.add_args);
+            set_uri(x, rule.add_args);
             changed = true;
             match rule.flag {
                 RewriteFlag::Last => return Ok(Rw::Last),
@@ -222,42 +311,21 @@ impl Conn {
         Ok(if changed { Rw::Changed } else { Rw::Continue })
     }
 
-    /// Makes the URI in `tmpl` the current one. A `?` in it starts new
-    /// arguments, followed by the old ones when `add_args`; without one the
-    /// old arguments stay when `add_args`.
-    fn set_uri(&mut self, add_args: bool) {
-        self.uri_changed = true;
-        match self.tmpl.iter().position(|&c| c == b'?') {
-            Some(q) => {
-                self.scratch.clear();
-                self.scratch.extend_from_slice(&self.tmpl[q + 1..]);
-                if add_args && !self.args.is_empty() {
-                    self.scratch.push(b'&');
-                    self.scratch.extend_from_slice(&self.args);
-                }
-                std::mem::swap(&mut self.args, &mut self.scratch);
-                self.tmpl.truncate(q);
-            }
-            None if !add_args => self.args.clear(),
-            None => {}
-        }
-        std::mem::swap(&mut self.path, &mut self.tmpl);
-    }
-
     /// nginx try_files: the first name that exists under `root` becomes the
     /// path; a name ending in `/` must be a directory, any other a file.
-    fn try_files(&mut self, root: &[u8], t: &TryFiles) -> bool {
+    fn try_files(&mut self, x: &mut Exchange, root: &[u8], t: &TryFiles) -> bool {
         for name in &t.files {
-            self.expand(name);
-            let file = &mut self.scratch;
+            expand(x, name);
+            let file = &mut x.scratch;
             file.clear();
             file.extend_from_slice(root);
-            file.extend_from_slice(&self.tmpl);
-            let dir = self.tmpl.ends_with(b"/");
+            file.extend_from_slice(&x.tmpl);
+            let dir = x.tmpl.ends_with(b"/");
             if std::fs::metadata(OsStr::from_bytes(file)).is_ok_and(|m| m.is_dir() == dir) {
-                if self.tmpl != self.path {
-                    std::mem::swap(&mut self.path, &mut self.tmpl);
+                if x.tmpl != x.path {
+                    std::mem::swap(&mut x.path, &mut x.tmpl);
                 }
+                self.note(|| format!("try_files {}", String::from_utf8_lossy(&x.path)));
                 return true;
             }
         }
@@ -265,131 +333,147 @@ impl Conn {
     }
 
     /// nginx return. 444 closes the connection without an answer.
-    async fn ret(&mut self, r: &Return) -> Next {
+    fn ret(&mut self, x: &mut Exchange, r: &Return) -> Step {
         if r.status == 444 {
-            return Next::Done(false);
+            return Ok(Outcome::Close);
         }
         if is_redirect(r.status) {
-            self.expand(&r.text);
-            return Next::Done(self.send_redirect(r.status).await);
+            expand(x, &r.text);
+            return Ok(Outcome::Redirect(r.status));
         }
         if r.text.parts().is_empty() && r.status >= 300 {
-            return Next::Error(r.status);
+            return Err(Next::Error(r.status));
         }
-        self.expand(&r.text);
-        Next::Done(self.send_text(r.status).await)
+        expand(x, &r.text);
+        Ok(Outcome::Text(r.status))
     }
+}
 
-    /// Answers `status` with the body in `tmpl`.
-    async fn send_text(&mut self, status: u16) -> KeepAlive {
-        let status = self.status(status);
-        let keep = self.req.keep_alive;
-        let out = &mut self.out;
-        out.clear();
-        reply::start(out, status, b"");
-        if !self.tmpl.is_empty() {
-            out.extend_from_slice(b"Content-Type: text/plain\r\n");
+/// Makes the URI in `tmpl` the current one. A `?` in it starts new arguments,
+/// followed by the old ones when `add_args`; without one the old arguments
+/// stay when `add_args`.
+fn set_uri(x: &mut Exchange, add_args: bool) {
+    x.uri_changed = true;
+    match x.tmpl.iter().position(|&c| c == b'?') {
+        Some(q) => {
+            x.scratch.clear();
+            x.scratch.extend_from_slice(&x.tmpl[q + 1..]);
+            if add_args && !x.args.is_empty() {
+                x.scratch.push(b'&');
+                x.scratch.extend_from_slice(&x.args);
+            }
+            std::mem::swap(&mut x.args, &mut x.scratch);
+            x.tmpl.truncate(q);
         }
-        out.extend_from_slice(b"Content-Length: ");
-        push_u64(out, self.tmpl.len() as u64);
-        out.extend_from_slice(b"\r\n");
-        reply::connection(out, keep);
-        out.extend_from_slice(b"\r\n");
-        if self.req.method != Method::Head {
-            out.extend_from_slice(&self.tmpl);
-        }
-        self.respond(keep).await
+        None if !add_args => x.args.clear(),
+        None => {}
     }
+    std::mem::swap(&mut x.path, &mut x.tmpl);
+}
 
-    /// Redirects to the Location in `tmpl`, made absolute with the request
-    /// host and port when it is a path (nginx `absolute_redirect on`).
-    pub(crate) async fn send_redirect(&mut self, status: u16) -> KeepAlive {
-        let status = self.status(status);
-        let keep = self.req.keep_alive && keeps_alive(status);
-        let out = &mut self.out;
-        out.clear();
-        reply::start(out, status, b"");
-        out.extend_from_slice(b"Location: ");
-        if self.tmpl.starts_with(b"/") {
-            reply::push_origin(out, &self.host, self.local);
+pub(crate) enum Static {
+    File(File, Metadata),
+    /// An index file exists; `path` was extended and is routed again.
+    Index,
+    /// A directory addressed without a trailing slash.
+    Directory,
+    Status(u16),
+}
+
+/// nginx `root` + `index`. The file system path is left in `scratch`.
+fn resolve_static(x: &mut Exchange, root: &[u8], index: &[Box<[u8]>]) -> Static {
+    let file = &mut x.scratch;
+    file.clear();
+    file.extend_from_slice(root);
+    file.extend_from_slice(&x.path);
+    if x.path.ends_with(b"/") {
+        let dir = file.len();
+        for name in index {
+            file.truncate(dir);
+            file.extend_from_slice(name);
+            if std::fs::metadata(OsStr::from_bytes(file)).is_ok_and(|m| !m.is_dir()) {
+                x.path.extend_from_slice(name);
+                return Static::Index;
+            }
         }
-        reply::push_header_value(out, &self.tmpl);
-        out.extend_from_slice(b"\r\n");
-        reply::page(out, status, keep, self.req.method == Method::Head);
-        self.respond(keep).await
+        file.truncate(dir);
+        // nginx answers 403 for an existing directory without an index.
+        return match std::fs::metadata(OsStr::from_bytes(file)) {
+            Ok(m) if m.is_dir() => Static::Status(403),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Static::Status(403),
+            _ => Static::Status(404),
+        };
     }
-
-    /// The status to send: the one an error page set, if any.
-    pub(crate) fn status(&self, status: u16) -> u16 {
-        if self.err_status != 0 {
-            self.err_status
-        } else {
-            status
-        }
+    match File::open(OsStr::from_bytes(file)) {
+        Ok(f) => match f.metadata() {
+            Ok(m) if m.is_dir() => Static::Directory,
+            Ok(m) => Static::File(f, m),
+            Err(_) => Static::Status(500),
+        },
+        Err(e) => Static::Status(match e.kind() {
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => 404,
+            io::ErrorKind::PermissionDenied => 403,
+            _ => 500,
+        }),
     }
+}
 
-    /// Expands `t` into `tmpl`.
-    fn expand(&mut self, t: &Template) {
-        let mut out = std::mem::take(&mut self.tmpl);
-        out.clear();
-        for part in t.parts() {
-            match part {
-                Part::Lit(l) => out.extend_from_slice(l),
-                Part::Var(v) => self.var(*v, &mut out),
-                Part::Header(name) => {
-                    if let Some(h) = self
-                        .req
-                        .headers
-                        .iter()
-                        .find(|h| h.name.get(&self.head).eq_ignore_ascii_case(name))
-                    {
-                        out.extend_from_slice(h.value.get(&self.head));
-                    }
+/// Expands `t` into `tmpl`.
+pub(crate) fn expand(x: &mut Exchange, t: &Template) {
+    let mut out = std::mem::take(&mut x.tmpl);
+    out.clear();
+    for part in t.parts() {
+        match part {
+            Part::Lit(l) => out.extend_from_slice(l),
+            Part::Var(v) => var(x, *v, &mut out),
+            Part::Header(name) => {
+                if let Some(v) = x.request_header(name) {
+                    out.extend_from_slice(v);
                 }
-                Part::Arg(name) => {
-                    if let Some(v) = self.args.split(|&c| c == b'&').find_map(|kv| {
-                        let (k, v) = kv.split_at(kv.iter().position(|&c| c == b'=')?);
-                        k.eq_ignore_ascii_case(name).then_some(&v[1..])
-                    }) {
-                        out.extend_from_slice(v);
-                    }
+            }
+            Part::Arg(name) => {
+                if let Some(v) = x.args.split(|&c| c == b'&').find_map(|kv| {
+                    let (k, v) = kv.split_at(kv.iter().position(|&c| c == b'=')?);
+                    k.eq_ignore_ascii_case(name).then_some(&v[1..])
+                }) {
+                    out.extend_from_slice(v);
                 }
             }
         }
-        self.tmpl = out;
     }
+    x.tmpl = out;
+}
 
-    fn var(&self, v: Var, out: &mut Vec<u8>) {
-        match v {
-            Var::Uri => out.extend_from_slice(&self.path),
-            Var::Args => out.extend_from_slice(&self.args),
-            Var::IsArgs => {
-                if !self.args.is_empty() {
-                    out.push(b'?');
-                }
+fn var(x: &Exchange, v: Var, out: &mut Vec<u8>) {
+    match v {
+        Var::Uri => out.extend_from_slice(&x.path),
+        Var::Args => out.extend_from_slice(&x.args),
+        Var::IsArgs => {
+            if !x.args.is_empty() {
+                out.push(b'?');
             }
-            Var::RequestUri => out.extend_from_slice(self.req.target.get(&self.head)),
-            Var::Host => {
-                if self.host.is_empty() {
-                    _ = write!(out, "{}", self.local.ip());
-                } else {
-                    out.extend_from_slice(&self.host);
-                }
+        }
+        Var::RequestUri => out.extend_from_slice(x.req.target.get(&x.head)),
+        Var::Host => {
+            if x.host.is_empty() {
+                _ = write!(out, "{}", x.local.ip());
+            } else {
+                out.extend_from_slice(&x.host);
             }
-            Var::Scheme => out.extend_from_slice(b"http"),
-            Var::RequestMethod => {
-                if self.as_get {
-                    out.extend_from_slice(b"GET");
-                } else {
-                    out.extend_from_slice(self.req.method_span.get(&self.head));
-                }
+        }
+        Var::Scheme => out.extend_from_slice(b"http"),
+        Var::RequestMethod => {
+            if x.as_get {
+                out.extend_from_slice(b"GET");
+            } else {
+                out.extend_from_slice(x.req.method_span.get(&x.head));
             }
-            Var::ServerPort => push_u64(out, u64::from(self.local.port())),
-            Var::RemoteAddr => _ = write!(out, "{}", self.peer.ip()),
-            Var::Capture(i) => {
-                if let Some(c) = self.caps.get(usize::from(i)) {
-                    out.extend_from_slice(c);
-                }
+        }
+        Var::ServerPort => push_u64(out, u64::from(x.local.port())),
+        Var::RemoteAddr => _ = write!(out, "{}", x.peer.ip()),
+        Var::Capture(i) => {
+            if let Some(c) = x.caps.get(usize::from(i)) {
+                out.extend_from_slice(c);
             }
         }
     }

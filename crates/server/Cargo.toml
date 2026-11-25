@@ -9,13 +9,13 @@ publish.workspace = true
 
 [dependencies]
 arc-swap.workspace = true
+proxelo-api.workspace = true
 proxelo-http1.workspace = true
 proxelo-snapshot.workspace = true
 socket2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-proxelo-api.workspace = true
 stats_alloc.workspace = true
 
 [lints]

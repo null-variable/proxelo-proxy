@@ -4,11 +4,13 @@
 //! checks what the proxy depends on to serve traffic safely: every index points
 //! at an existing object and every match and action is fully specified.
 
+mod cond;
 mod runtime;
 mod template;
 
 use std::fmt;
 
+pub use cond::{Cond, Facts};
 pub use runtime::{
     Action, BuildError, Captures, ErrorPage, ErrorTarget, Fallback, Listener, MatchError, Pattern,
     Return, Rewrite, RewriteFlag, Route, Runtime, Site, Target, TryFiles, Upstream,

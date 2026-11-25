@@ -15,6 +15,7 @@ mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 mimalloc = { workspace = true, optional = true }
+prost.workspace = true
 proxelo-api.workspace = true
 proxelo-server.workspace = true
 proxelo-snapshot.workspace = true
