@@ -1,0 +1,44 @@
+[package]
+name = "proxelo-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+proxelo-http1 = { path = "../crates/http1" }
+
+# Not part of the main workspace: cargo-fuzz needs nightly and sanitizer flags.
+[workspace]
+
+[[bin]]
+name = "request"
+path = "fuzz_targets/request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "response"
+path = "fuzz_targets/response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunked"
+path = "fuzz_targets/chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path"
+path = "fuzz_targets/path.rs"
+test = false
+doc = false
+bench = false

@@ -21,6 +21,24 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --release --workspace
+      - run: cargo build --release -p proxelo-proxy --features jemalloc
+      - run: cargo build --release -p proxelo-proxy --features mimalloc
+
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [request, response, chunked, path]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      # Smoke run on every push; the 1-hour run before a release is the
+      # same command with -max_total_time=3600.
+      - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=120
 
   deny:
     runs-on: ubuntu-latest
