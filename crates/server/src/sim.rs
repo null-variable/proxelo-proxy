@@ -56,7 +56,11 @@ pub fn simulate(rt: &Runtime, r: &HttpRequest) -> SimResult {
     let mut head = format!("{method} {target} HTTP/1.1\r\n");
     // HTTP/1.1 requires Host; without one, send what a client connecting to
     // the listener address would.
-    if !r.headers.iter().any(|h| h.name.eq_ignore_ascii_case("host")) {
+    if !r
+        .headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("host"))
+    {
         head.push_str(&format!("Host: {local}\r\n"));
     }
     for h in &r.headers {
