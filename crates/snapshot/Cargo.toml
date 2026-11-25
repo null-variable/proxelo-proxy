@@ -1,0 +1,15 @@
+[package]
+name = "proxelo-snapshot"
+description = "Loads a snapshot into the runtime form used by the proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+proxelo-api.workspace = true
+prost.workspace = true
+
+[lints]
+workspace = true
