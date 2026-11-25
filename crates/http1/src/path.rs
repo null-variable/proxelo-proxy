@@ -103,7 +103,9 @@ mod tests {
 
     #[test]
     fn rejects() {
-        for raw in ["", "a", "/..", "/a/../..", "/%2e%2e", "/%zz", "/%4", "/%00", "/(\0}"] {
+        for raw in [
+            "", "a", "/..", "/a/../..", "/%2e%2e", "/%zz", "/%4", "/%00", "/(\0}",
+        ] {
             assert_eq!(norm(raw), Err(Error::BadRequest), "{raw}");
         }
     }
