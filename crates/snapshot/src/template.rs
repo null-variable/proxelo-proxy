@@ -1,0 +1,179 @@
+//! nginx-style value templates: literal text, `$variables` and `$0`..`$9`.
+//!
+//! Parsing happens once when a snapshot is built; the request path only walks
+//! the parts.
+
+use std::fmt;
+
+/// A variable whose value comes from the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Var {
+    /// `$uri`, `$document_uri`: the current normalized path.
+    Uri,
+    /// `$args`, `$query_string`.
+    Args,
+    /// `?` when there are arguments.
+    IsArgs,
+    /// `$request_uri`: the target as the client sent it.
+    RequestUri,
+    Host,
+    Scheme,
+    RequestMethod,
+    ServerPort,
+    RemoteAddr,
+    /// `$0`..`$9`: groups of the last regex that matched.
+    Capture(u8),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Part {
+    Lit(Box<[u8]>),
+    Var(Var),
+    /// `$http_<name>`, with the lowercase header name using `-`.
+    Header(Box<[u8]>),
+    /// `$arg_<name>`.
+    Arg(Box<[u8]>),
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Template {
+    parts: Box<[Part]>,
+    source: Box<str>,
+}
+
+impl fmt::Debug for Template {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Template({:?})", self.source)
+    }
+}
+
+impl Template {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let b = s.as_bytes();
+        let mut parts = Vec::new();
+        let mut lit = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] != b'$' {
+                lit.push(b[i]);
+                i += 1;
+                continue;
+            }
+            i += 1;
+            let var = if let Some(&d) = b.get(i).filter(|c| c.is_ascii_digit()) {
+                // nginx takes one digit: "$10" is $1 followed by "0".
+                i += 1;
+                Part::Var(Var::Capture(d - b'0'))
+            } else {
+                let braced = b.get(i) == Some(&b'{');
+                if braced {
+                    i += 1;
+                }
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                if start == i {
+                    return Err(format!("{s:?}: '$' must be followed by a variable name"));
+                }
+                let name = &s[start..i];
+                if braced {
+                    if b.get(i) != Some(&b'}') {
+                        return Err(format!("{s:?}: missing '}}' after ${{{name}"));
+                    }
+                    i += 1;
+                }
+                var(name).ok_or_else(|| format!("{s:?}: unknown variable ${name}"))?
+            };
+            if !lit.is_empty() {
+                parts.push(Part::Lit(std::mem::take(&mut lit).into()));
+            }
+            parts.push(var);
+        }
+        if !lit.is_empty() {
+            parts.push(Part::Lit(lit.into()));
+        }
+        Ok(Self {
+            parts: parts.into(),
+            source: s.into(),
+        })
+    }
+
+    pub fn parts(&self) -> &[Part] {
+        &self.parts
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn uses_captures(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|p| matches!(p, Part::Var(Var::Capture(_))))
+    }
+}
+
+fn var(name: &str) -> Option<Part> {
+    let v = match name {
+        "uri" | "document_uri" => Var::Uri,
+        "args" | "query_string" => Var::Args,
+        "is_args" => Var::IsArgs,
+        "request_uri" => Var::RequestUri,
+        "host" => Var::Host,
+        "scheme" => Var::Scheme,
+        "request_method" => Var::RequestMethod,
+        "server_port" => Var::ServerPort,
+        "remote_addr" => Var::RemoteAddr,
+        _ => {
+            if let Some(h) = name.strip_prefix("http_").filter(|h| !h.is_empty()) {
+                let h: Vec<u8> = h
+                    .bytes()
+                    .map(|c| match c {
+                        b'_' => b'-',
+                        c => c.to_ascii_lowercase(),
+                    })
+                    .collect();
+                return Some(Part::Header(h.into()));
+            }
+            if let Some(a) = name.strip_prefix("arg_").filter(|a| !a.is_empty()) {
+                return Some(Part::Arg(a.as_bytes().into()));
+            }
+            return None;
+        }
+    };
+    Some(Part::Var(v))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_nginx_syntax() {
+        let t = Template::parse("/x/$1${uri}?a=$arg_id&h=$http_X_Real_IP$10").unwrap();
+        assert_eq!(
+            t.parts(),
+            &[
+                Part::Lit((*b"/x/").into()),
+                Part::Var(Var::Capture(1)),
+                Part::Var(Var::Uri),
+                Part::Lit((*b"?a=").into()),
+                Part::Arg((*b"id").into()),
+                Part::Lit((*b"&h=").into()),
+                Part::Header((*b"x-real-ip").into()),
+                Part::Var(Var::Capture(1)),
+                Part::Lit((*b"0").into()),
+            ]
+        );
+        assert!(t.uses_captures());
+        assert!(!Template::parse("$uri/").unwrap().uses_captures());
+    }
+
+    #[test]
+    fn rejects_bad_variables() {
+        for bad in ["$", "a$", "${uri", "$nope", "$http_", "${}"] {
+            assert!(Template::parse(bad).is_err(), "{bad}");
+        }
+    }
+}

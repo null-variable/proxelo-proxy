@@ -9,6 +9,7 @@
 mod buf;
 mod conn;
 mod listeners;
+mod phases;
 mod proxy;
 mod reply;
 mod static_file;

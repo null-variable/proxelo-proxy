@@ -5,15 +5,21 @@
 //! at an existing object and every match and action is fully specified.
 
 mod runtime;
+mod template;
 
 use std::fmt;
 
 pub use runtime::{
-    Action, BuildError, Listener, MatchError, Pattern, Route, Runtime, Site, Target, Upstream,
+    Action, BuildError, Captures, ErrorPage, ErrorTarget, Fallback, Listener, MatchError, Pattern,
+    Return, Rewrite, RewriteFlag, Route, Runtime, Site, Target, TryFiles, Upstream,
 };
+pub use template::{Part, Template, Var};
 
 use prost::Message;
-use proxelo_api::snapshot::v1::{Snapshot, action, host_match, path_match};
+use proxelo_api::snapshot::v1::{
+    ErrorPage as IrErrorPage, ReturnAction, Route as IrRoute, Snapshot, action, error_page,
+    host_match, path_match, try_files,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum LoadError {
@@ -30,18 +36,12 @@ pub enum LoadError {
         site: usize,
         host: usize,
     },
-    UnspecifiedPath {
+    /// A field of a site; `field` is the path below the site, for example
+    /// `routes[1].children[0].action`.
+    Site {
         site: usize,
-        route: usize,
-    },
-    MissingAction {
-        site: usize,
-        route: usize,
-    },
-    ProxyUpstream {
-        site: usize,
-        route: usize,
-        upstream: u32,
+        field: String,
+        error: &'static str,
     },
     EmptyUpstream {
         upstream: usize,
@@ -61,31 +61,107 @@ impl fmt::Display for LoadError {
             Self::UnspecifiedHost { site, host } => {
                 write!(f, "sites[{site}].hostnames[{host}]: kind is unspecified")
             }
-            Self::UnspecifiedPath { site, route } => {
-                write!(
-                    f,
-                    "sites[{site}].routes[{route}].path: missing or unspecified"
-                )
-            }
-            Self::MissingAction { site, route } => {
-                write!(f, "sites[{site}].routes[{route}].action: missing")
-            }
-            Self::ProxyUpstream {
-                site,
-                route,
-                upstream,
-            } => {
-                write!(
-                    f,
-                    "sites[{site}].routes[{route}].action.proxy: no upstream {upstream}"
-                )
-            }
+            Self::Site { site, field, error } => write!(f, "sites[{site}].{field}: {error}"),
             Self::EmptyUpstream { upstream } => write!(f, "upstreams[{upstream}]: no targets"),
         }
     }
 }
 
 impl std::error::Error for LoadError {}
+
+type Invalid = (String, &'static str);
+
+/// Checks of the routes of one site.
+struct SiteCheck {
+    upstreams: usize,
+    named: usize,
+}
+
+impl SiteCheck {
+    fn routes(&self, routes: &[IrRoute], at: &str, matched: bool) -> Result<(), Invalid> {
+        for (i, r) in routes.iter().enumerate() {
+            self.route(r, &format!("{at}[{i}]"), matched)?;
+        }
+        Ok(())
+    }
+
+    fn route(&self, route: &IrRoute, at: &str, matched: bool) -> Result<(), Invalid> {
+        let kind = route.path.as_ref().map(|p| p.kind());
+        if matched {
+            match kind {
+                Some(path_match::Kind::Unspecified) | None => {
+                    return Err((format!("{at}.path"), "missing or unspecified"));
+                }
+                Some(path_match::Kind::Prefix | path_match::Kind::PrefixPriority) => {}
+                Some(_) if !route.children.is_empty() => {
+                    return Err((format!("{at}.children"), "only prefix routes have children"));
+                }
+                Some(_) => {}
+            }
+        }
+        match route.action.as_ref().and_then(|a| a.kind.as_ref()) {
+            None => return Err((format!("{at}.action"), "missing")),
+            Some(action::Kind::Proxy(p)) if p.upstream as usize >= self.upstreams => {
+                return Err((format!("{at}.action.proxy.upstream"), "no such upstream"));
+            }
+            Some(action::Kind::Static(st)) => {
+                if let Some(t) = &st.try_files {
+                    let at = format!("{at}.action.static.try_files");
+                    if t.files.is_empty() {
+                        return Err((format!("{at}.files"), "empty"));
+                    }
+                    match t.fallback {
+                        None => return Err((at, "fallback is missing")),
+                        Some(try_files::Fallback::Named(n)) if n as usize >= self.named => {
+                            return Err((format!("{at}.named"), "no such named route"));
+                        }
+                        Some(try_files::Fallback::Status(c)) if !(100..=999).contains(&c) => {
+                            return Err((format!("{at}.status"), "must be 100-999"));
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+            Some(action::Kind::Return(r)) => check_return(r, format!("{at}.action.return"))?,
+            Some(action::Kind::Proxy(_)) => {}
+        }
+        self.error_pages(&route.error_pages, &format!("{at}.error_pages"))?;
+        if matched {
+            self.routes(&route.children, &format!("{at}.children"), true)?;
+        }
+        Ok(())
+    }
+
+    fn error_pages(&self, eps: &[IrErrorPage], at: &str) -> Result<(), Invalid> {
+        for (i, e) in eps.iter().enumerate() {
+            let at = format!("{at}[{i}]");
+            if e.codes.is_empty() || e.codes.iter().any(|c| !(300..=599).contains(c)) {
+                return Err((format!("{at}.codes"), "must be 300-599"));
+            }
+            match e.target {
+                None => return Err((at, "target is missing")),
+                Some(error_page::Target::Named(n)) if n as usize >= self.named => {
+                    return Err((format!("{at}.named"), "no such named route"));
+                }
+                Some(_) => {}
+            }
+            if let Some(c) = e.status
+                && c != 0
+                && !(100..=999).contains(&c)
+            {
+                return Err((format!("{at}.status"), "must be 0 or 100-999"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn check_return(r: &ReturnAction, at: String) -> Result<(), Invalid> {
+    if r.status > 999 {
+        return Err((format!("{at}.status"), "must be 0-999"));
+    }
+    Ok(())
+}
 
 /// Decodes and validates a serialized snapshot.
 pub fn load(bytes: &[u8]) -> Result<Snapshot, LoadError> {
@@ -117,23 +193,27 @@ pub fn validate(snap: &Snapshot) -> Result<(), LoadError> {
                 return Err(LoadError::UnspecifiedHost { site: s, host: h });
             }
         }
-        for (r, route) in site.routes.iter().enumerate() {
-            match &route.path {
-                Some(p) if p.kind() != path_match::Kind::Unspecified => {}
-                _ => return Err(LoadError::UnspecifiedPath { site: s, route: r }),
-            }
-            match route.action.as_ref().and_then(|a| a.kind.as_ref()) {
-                None => return Err(LoadError::MissingAction { site: s, route: r }),
-                Some(action::Kind::Proxy(p)) if p.upstream as usize >= upstreams => {
-                    return Err(LoadError::ProxyUpstream {
-                        site: s,
-                        route: r,
-                        upstream: p.upstream,
-                    });
+        let v = SiteCheck {
+            upstreams,
+            named: site.named_routes.len(),
+        };
+        let at = |field: String, error| LoadError::Site {
+            site: s,
+            field,
+            error,
+        };
+        v.routes(&site.routes, "routes", true)
+            .and_then(|()| {
+                for (n, r) in site.named_routes.iter().enumerate() {
+                    // A named route has no path; children are never searched.
+                    v.route(r, &format!("named_routes[{n}]"), false)?;
                 }
-                Some(_) => {}
-            }
-        }
+                if let Some(r) = &site.r#return {
+                    check_return(r, "return".into())?;
+                }
+                v.error_pages(&site.error_pages, "error_pages")
+            })
+            .map_err(|(field, error)| at(field, error))?;
     }
 
     if let Some(u) = snap.upstreams.iter().position(|u| u.targets.is_empty()) {
@@ -159,6 +239,7 @@ mod tests {
             action: Some(Action {
                 kind: Some(action::Kind::Proxy(ProxyAction { upstream })),
             }),
+            ..Default::default()
         }
     }
 
@@ -177,6 +258,7 @@ mod tests {
                     value: "example.com".into(),
                 }],
                 routes: vec![proxy_route(0)],
+                ..Default::default()
             }],
             upstreams: vec![Upstream {
                 targets: vec![Target {
@@ -245,7 +327,11 @@ mod tests {
         s.sites[0].routes[0].path = None;
         assert_eq!(
             validate(&s),
-            Err(LoadError::UnspecifiedPath { site: 0, route: 0 })
+            Err(LoadError::Site {
+                site: 0,
+                field: "routes[0].path".into(),
+                error: "missing or unspecified"
+            })
         );
     }
 
@@ -255,7 +341,11 @@ mod tests {
         s.sites[0].routes[0].action = None;
         assert_eq!(
             validate(&s),
-            Err(LoadError::MissingAction { site: 0, route: 0 })
+            Err(LoadError::Site {
+                site: 0,
+                field: "routes[0].action".into(),
+                error: "missing"
+            })
         );
     }
 
@@ -265,10 +355,10 @@ mod tests {
         s.sites[0].routes[0] = proxy_route(1);
         assert_eq!(
             validate(&s),
-            Err(LoadError::ProxyUpstream {
+            Err(LoadError::Site {
                 site: 0,
-                route: 0,
-                upstream: 1
+                field: "routes[0].action.proxy.upstream".into(),
+                error: "no such upstream"
             })
         );
     }

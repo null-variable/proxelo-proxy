@@ -2,8 +2,7 @@
 
 use std::ffi::OsStr;
 use std::fs::{File, Metadata};
-use std::io::{self, Read, Write as _};
-use std::net::SocketAddr;
+use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::time::UNIX_EPOCH;
 
@@ -92,9 +91,10 @@ impl Conn {
         };
 
         let keep = self.req.keep_alive;
+        let status = if not_modified { 304 } else { self.status(200) };
         let out = &mut self.out;
         out.clear();
-        reply::start(out, if not_modified { 304 } else { 200 }, b"");
+        reply::start(out, status, b"");
         if !not_modified {
             out.extend_from_slice(b"Content-Type: ");
             out.extend_from_slice(reply::mime(&self.path));
@@ -156,19 +156,8 @@ impl Conn {
         let out = &mut self.out;
         out.clear();
         reply::start(out, 301, b"");
-        out.extend_from_slice(b"Location: http://");
-        if self.host.is_empty() {
-            match self.local {
-                SocketAddr::V4(a) => _ = write!(out, "{}", a.ip()),
-                SocketAddr::V6(a) => _ = write!(out, "[{}]", a.ip()),
-            }
-        } else {
-            out.extend_from_slice(&self.host);
-        }
-        if self.local.port() != 80 {
-            out.push(b':');
-            push_u64(out, u64::from(self.local.port()));
-        }
+        out.extend_from_slice(b"Location: ");
+        reply::push_origin(out, &self.host, self.local);
         reply::push_uri_path(out, &self.path);
         out.push(b'/');
         if !self.args.is_empty() {

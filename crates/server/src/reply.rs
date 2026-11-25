@@ -1,5 +1,8 @@
 //! Response head and generated page writers.
 
+use std::io::Write as _;
+use std::net::SocketAddr;
+
 use proxelo_http1::{push_u64, reason};
 
 use crate::worker;
@@ -60,6 +63,38 @@ pub(crate) fn page(out: &mut Vec<u8>, status: u16, keep_alive: bool, head: bool)
 pub(crate) fn push_uri_path(out: &mut Vec<u8>, path: &[u8]) {
     for &c in path {
         if c <= b' ' || c >= 0x7f || matches!(c, b'"' | b'%' | b'?' | b'#') {
+            out.push(b'%');
+            out.push(b"0123456789ABCDEF"[usize::from(c >> 4)]);
+            out.push(b"0123456789ABCDEF"[usize::from(c & 15)]);
+        } else {
+            out.push(c);
+        }
+    }
+}
+
+/// Appends `http://host[:port]` for an absolute Location: the request host,
+/// or the local address without one, and the port unless it is 80.
+pub(crate) fn push_origin(out: &mut Vec<u8>, host: &[u8], local: SocketAddr) {
+    out.extend_from_slice(b"http://");
+    if host.is_empty() {
+        match local {
+            SocketAddr::V4(a) => _ = write!(out, "{}", a.ip()),
+            SocketAddr::V6(a) => _ = write!(out, "[{}]", a.ip()),
+        }
+    } else {
+        out.extend_from_slice(host);
+    }
+    if local.port() != 80 {
+        out.push(b':');
+        push_u64(out, u64::from(local.port()));
+    }
+}
+
+/// Appends a header value, percent-encoding control bytes, spaces and
+/// non-ASCII so a value built from the decoded path cannot break the head.
+pub(crate) fn push_header_value(out: &mut Vec<u8>, value: &[u8]) {
+    for &c in value {
+        if c <= b' ' || c >= 0x7f {
             out.push(b'%');
             out.push(b"0123456789ABCDEF"[usize::from(c >> 4)]);
             out.push(b"0123456789ABCDEF"[usize::from(c & 15)]);

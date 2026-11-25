@@ -23,6 +23,7 @@ fn route(kind: path_match::Kind, path: &str, action: action::Kind) -> Route {
             value: path.into(),
         }),
         action: Some(Action { kind: Some(action) }),
+        ..Default::default()
     }
 }
 
@@ -34,6 +35,7 @@ fn static_root(root: &std::path::Path) -> action::Kind {
     action::Kind::Static(StaticAction {
         root: root.to_str().unwrap().into(),
         index: vec!["index.html".into()],
+        ..Default::default()
     })
 }
 
@@ -65,6 +67,7 @@ fn snapshot(routes: Vec<Route>, upstreams: Vec<Upstream>) -> ir::Snapshot {
                 value: "example.com".into(),
             }],
             routes,
+            ..Default::default()
         }],
         upstreams,
         ..Default::default()

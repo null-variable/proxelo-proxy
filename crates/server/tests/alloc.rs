@@ -65,6 +65,7 @@ fn route_kind(kind: path_match::Kind, path: &str, action: action::Kind) -> Route
             value: path.into(),
         }),
         action: Some(Action { kind: Some(action) }),
+        ..Default::default()
     }
 }
 
@@ -125,7 +126,7 @@ fn warm_requests_do_not_allocate() {
                     "/",
                     action::Kind::Static(StaticAction {
                         root: root.to_str().unwrap().into(),
-                        index: vec![],
+                        ..Default::default()
                     }),
                 ),
                 route("/api/", action::Kind::Proxy(ProxyAction { upstream: 0 })),

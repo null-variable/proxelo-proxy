@@ -18,11 +18,15 @@ Both serve HTTP/1.1:
 - Routes by nginx `location` order: `=`, then the longest prefix (`^~` stops
   here), then the first `~`/`~*` PCRE2 regex, then that longest prefix.
   Regexes run with JIT and a match limit; a match that hits it answers 500.
+- Nested routes (locations inside a prefix location), searched like nginx.
+- nginx `rewrite` (site and route level, `last`/`break`/`redirect`/
+  `permanent`, captures `$1`..`$9`), `return`, `error_page` (internal
+  redirect, named route or redirect, once per request) and `try_files`, with
+  nginx variables such as `$uri`, `$args`, `$host` and `$arg_name`.
 - Static files (`root`, `index`) and reverse proxying with smooth weighted
   round robin and keepalive upstream connections.
 
-TLS, HTTP/2, rewrite/return/error_page/try_files and the `--sim` dry-load
-mode are not built yet.
+TLS, HTTP/2 and the `--sim` dry-load mode are not built yet.
 
 Behaviour follows nginx defaults where the snapshot has no setting yet:
 timeouts (`client_header_timeout 60s`, `keepalive_timeout 75s`,

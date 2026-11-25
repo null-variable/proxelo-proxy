@@ -12,13 +12,12 @@ use proxelo_http1::{
     Body, ChunkedDecoder, Error as ParseError, Method, Request, Response, normalize_path,
     parse_request, request_line_complete,
 };
-use proxelo_snapshot::{Action, MatchError};
+use proxelo_snapshot::{Captures, MatchError};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::buf::Buf;
-use crate::static_file::Static;
 use crate::{Active, Server, reply};
 
 // nginx defaults.
@@ -31,8 +30,6 @@ const HEADER_BUF: usize = 1024;
 const MAX_HEADER: usize = 32 * 1024;
 /// `client_max_body_size`.
 pub(crate) const MAX_BODY: u64 = 1024 * 1024;
-/// Internal redirects (index files) per request before answering 500.
-const MAX_REDIRECTS: usize = 10;
 
 /// Unread part of the request body.
 pub(crate) enum BodyLeft {
@@ -72,6 +69,7 @@ pub(crate) type KeepAlive = bool;
 pub(crate) struct Conn {
     pub client: TcpStream,
     pub local: SocketAddr,
+    pub peer: SocketAddr,
     /// Address of the socket that accepted the connection.
     listener: SocketAddr,
     served: bool,
@@ -91,10 +89,23 @@ pub(crate) struct Conn {
     /// Query string without `?`.
     pub args: Vec<u8>,
     pub scratch: Vec<u8>,
+    /// Expanded templates.
+    pub tmpl: Vec<u8>,
+    /// Groups of the last regex that matched in this request.
+    pub caps: Captures,
+    /// `path` or `args` differ from the request target.
+    pub uri_changed: bool,
+    /// An error page took over this request; another error is answered
+    /// directly.
+    pub error_paged: bool,
+    /// Status set by an error page for the final response, 0 for none.
+    pub err_status: u16,
+    /// An error page turned the request into a GET.
+    pub as_get: bool,
 }
 
 /// nginx keeps the connection after an error page except for these.
-fn keeps_alive(status: u16) -> bool {
+pub(crate) fn keeps_alive(status: u16) -> bool {
     !matches!(status, 400 | 413 | 414 | 500 | 501)
 }
 
@@ -115,12 +126,13 @@ fn host_key(raw: &[u8], out: &mut Vec<u8>) {
 
 pub(crate) async fn serve(server: Arc<Server>, listener: SocketAddr, client: TcpStream) {
     let _ = client.set_nodelay(true);
-    let Ok(local) = client.local_addr() else {
+    let (Ok(local), Ok(peer)) = (client.local_addr(), client.peer_addr()) else {
         return;
     };
     let mut c = Conn {
         client,
         local,
+        peer,
         listener,
         served: false,
         buf: Buf::new(),
@@ -134,6 +146,12 @@ pub(crate) async fn serve(server: Arc<Server>, listener: SocketAddr, client: Tcp
         path: Vec::new(),
         args: Vec::new(),
         scratch: Vec::new(),
+        tmpl: Vec::new(),
+        caps: Captures::default(),
+        uri_changed: false,
+        error_paged: false,
+        err_status: 0,
+        as_get: false,
     };
     loop {
         match c.read_head().await {
@@ -197,6 +215,11 @@ impl Conn {
         self.head.clear();
         self.head.extend_from_slice(&self.buf.data[..head_len]);
         self.buf.consume(head_len);
+        self.caps.clear();
+        self.uri_changed = false;
+        self.error_paged = false;
+        self.err_status = 0;
+        self.as_get = false;
         self.body = match self.req.body {
             Body::Length(n) => BodyLeft::Length(n),
             Body::Chunked => BodyLeft::Chunked(ChunkedDecoder::new(), 0),
@@ -232,34 +255,7 @@ impl Conn {
             Ok(None) => return self.page(404).await,
             Err(MatchError) => return self.page(500).await,
         };
-        let site = &active.rt.sites[site as usize];
-        let mut redirected = false;
-        for _ in 0..=MAX_REDIRECTS {
-            let route = match site.route(&self.path) {
-                Ok(Some(route)) => route,
-                Ok(None) => return self.page(404).await,
-                Err(MatchError) => return self.page(500).await,
-            };
-            match &site.routes[route as usize].action {
-                Action::Static { root, index } => {
-                    if !matches!(self.req.method, Method::Get | Method::Head) {
-                        return self.page(405).await;
-                    }
-                    match self.resolve_static(root, index) {
-                        Static::Index => redirected = true,
-                        Static::File(f, m) => return self.send_file(f, &m).await,
-                        Static::Directory => return self.redirect_dir().await,
-                        Static::Status(s) => return self.page(s).await,
-                    }
-                }
-                Action::Proxy { upstream } => {
-                    return self
-                        .proxy(&active.upstreams[*upstream as usize], redirected)
-                        .await;
-                }
-            }
-        }
-        self.page(500).await
+        self.run(active, &active.rt.sites[site as usize]).await
     }
 
     /// Reads the rest of the request body. With `up` the bytes are forwarded

@@ -4,11 +4,15 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use foldhash::fast::FixedState;
-use pcre2::bytes::{Regex, RegexBuilder};
-use proxelo_api::snapshot::v1::{self as ir, action, host_match, path_match};
+use pcre2::bytes::{CaptureLocations, Regex, RegexBuilder};
+use proxelo_api::snapshot::v1::{
+    self as ir, action, error_page, host_match, path_match, rewrite, try_files,
+};
+
+use crate::template::Template;
 
 type Map<V> = HashMap<Box<[u8]>, V, FixedState>;
 
@@ -56,6 +60,9 @@ pub const MATCH_LIMIT: u32 = 100_000;
 pub struct Pattern {
     source: Box<str>,
     re: Regex,
+    /// Match data for capturing matches, reused so a warm request does not
+    /// allocate. One entry per concurrent match at most.
+    locs: Mutex<Vec<CaptureLocations>>,
 }
 
 impl fmt::Debug for Pattern {
@@ -80,11 +87,56 @@ impl Pattern {
         Ok(Self {
             source: source.into(),
             re,
+            locs: Mutex::default(),
         })
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
     }
 
     fn is_match(&self, subject: &[u8]) -> Result<bool, MatchError> {
         self.re.is_match(subject).map_err(|_| MatchError)
+    }
+
+    /// Matches `subject` and, on a match, replaces `caps` with its groups.
+    pub fn captures(&self, subject: &[u8], caps: &mut Captures) -> Result<bool, MatchError> {
+        let pooled = self.locs.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let mut locs = pooled.unwrap_or_else(|| self.re.capture_locations());
+        let r = self.re.captures_read(&mut locs, subject);
+        if let Ok(Some(_)) = r {
+            caps.subject.clear();
+            caps.subject.extend_from_slice(subject);
+            caps.spans.clear();
+            caps.spans
+                .extend((0..locs.len()).map(|i| locs.get(i).unwrap_or((usize::MAX, 0))));
+        }
+        self.locs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(locs);
+        r.map(|m| m.is_some()).map_err(|_| MatchError)
+    }
+}
+
+/// Groups of the last regex that matched, for `$0`..`$9` (nginx keeps the
+/// captures of the last successful match of a request).
+#[derive(Debug, Default)]
+pub struct Captures {
+    subject: Vec<u8>,
+    spans: Vec<(usize, usize)>,
+}
+
+impl Captures {
+    pub fn clear(&mut self) {
+        self.subject.clear();
+        self.spans.clear();
+    }
+
+    /// Group `i`, or `None` when it does not exist or did not take part.
+    pub fn get(&self, i: usize) -> Option<&[u8]> {
+        let &(s, e) = self.spans.get(i)?;
+        (s != usize::MAX).then(|| &self.subject[s..e])
     }
 }
 
@@ -101,19 +153,33 @@ struct Prefix {
     priority: bool,
 }
 
-#[derive(Debug)]
-pub struct Site {
+/// The routes of one nesting level (nginx locations of one block).
+#[derive(Debug, Default)]
+struct Level {
     exact: Map<u32>,
     /// Prefix and priority prefix routes, longest first.
     prefixes: Box<[Prefix]>,
     /// Regex routes in definition order.
     regex: Box<[(Pattern, u32)]>,
+}
+
+#[derive(Debug)]
+pub struct Site {
+    top: Level,
+    /// Every route: the tree in pre-order, then the named routes. Route
+    /// numbers index this.
     pub routes: Box<[Route]>,
+    pub rewrites: Box<[Rewrite]>,
+    pub ret: Option<Return>,
+    pub error_pages: Box<[ErrorPage]>,
 }
 
 #[derive(Debug)]
 pub struct Route {
     pub action: Action,
+    pub rewrites: Box<[Rewrite]>,
+    pub error_pages: Box<[ErrorPage]>,
+    children: Option<Level>,
 }
 
 #[derive(Debug)]
@@ -122,10 +188,70 @@ pub enum Action {
         /// Root directory as bytes, without a trailing slash.
         root: Box<[u8]>,
         index: Box<[Box<[u8]>]>,
+        try_files: Option<TryFiles>,
     },
     Proxy {
         upstream: u32,
     },
+    Return(Return),
+}
+
+#[derive(Debug)]
+pub struct Return {
+    pub status: u16,
+    pub text: Template,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewriteFlag {
+    None,
+    Last,
+    Break,
+    Redirect,
+    Permanent,
+}
+
+#[derive(Debug)]
+pub struct Rewrite {
+    pub regex: Pattern,
+    /// Without a trailing `?`.
+    pub replacement: Template,
+    pub flag: RewriteFlag,
+    /// The request arguments are appended; a trailing `?` turns this off.
+    pub add_args: bool,
+    /// The replacement starts with `http://`, `https://` or `$scheme`, which
+    /// makes the rewrite a redirect whatever the flag.
+    pub absolute: bool,
+}
+
+#[derive(Debug)]
+pub struct TryFiles {
+    pub files: Box<[Template]>,
+    pub fallback: Fallback,
+}
+
+#[derive(Debug)]
+pub enum Fallback {
+    Uri(Template),
+    Status(u16),
+    /// A named route, as a route number.
+    Route(u32),
+}
+
+#[derive(Debug)]
+pub struct ErrorPage {
+    pub codes: Box<[u16]>,
+    pub target: ErrorTarget,
+    /// `None` keeps the original code, `Some(0)` the redirected request's.
+    pub status: Option<u16>,
+}
+
+#[derive(Debug)]
+pub enum ErrorTarget {
+    /// A path (internal redirect) or an absolute URL (redirect).
+    Uri(Template),
+    /// A named route, as a route number.
+    Route(u32),
 }
 
 #[derive(Debug)]
@@ -152,18 +278,16 @@ pub enum BuildError {
         target: usize,
         error: String,
     },
-    StaticRoot {
-        site: usize,
-        route: usize,
-    },
     HostRegex {
         site: usize,
         host: usize,
         error: String,
     },
-    PathRegex {
+    /// A field of a site or route; `field` is the path below the site, for
+    /// example `routes[2].children[0].path.value`.
+    Site {
         site: usize,
-        route: usize,
+        field: String,
         error: String,
     },
 }
@@ -184,18 +308,10 @@ impl fmt::Display for BuildError {
                     "upstreams[{upstream}].targets[{target}].address: {error}"
                 )
             }
-            Self::StaticRoot { site, route } => {
-                write!(
-                    f,
-                    "sites[{site}].routes[{route}].action.static.root: must be an absolute path"
-                )
-            }
             Self::HostRegex { site, host, error } => {
                 write!(f, "sites[{site}].hostnames[{host}].value: {error}")
             }
-            Self::PathRegex { site, route, error } => {
-                write!(f, "sites[{site}].routes[{route}].path.value: {error}")
-            }
+            Self::Site { site, field, error } => write!(f, "sites[{site}].{field}: {error}"),
         }
     }
 }
@@ -250,65 +366,25 @@ impl Runtime {
                 l.hosts.add(&site.hostnames, &regex_hosts, s as u32);
             }
 
-            let mut exact = Map::default();
-            let mut prefixes = Vec::new();
-            let mut regex = Vec::new();
-            let mut routes = Vec::with_capacity(site.routes.len());
-            for (r, route) in site.routes.iter().enumerate() {
-                let path = route.path.as_ref().expect("validated");
-                let key: Box<[u8]> = path.value.as_bytes().into();
-                match path.kind() {
-                    path_match::Kind::Exact => {
-                        exact.entry(key).or_insert(r as u32);
-                    }
-                    path_match::Kind::Prefix => prefixes.push(Prefix {
-                        path: key,
-                        route: r as u32,
-                        priority: false,
-                    }),
-                    path_match::Kind::PrefixPriority => prefixes.push(Prefix {
-                        path: key,
-                        route: r as u32,
-                        priority: true,
-                    }),
-                    kind @ (path_match::Kind::Regex | path_match::Kind::RegexCi) => {
-                        let p = Pattern::new(&path.value, kind == path_match::Kind::RegexCi)
-                            .map_err(|error| BuildError::PathRegex {
-                                site: s,
-                                route: r,
-                                error,
-                            })?;
-                        regex.push((p, r as u32));
-                    }
-                    path_match::Kind::Unspecified => unreachable!("validated"),
-                }
-                let action = match route.action.as_ref().and_then(|a| a.kind.as_ref()) {
-                    Some(action::Kind::Static(st)) => {
-                        let root = st.root.trim_end_matches('/');
-                        if !st.root.starts_with('/') {
-                            return Err(BuildError::StaticRoot { site: s, route: r });
-                        }
-                        Action::Static {
-                            root: root.as_bytes().into(),
-                            index: st.index.iter().map(|i| i.as_bytes().into()).collect(),
-                        }
-                    }
-                    Some(action::Kind::Proxy(p)) => Action::Proxy {
-                        upstream: p.upstream,
-                    },
-                    None => unreachable!("validated"),
-                };
-                routes.push(Route { action });
+            let mut b = SiteBuilder {
+                site: s,
+                routes: Vec::new(),
+                named_base: tree_len(&site.routes) as u32,
+            };
+            let top = b.level(&site.routes, "routes")?;
+            for (n, route) in site.named_routes.iter().enumerate() {
+                let r = b.route(route, &format!("named_routes[{n}]"))?;
+                b.routes.push(r);
             }
-            // Stable sort keeps definition order between equal prefixes, so
-            // the first one defined wins like a duplicate nginx location.
-            prefixes.sort_by_key(|p| std::cmp::Reverse(p.path.len()));
-            prefixes.dedup_by(|a, b| a.path == b.path);
             sites.push(Site {
-                exact,
-                prefixes: prefixes.into(),
-                regex: regex.into(),
-                routes: routes.into(),
+                top,
+                rewrites: b.rewrites(&site.rewrites, "rewrites")?,
+                ret: match &site.r#return {
+                    Some(r) => Some(b.ret(r, "return")?),
+                    None => None,
+                },
+                error_pages: b.error_pages(&site.error_pages, "error_pages")?,
+                routes: b.routes.into(),
             });
         }
 
@@ -341,6 +417,184 @@ impl Runtime {
             sites: sites.into(),
             upstreams: upstreams.into(),
         })
+    }
+}
+
+fn tree_len(routes: &[ir::Route]) -> usize {
+    routes.iter().map(|r| 1 + tree_len(&r.children)).sum()
+}
+
+/// Builds the routes of one site. Route numbers are assigned in pre-order,
+/// with named routes after the tree.
+struct SiteBuilder {
+    site: usize,
+    routes: Vec<Route>,
+    /// Route number of named route 0.
+    named_base: u32,
+}
+
+impl SiteBuilder {
+    fn err(&self, field: impl Into<String>, error: impl Into<String>) -> BuildError {
+        BuildError::Site {
+            site: self.site,
+            field: field.into(),
+            error: error.into(),
+        }
+    }
+
+    fn template(&self, s: &str, field: &str) -> Result<Template, BuildError> {
+        Template::parse(s).map_err(|e| self.err(field, e))
+    }
+
+    fn level(&mut self, routes: &[ir::Route], field: &str) -> Result<Level, BuildError> {
+        let mut exact = Map::default();
+        let mut prefixes = Vec::new();
+        let mut regex = Vec::new();
+        for (i, route) in routes.iter().enumerate() {
+            let at = format!("{field}[{i}]");
+            let r = self.routes.len() as u32;
+            let path = route.path.as_ref().expect("validated");
+            let key: Box<[u8]> = path.value.as_bytes().into();
+            match path.kind() {
+                path_match::Kind::Exact => {
+                    exact.entry(key).or_insert(r);
+                }
+                kind @ (path_match::Kind::Prefix | path_match::Kind::PrefixPriority) => prefixes
+                    .push(Prefix {
+                        path: key,
+                        route: r,
+                        priority: kind == path_match::Kind::PrefixPriority,
+                    }),
+                kind @ (path_match::Kind::Regex | path_match::Kind::RegexCi) => {
+                    let p = Pattern::new(&path.value, kind == path_match::Kind::RegexCi)
+                        .map_err(|e| self.err(format!("{at}.path.value"), e))?;
+                    regex.push((p, r));
+                }
+                path_match::Kind::Unspecified => unreachable!("validated"),
+            }
+            let built = self.route(route, &at)?;
+            self.routes.push(built);
+            if !route.children.is_empty() {
+                let children = self.level(&route.children, &format!("{at}.children"))?;
+                self.routes[r as usize].children = Some(children);
+            }
+        }
+        // Stable sort keeps definition order between equal prefixes, so the
+        // first one defined wins like a duplicate nginx location.
+        prefixes.sort_by_key(|p| std::cmp::Reverse(p.path.len()));
+        prefixes.dedup_by(|a, b| a.path == b.path);
+        Ok(Level {
+            exact,
+            prefixes: prefixes.into(),
+            regex: regex.into(),
+        })
+    }
+
+    /// Builds one route without its children.
+    fn route(&self, route: &ir::Route, at: &str) -> Result<Route, BuildError> {
+        let action = match route.action.as_ref().and_then(|a| a.kind.as_ref()) {
+            Some(action::Kind::Static(st)) => {
+                if !st.root.starts_with('/') {
+                    return Err(self.err(
+                        format!("{at}.action.static.root"),
+                        "must be an absolute path",
+                    ));
+                }
+                let try_files = match &st.try_files {
+                    Some(t) => Some(self.try_files(t, &format!("{at}.action.static.try_files"))?),
+                    None => None,
+                };
+                Action::Static {
+                    root: st.root.trim_end_matches('/').as_bytes().into(),
+                    index: st.index.iter().map(|i| i.as_bytes().into()).collect(),
+                    try_files,
+                }
+            }
+            Some(action::Kind::Proxy(p)) => Action::Proxy {
+                upstream: p.upstream,
+            },
+            Some(action::Kind::Return(r)) => {
+                Action::Return(self.ret(r, &format!("{at}.action.return"))?)
+            }
+            None => unreachable!("validated"),
+        };
+        Ok(Route {
+            action,
+            rewrites: self.rewrites(&route.rewrites, &format!("{at}.rewrites"))?,
+            error_pages: self.error_pages(&route.error_pages, &format!("{at}.error_pages"))?,
+            children: None,
+        })
+    }
+
+    fn ret(&self, r: &ir::ReturnAction, at: &str) -> Result<Return, BuildError> {
+        Ok(Return {
+            status: r.status as u16,
+            text: self.template(&r.text, &format!("{at}.text"))?,
+        })
+    }
+
+    fn try_files(&self, t: &ir::TryFiles, at: &str) -> Result<TryFiles, BuildError> {
+        let files = t
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| self.template(f, &format!("{at}.files[{i}]")))
+            .collect::<Result<_, _>>()?;
+        let fallback = match t.fallback.as_ref().expect("validated") {
+            try_files::Fallback::Uri(u) => Fallback::Uri(self.template(u, &format!("{at}.uri"))?),
+            try_files::Fallback::Status(s) => Fallback::Status(*s as u16),
+            try_files::Fallback::Named(n) => Fallback::Route(self.named_base + n),
+        };
+        Ok(TryFiles { files, fallback })
+    }
+
+    fn rewrites(&self, rs: &[ir::Rewrite], at: &str) -> Result<Box<[Rewrite]>, BuildError> {
+        rs.iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let at = format!("{at}[{i}]");
+                let regex = Pattern::new(&r.regex, false)
+                    .map_err(|e| self.err(format!("{at}.regex"), e))?;
+                let (repl, add_args) = match r.replacement.strip_suffix('?') {
+                    Some(rest) => (rest, false),
+                    None => (r.replacement.as_str(), true),
+                };
+                Ok(Rewrite {
+                    regex,
+                    replacement: self.template(repl, &format!("{at}.replacement"))?,
+                    flag: match r.flag() {
+                        rewrite::Flag::Unspecified => RewriteFlag::None,
+                        rewrite::Flag::Last => RewriteFlag::Last,
+                        rewrite::Flag::Break => RewriteFlag::Break,
+                        rewrite::Flag::Redirect => RewriteFlag::Redirect,
+                        rewrite::Flag::Permanent => RewriteFlag::Permanent,
+                    },
+                    add_args,
+                    absolute: ["http://", "https://", "$scheme"]
+                        .iter()
+                        .any(|p| r.replacement.starts_with(p)),
+                })
+            })
+            .collect()
+    }
+
+    fn error_pages(&self, eps: &[ir::ErrorPage], at: &str) -> Result<Box<[ErrorPage]>, BuildError> {
+        eps.iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let target = match e.target.as_ref().expect("validated") {
+                    error_page::Target::Uri(u) => {
+                        ErrorTarget::Uri(self.template(u, &format!("{at}[{i}].uri"))?)
+                    }
+                    error_page::Target::Named(n) => ErrorTarget::Route(self.named_base + n),
+                };
+                Ok(ErrorPage {
+                    codes: e.codes.iter().map(|&c| c as u16).collect(),
+                    target,
+                    status: e.status.map(|s| s as u16),
+                })
+            })
+            .collect()
     }
 }
 
@@ -441,27 +695,54 @@ impl Listener {
     }
 }
 
+enum Found {
+    None,
+    /// A prefix route; regexes of enclosing levels may still win.
+    Prefix(u32),
+    /// An exact or regex route.
+    Final(u32),
+}
+
 impl Site {
-    /// Finds the route for a normalized path with nginx location order: an
-    /// exact match wins; otherwise the longest prefix is found and wins at
-    /// once if it is `^~`; otherwise the first matching regex in definition
-    /// order; otherwise that longest prefix.
-    pub fn route(&self, path: &[u8]) -> Result<Option<u32>, MatchError> {
-        if let Some(&r) = self.exact.get(path) {
-            return Ok(Some(r));
+    /// Finds the route for a normalized path in nginx location order
+    /// (`ngx_http_core_find_location`): an exact match wins; otherwise the
+    /// longest prefix is found and its nested routes are searched the same
+    /// way, where an exact or regex match wins outright; unless that prefix
+    /// is `^~`, the regexes of this level are tried in definition order;
+    /// otherwise the deepest prefix found wins. A regex match replaces
+    /// `caps`.
+    pub fn route(&self, path: &[u8], caps: &mut Captures) -> Result<Option<u32>, MatchError> {
+        Ok(match self.find(&self.top, path, caps)? {
+            Found::None => None,
+            Found::Prefix(r) | Found::Final(r) => Some(r),
+        })
+    }
+
+    fn find(&self, level: &Level, path: &[u8], caps: &mut Captures) -> Result<Found, MatchError> {
+        if let Some(&r) = level.exact.get(path) {
+            return Ok(Found::Final(r));
         }
-        let prefix = self.prefixes.iter().find(|p| path.starts_with(&p.path));
-        if let Some(p) = prefix
-            && p.priority
-        {
-            return Ok(Some(p.route));
-        }
-        for (p, r) in &self.regex {
-            if p.is_match(path)? {
-                return Ok(Some(*r));
+        let mut found = Found::None;
+        let mut noregex = false;
+        if let Some(p) = level.prefixes.iter().find(|p| path.starts_with(&p.path)) {
+            found = Found::Prefix(p.route);
+            noregex = p.priority;
+            if let Some(children) = &self.routes[p.route as usize].children {
+                match self.find(children, path, caps)? {
+                    Found::Final(r) => return Ok(Found::Final(r)),
+                    Found::Prefix(r) => found = Found::Prefix(r),
+                    Found::None => {}
+                }
             }
         }
-        Ok(prefix.map(|p| p.route))
+        if !noregex {
+            for (p, r) in &level.regex {
+                if p.captures(path, caps)? {
+                    return Ok(Found::Final(*r));
+                }
+            }
+        }
+        Ok(found)
     }
 }
 
@@ -483,6 +764,7 @@ mod tests {
             action: Some(IrAction {
                 kind: Some(action::Kind::Proxy(ProxyAction { upstream })),
             }),
+            ..Default::default()
         }
     }
 
@@ -496,7 +778,7 @@ mod tests {
                     value: value.into(),
                 })
                 .collect(),
-            routes: vec![],
+            ..Default::default()
         }
     }
 
@@ -511,6 +793,7 @@ mod tests {
                 })
                 .collect(),
             routes,
+            ..Default::default()
         }
     }
 
@@ -585,16 +868,27 @@ mod tests {
         );
         let rt = Runtime::build(&snap).unwrap();
         let s = &rt.sites[0];
-        assert_eq!(s.route(b"/"), Ok(Some(0)));
-        assert_eq!(s.route(b"/index.html"), Ok(Some(0)));
-        assert_eq!(s.route(b"/api"), Ok(Some(0)));
-        assert_eq!(s.route(b"/api/"), Ok(Some(2)), "exact wins over prefix");
+        assert_eq!(s.route(b"/", &mut Captures::default()), Ok(Some(0)));
         assert_eq!(
-            s.route(b"/api/x"),
+            s.route(b"/index.html", &mut Captures::default()),
+            Ok(Some(0))
+        );
+        assert_eq!(s.route(b"/api", &mut Captures::default()), Ok(Some(0)));
+        assert_eq!(
+            s.route(b"/api/", &mut Captures::default()),
+            Ok(Some(2)),
+            "exact wins over prefix"
+        );
+        assert_eq!(
+            s.route(b"/api/x", &mut Captures::default()),
             Ok(Some(1)),
             "first duplicate prefix wins"
         );
-        assert_eq!(s.route(b"/api/v1/x"), Ok(Some(3)), "longest prefix wins");
+        assert_eq!(
+            s.route(b"/api/v1/x", &mut Captures::default()),
+            Ok(Some(3)),
+            "longest prefix wins"
+        );
     }
 
     #[test]
@@ -674,18 +968,42 @@ mod tests {
         );
         let rt = Runtime::build(&snap).unwrap();
         let s = &rt.sites[0];
-        assert_eq!(s.route(b"/logo.png"), Ok(Some(5)), "exact before regex");
-        assert_eq!(s.route(b"/static/a.php"), Ok(Some(1)), "^~ skips regex");
         assert_eq!(
-            s.route(b"/static/deep/a.php"),
+            s.route(b"/logo.png", &mut Captures::default()),
+            Ok(Some(5)),
+            "exact before regex"
+        );
+        assert_eq!(
+            s.route(b"/static/a.php", &mut Captures::default()),
+            Ok(Some(1)),
+            "^~ skips regex"
+        );
+        assert_eq!(
+            s.route(b"/static/deep/a.php", &mut Captures::default()),
             Ok(Some(2)),
             "longer plain prefix does not stop regex"
         );
-        assert_eq!(s.route(b"/images/a.PNG"), Ok(Some(3)), "regex beats prefix");
-        assert_eq!(s.route(b"/a.png"), Ok(Some(3)), "first regex in order");
-        assert_eq!(s.route(b"/a.Png"), Ok(Some(3)));
-        assert_eq!(s.route(b"/a.PHP"), Ok(Some(0)), "~ is case-sensitive");
-        assert_eq!(s.route(b"/images/a.gif"), Ok(Some(4)), "longest prefix");
+        assert_eq!(
+            s.route(b"/images/a.PNG", &mut Captures::default()),
+            Ok(Some(3)),
+            "regex beats prefix"
+        );
+        assert_eq!(
+            s.route(b"/a.png", &mut Captures::default()),
+            Ok(Some(3)),
+            "first regex in order"
+        );
+        assert_eq!(s.route(b"/a.Png", &mut Captures::default()), Ok(Some(3)));
+        assert_eq!(
+            s.route(b"/a.PHP", &mut Captures::default()),
+            Ok(Some(0)),
+            "~ is case-sensitive"
+        );
+        assert_eq!(
+            s.route(b"/images/a.gif", &mut Captures::default()),
+            Ok(Some(4)),
+            "longest prefix"
+        );
     }
 
     #[test]
@@ -701,10 +1019,16 @@ mod tests {
         let rt = Runtime::build(&snap).unwrap();
         let mut path = b"/".to_vec();
         path.extend([b'a'; 40]);
-        assert_eq!(rt.sites[0].route(&path), Ok(Some(0)));
+        assert_eq!(
+            rt.sites[0].route(&path, &mut Captures::default()),
+            Ok(Some(0))
+        );
         path.push(b'b');
         let start = std::time::Instant::now();
-        assert_eq!(rt.sites[0].route(&path), Err(MatchError));
+        assert_eq!(
+            rt.sites[0].route(&path, &mut Captures::default()),
+            Err(MatchError)
+        );
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
     }
 
@@ -720,11 +1044,7 @@ mod tests {
         );
         assert!(matches!(
             Runtime::build(&snap),
-            Err(BuildError::PathRegex {
-                site: 0,
-                route: 0,
-                ..
-            })
+            Err(BuildError::Site { site: 0, ref field, .. }) if field == "routes[0].path.value"
         ));
         let snap = snapshot(
             vec![named(vec![0], &[(host_match::Kind::Regex, "[")])],
@@ -751,7 +1071,7 @@ mod tests {
             None,
         );
         let rt = Runtime::build(&snap).unwrap();
-        assert_eq!(rt.sites[0].route(b"/y"), Ok(None));
+        assert_eq!(rt.sites[0].route(b"/y", &mut Captures::default()), Ok(None));
     }
 
     #[test]
@@ -779,12 +1099,14 @@ mod tests {
                 kind: Some(action::Kind::Static(StaticAction {
                     root: "/srv/www/".into(),
                     index: vec!["index.html".into()],
+                    ..Default::default()
                 })),
             }),
+            ..Default::default()
         });
         let rt = Runtime::build(&snap).unwrap();
         match &rt.sites[0].routes[0].action {
-            Action::Static { root, index } => {
+            Action::Static { root, index, .. } => {
                 assert_eq!(&**root, b"/srv/www");
                 assert_eq!(index.len(), 1);
             }
@@ -793,12 +1115,16 @@ mod tests {
         snap.sites[0].routes[0].action = Some(IrAction {
             kind: Some(action::Kind::Static(StaticAction {
                 root: "srv".into(),
-                index: vec![],
+                ..Default::default()
             })),
         });
         assert_eq!(
             Runtime::build(&snap).err(),
-            Some(BuildError::StaticRoot { site: 0, route: 0 })
+            Some(BuildError::Site {
+                site: 0,
+                field: "routes[0].action.static.root".into(),
+                error: "must be an absolute path".into()
+            })
         );
     }
 

@@ -54,11 +54,14 @@ async fn read(s: &mut TcpStream, buf: &mut crate::buf::Buf, max: usize) -> Resul
 }
 
 impl Conn {
-    pub async fn proxy(&mut self, ups: &upstream::State, redirected: bool) -> KeepAlive {
+    /// Proxies the request. `Err` carries the 502 or 504 to answer, which an
+    /// error page may replace.
+    pub async fn proxy(&mut self, ups: &upstream::State) -> Result<KeepAlive, u16> {
         // After the request went out, a retry is only safe when it can be
         // replayed: no body and a method that tolerates repetition
         // (`proxy_next_upstream error timeout` without `non_idempotent`).
-        let replayable = self.req.body == Body::None && idempotent(self.req.method);
+        let replayable =
+            (self.req.body == Body::None || self.as_get) && idempotent(self.req.method);
         let mut tried = 0u64;
         let mut status = 502;
         while let Some(i) = ups.pick(tried) {
@@ -84,17 +87,17 @@ impl Conn {
                     }
                 },
             };
-            self.upstream_head(pool.addr, ups.keepalive, redirected);
+            self.upstream_head(pool.addr, ups.keepalive);
             match self.exchange(&mut up).await {
-                Ok(()) => return self.relay(up, pool, ups.keepalive).await,
-                Err(Fail::Client) => return false,
+                Ok(()) => return Ok(self.relay(up, pool, ups.keepalive).await),
+                Err(Fail::Client) => return Ok(false),
                 Err(Fail::BadBody) => {
                     self.req.keep_alive = false;
-                    return self.page(400).await;
+                    return Ok(self.page(400).await);
                 }
                 Err(Fail::TooLarge) => {
                     self.req.keep_alive = false;
-                    return self.page(413).await;
+                    return Ok(self.page(413).await);
                 }
                 Err(f) => {
                     status = if matches!(f, Fail::UpstreamTimeout) {
@@ -118,18 +121,22 @@ impl Conn {
             // be told apart from a next request.
             self.req.keep_alive = false;
         }
-        self.page(status).await
+        Err(status)
     }
 
     /// Builds the upstream request head into `out`: the original target, or
-    /// the changed URI after an internal redirect, as `proxy_pass` without a
-    /// URI part does.
-    fn upstream_head(&mut self, target: SocketAddr, keepalive: bool, redirected: bool) {
+    /// the changed URI after a rewrite or internal redirect, as `proxy_pass`
+    /// without a URI part does.
+    fn upstream_head(&mut self, target: SocketAddr, keepalive: bool) {
         let out = &mut self.out;
         out.clear();
-        out.extend_from_slice(self.req.method_span.get(&self.head));
+        if self.as_get {
+            out.extend_from_slice(b"GET");
+        } else {
+            out.extend_from_slice(self.req.method_span.get(&self.head));
+        }
         out.push(b' ');
-        if redirected {
+        if self.uri_changed {
             reply::push_uri_path(out, &self.path);
             if !self.args.is_empty() {
                 out.push(b'?');
@@ -141,8 +148,12 @@ impl Conn {
         out.extend_from_slice(b" HTTP/1.1\r\n");
         let mut has_host = false;
         for h in self.req.headers.iter() {
-            // Expect is answered here, not by the upstream.
-            if h.kind.is_hop_by_hop() || h.kind == HeaderKind::Expect {
+            // Expect is answered here, not by the upstream. A request an
+            // error page turned into a GET has no body any more.
+            if h.kind.is_hop_by_hop()
+                || h.kind == HeaderKind::Expect
+                || (self.as_get && h.kind == HeaderKind::ContentLength)
+            {
                 continue;
             }
             has_host |= h.kind == HeaderKind::Host;
@@ -154,7 +165,7 @@ impl Conn {
         if !has_host {
             _ = write!(out, "Host: {target}\r\n");
         }
-        if self.req.body == Body::Chunked {
+        if self.req.body == Body::Chunked && !self.as_get {
             out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
         }
         if !keepalive {
@@ -231,7 +242,11 @@ impl Conn {
 
         let out = &mut self.out;
         out.clear();
-        reply::start(out, self.resp.status, self.resp.reason.get(&self.ubuf.data));
+        if self.err_status != 0 {
+            reply::start(out, self.err_status, b"");
+        } else {
+            reply::start(out, self.resp.status, self.resp.reason.get(&self.ubuf.data));
+        }
         for h in self.resp.headers.iter() {
             // nginx hides Date, Server, X-Pad and X-Accel-* by default and
             // sets its own Date and Server.
