@@ -55,9 +55,13 @@ fn upstream() -> SocketAddr {
 }
 
 fn route(path: &str, action: action::Kind) -> Route {
+    route_kind(path_match::Kind::Prefix, path, action)
+}
+
+fn route_kind(kind: path_match::Kind, path: &str, action: action::Kind) -> Route {
     Route {
         path: Some(PathMatch {
-            kind: path_match::Kind::Prefix as i32,
+            kind: kind as i32,
             value: path.into(),
         }),
         action: Some(Action { kind: Some(action) }),
@@ -125,6 +129,18 @@ fn warm_requests_do_not_allocate() {
                     }),
                 ),
                 route("/api/", action::Kind::Proxy(ProxyAction { upstream: 0 })),
+                // Regex locations: every request is checked against them, the
+                // case-insensitive one matches /img/ requests.
+                route_kind(
+                    path_match::Kind::Regex,
+                    r"\.php$",
+                    action::Kind::Proxy(ProxyAction { upstream: 0 }),
+                ),
+                route_kind(
+                    path_match::Kind::RegexCi,
+                    r"^/img/.+\.(png|jpg)$",
+                    action::Kind::Proxy(ProxyAction { upstream: 0 }),
+                ),
             ],
             ..Default::default()
         }],
@@ -153,9 +169,10 @@ fn warm_requests_do_not_allocate() {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut buf = vec![0u8; 8192];
-    let requests: [&[u8]; 2] = [
+    let requests: [&[u8]; 3] = [
         b"GET /1k.txt HTTP/1.1\r\nHost: example.com\r\nUser-Agent: bench\r\nAccept: */*\r\n\r\n",
         b"GET /api/item?id=7 HTTP/1.1\r\nHost: example.com\r\nUser-Agent: bench\r\nAccept: */*\r\n\r\n",
+        b"GET /img/a.PNG HTTP/1.1\r\nHost: example.com\r\nUser-Agent: bench\r\nAccept: */*\r\n\r\n",
     ];
 
     // Warm up: buffers grow to size and the upstream connection is pooled.

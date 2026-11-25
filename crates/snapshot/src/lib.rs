@@ -8,7 +8,9 @@ mod runtime;
 
 use std::fmt;
 
-pub use runtime::{Action, BuildError, Listener, Route, Runtime, Site, Target, Upstream};
+pub use runtime::{
+    Action, BuildError, Listener, MatchError, Pattern, Route, Runtime, Site, Target, Upstream,
+};
 
 use prost::Message;
 use proxelo_api::snapshot::v1::{Snapshot, action, host_match, path_match};

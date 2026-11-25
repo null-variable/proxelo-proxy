@@ -11,10 +11,18 @@ The wire format between the two lives in
 
 Early development. `proxelo-proxy run` receives snapshots from the control
 plane and serves them; `proxelo-proxy serve` serves a single snapshot file.
-Both serve HTTP/1.1: exact-host sites, exact and prefix routes with nginx `location` order,
-static files (`root`, `index`) and reverse proxying with smooth weighted round
-robin and keepalive upstream connections. TLS, HTTP/2, regex routes and
-the `--sim` dry-load mode are not built yet.
+Both serve HTTP/1.1:
+
+- Sites by nginx `server_name` order: exact name, longest `*.name` or
+  `.name`, longest `name.*`, first PCRE2 regex, then the default site.
+- Routes by nginx `location` order: `=`, then the longest prefix (`^~` stops
+  here), then the first `~`/`~*` PCRE2 regex, then that longest prefix.
+  Regexes run with JIT and a match limit; a match that hits it answers 500.
+- Static files (`root`, `index`) and reverse proxying with smooth weighted
+  round robin and keepalive upstream connections.
+
+TLS, HTTP/2, rewrite/return/error_page/try_files and the `--sim` dry-load
+mode are not built yet.
 
 Behaviour follows nginx defaults where the snapshot has no setting yet:
 timeouts (`client_header_timeout 60s`, `keepalive_timeout 75s`,
@@ -27,7 +35,7 @@ timeout` and the response headers nginx hides from upstreams.
 | Crate | Purpose |
 |---|---|
 | `crates/proxy` | `proxelo-proxy` binary |
-| `crates/snapshot` | Validates snapshots and builds the runtime form (host and route lookup, resolved upstream targets) |
+| `crates/snapshot` | Validates snapshots and builds the runtime form (host and route lookup with PCRE2, resolved upstream targets) |
 | `crates/http1` | HTTP/1.1 codec: in-place parsing, strict framing, chunked decoding, path normalization |
 | `crates/server` | Accept loop, request handling, static files, proxying, upstream pools, snapshot swap, listening sockets that follow the snapshot |
 | `crates/sync` | Control plane client: receives snapshots over the control socket and acks them |
@@ -36,7 +44,7 @@ timeout` and the response headers nginx hides from upstreams.
 ## Build
 
 ```sh
-cargo build --release
+cargo build --release      # builds the bundled PCRE2 with a C compiler
 ./target/release/proxelo-proxy version
 ./target/release/proxelo-proxy check snapshot.bin
 ./target/release/proxelo-proxy serve snapshot.bin --workers 4 --runtime per-core

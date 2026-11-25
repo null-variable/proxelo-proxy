@@ -12,7 +12,7 @@ use proxelo_http1::{
     Body, ChunkedDecoder, Error as ParseError, Method, Request, Response, normalize_path,
     parse_request, request_line_complete,
 };
-use proxelo_snapshot::Action;
+use proxelo_snapshot::{Action, MatchError};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -227,14 +227,18 @@ impl Conn {
         let Some(listener) = active.rt.listener(self.listener) else {
             return false;
         };
-        let Some(site) = listener.site(host) else {
-            return self.page(404).await;
+        let site = match listener.site(host) {
+            Ok(Some(site)) => site,
+            Ok(None) => return self.page(404).await,
+            Err(MatchError) => return self.page(500).await,
         };
         let site = &active.rt.sites[site as usize];
         let mut redirected = false;
         for _ in 0..=MAX_REDIRECTS {
-            let Some(route) = site.route(&self.path) else {
-                return self.page(404).await;
+            let route = match site.route(&self.path) {
+                Ok(Some(route)) => route,
+                Ok(None) => return self.page(404).await,
+                Err(MatchError) => return self.page(500).await,
             };
             match &site.routes[route as usize].action {
                 Action::Static { root, index } => {
