@@ -6,7 +6,8 @@ use std::time::UNIX_EPOCH;
 
 use proxelo_http1::{Method, http_date, push_hex, push_u64};
 
-use crate::conn::{Conn, KeepAlive, SEND_TIMEOUT, write_timeout};
+use crate::conn::{Conn, KeepAlive, SEND_TIMEOUT, body_len};
+use crate::io::write_timeout;
 use crate::reply;
 
 /// File bytes read per write.
@@ -58,12 +59,16 @@ impl Conn {
         if !not_modified {
             out.extend_from_slice(b"Accept-Ranges: bytes\r\n");
         }
-        reply::connection(out, keep);
+        reply::connection(out, keep, &self.x.resp_extra);
         out.extend_from_slice(b"\r\n");
+        self.x.sent.status = status;
+        self.x.sent.bytes = out.len() as u64;
 
         if not_modified || self.x.req.method == Method::Head {
             return self.respond(keep).await;
         }
+        self.x.sent.bytes += len;
+        self.x.sent.body_bytes = len;
         if keep && self.pump_body(None).await.is_err() {
             return false;
         }
@@ -105,7 +110,7 @@ impl Conn {
         out.clear();
         reply::start(out, 301, b"");
         out.extend_from_slice(b"Location: ");
-        reply::push_origin(out, &self.x.host, self.x.local);
+        reply::push_origin(out, self.x.tls.is_some(), &self.x.host, self.x.local);
         reply::push_uri_path(out, &self.x.path);
         out.push(b'/');
         if !self.x.args.is_empty() {
@@ -113,7 +118,11 @@ impl Conn {
             out.extend_from_slice(&self.x.args);
         }
         out.extend_from_slice(b"\r\n");
-        reply::page(out, 301, keep, self.x.req.method == Method::Head);
+        let head = self.x.req.method == Method::Head;
+        reply::page(out, 301, keep, head, &self.x.resp_extra);
+        self.x.sent.status = 301;
+        self.x.sent.bytes = out.len() as u64;
+        self.x.sent.body_bytes = body_len(out) as u64;
         self.respond(keep).await
     }
 }

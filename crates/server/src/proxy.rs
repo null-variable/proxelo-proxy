@@ -2,22 +2,18 @@
 
 use std::io::Write as _;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use proxelo_http1::{Body, ChunkedDecoder, HeaderKind, Method, Version, parse_response, push_hex};
+use proxelo_snapshot::{Proxy, Route};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-use crate::conn::{
-    BodyLeft, Conn, Fail, KeepAlive, SEND_TIMEOUT as CLIENT_SEND, upstream_fail, write_timeout,
-};
-use crate::reply;
-use crate::upstream::{self, Pool};
+use crate::conn::{BodyLeft, Conn, Fail, KeepAlive, SEND_TIMEOUT as CLIENT_SEND, upstream_fail};
+use crate::io::write_timeout;
+use crate::upstream::Pool;
+use crate::{Active, headers, reply};
 
-// nginx defaults.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
-pub(crate) const SEND_TIMEOUT: Duration = Duration::from_secs(60);
-const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// `proxy_buffer_size`: the upstream response head must fit.
 const HEAD_BUF: usize = 16 * 1024;
 /// Upstream body bytes read per client write.
@@ -45,73 +41,150 @@ fn idempotent(m: Method) -> bool {
     )
 }
 
-async fn read(s: &mut TcpStream, buf: &mut crate::buf::Buf, max: usize) -> Result<usize, Fail> {
-    match timeout(READ_TIMEOUT, buf.fill(s, HEAD_BUF, max)).await {
+async fn read(
+    s: &mut TcpStream,
+    buf: &mut crate::buf::Buf,
+    max: usize,
+    t: Duration,
+) -> Result<usize, Fail> {
+    match timeout(t, buf.fill(s, HEAD_BUF, max)).await {
         Ok(Ok(n)) => Ok(n),
         Ok(Err(e)) => Err(upstream_fail(e)),
         Err(_) => Err(Fail::UpstreamTimeout),
     }
 }
 
+/// An attempt that got a response head the route wants to retry on.
+struct Retry;
+
 impl Conn {
     /// Proxies the request. `Err` carries the 502 or 504 to answer, which an
     /// error page may replace.
-    pub async fn proxy(&mut self, ups: &upstream::State) -> Result<KeepAlive, u16> {
+    pub async fn proxy(
+        &mut self,
+        active: &Active,
+        p: &Proxy,
+        route: &Route,
+    ) -> Result<KeepAlive, u16> {
+        let ups = &active.upstreams[p.upstream as usize];
         // After the request went out, a retry is only safe when it can be
-        // replayed: no body and a method that tolerates repetition
-        // (`proxy_next_upstream error timeout` without `non_idempotent`).
-        let replayable =
-            (self.x.req.body == Body::None || self.x.as_get) && idempotent(self.x.req.method);
+        // replayed: no body and a method that tolerates repetition, unless
+        // the route allows non_idempotent.
+        let replayable = (self.x.req.body == Body::None || self.x.as_get)
+            && (p.next.non_idempotent || idempotent(self.x.req.method));
+        let started = Instant::now();
         let mut tried = 0u64;
+        let mut tries = 0u32;
         let mut status = 502;
-        while let Some(i) = ups.pick(tried) {
+        loop {
+            if p.tries != 0 && tries >= p.tries {
+                break;
+            }
+            let Some(picked) = ups.pick(tried) else {
+                break;
+            };
+            tries += 1;
+            let i = picked.index;
             if i < 64 {
                 tried |= 1 << i;
             }
             let pool = &ups.pools()[i];
-            let (mut up, reused) = match pool.take() {
-                Some(s) => (s, true),
-                None => match timeout(CONNECT_TIMEOUT, TcpStream::connect(pool.addr)).await {
+            self.x.sent.upstream_addr = Some(pool.addr);
+            let connect = Instant::now();
+            let (mut up, used) = match pool.take() {
+                Some(s) => s,
+                None => match timeout(p.connect_timeout, TcpStream::connect(pool.addr)).await {
                     Ok(Ok(s)) => {
                         let _ = s.set_nodelay(true);
-                        (s, false)
+                        (s, 0)
                     }
                     // Nothing was sent, so any request may move on.
                     Ok(Err(_)) => {
+                        ups.failed(i);
+                        active.metrics.upstream_failure(p.upstream, i);
                         status = 502;
+                        if !p.next.error {
+                            break;
+                        }
                         continue;
                     }
                     Err(_) => {
+                        ups.failed(i);
+                        active.metrics.upstream_failure(p.upstream, i);
                         status = 504;
+                        if !p.next.timeout {
+                            break;
+                        }
                         continue;
                     }
                 },
             };
-            self.upstream_head(pool.addr, ups.keepalive);
-            match self.exchange(&mut up).await {
-                Ok(()) => return Ok(self.relay(up, pool, ups.keepalive).await),
-                Err(Fail::Client) => return Ok(false),
-                Err(Fail::BadBody) => {
+            let reused = used > 0;
+            self.x.sent.upstream_connect = Some(connect.elapsed().as_secs_f64());
+            self.upstream_head(pool.addr, ups.keepalive, route);
+            let last = !replayable || !ups.has_next(tried) || (p.tries != 0 && tries >= p.tries);
+            match self.exchange(&mut up, p, last).await {
+                Ok(()) => {
+                    let st = self.resp.status;
+                    self.x.sent.upstream_status = st;
+                    self.x.sent.upstream_header = Some(connect.elapsed().as_secs_f64());
+                    let failure = p.next.on_status(st) && !matches!(st, 403 | 404);
+                    if failure {
+                        ups.failed(i);
+                    } else {
+                        ups.succeeded(i);
+                    }
+                    let keep_up = ups.keepalive && used + 1 < ups.keepalive_requests;
+                    let keep = self
+                        .relay(up, pool, keep_up, used + 1, route, p.read_timeout)
+                        .await;
+                    let took = started.elapsed();
+                    self.x.sent.upstream_response = Some(connect.elapsed().as_secs_f64());
+                    active.metrics.upstream_response(p.upstream, i, st, took);
+                    return Ok(keep);
+                }
+                Err(Ok(Retry)) => {
+                    // A status listed in next_upstream: try the next target.
+                    let st = self.resp.status;
+                    if !matches!(st, 403 | 404) {
+                        ups.failed(i);
+                    }
+                    active
+                        .metrics
+                        .upstream_response(p.upstream, i, st, connect.elapsed());
+                    self.x.sent.upstream_status = st;
+                    status = 502;
+                }
+                Err(Err(Fail::Client)) => return Ok(false),
+                Err(Err(Fail::BadBody)) => {
                     self.x.req.keep_alive = false;
                     return Ok(self.page(400).await);
                 }
-                Err(Fail::TooLarge) => {
+                Err(Err(Fail::TooLarge)) => {
                     self.x.req.keep_alive = false;
                     return Ok(self.page(413).await);
                 }
-                Err(f) => {
-                    status = if matches!(f, Fail::UpstreamTimeout) {
-                        504
-                    } else {
-                        502
-                    };
-                    if !replayable {
-                        break;
-                    }
+                Err(Err(f)) => {
+                    let timed_out = matches!(f, Fail::UpstreamTimeout);
+                    status = if timed_out { 504 } else { 502 };
                     // A pooled connection the upstream closed while idle says
                     // nothing about the target; allow it again on a fresh one.
-                    if reused && matches!(f, Fail::Upstream) && i < 64 {
-                        tried &= !(1 << i);
+                    if reused && matches!(f, Fail::Upstream) {
+                        if i < 64 {
+                            tried &= !(1 << i);
+                        }
+                        tries -= 1;
+                        continue;
+                    }
+                    ups.failed(i);
+                    active.metrics.upstream_failure(p.upstream, i);
+                    let allowed = if timed_out {
+                        p.next.timeout
+                    } else {
+                        p.next.error
+                    };
+                    if !replayable || !allowed {
+                        break;
                     }
                 }
             }
@@ -126,9 +199,9 @@ impl Conn {
 
     /// Builds the upstream request head into `out`: the original target, or
     /// the changed URI after a rewrite or internal redirect, as `proxy_pass`
-    /// without a URI part does.
-    fn upstream_head(&mut self, target: SocketAddr, keepalive: bool) {
-        let out = &mut self.out;
+    /// without a URI part does. The route's request headers are applied.
+    fn upstream_head(&mut self, target: SocketAddr, keepalive: bool, route: &Route) {
+        let mut out = std::mem::take(&mut self.out);
         out.clear();
         if self.x.as_get {
             out.extend_from_slice(b"GET");
@@ -137,7 +210,7 @@ impl Conn {
         }
         out.push(b' ');
         if self.x.uri_changed {
-            reply::push_uri_path(out, &self.x.path);
+            reply::push_uri_path(&mut out, &self.x.path);
             if !self.x.args.is_empty() {
                 out.push(b'?');
                 out.extend_from_slice(&self.x.args);
@@ -146,24 +219,30 @@ impl Conn {
             out.extend_from_slice(self.x.req.target.get(&self.x.head));
         }
         out.extend_from_slice(b" HTTP/1.1\r\n");
-        let mut has_host = false;
+        let ops = &route.request_headers;
+        let mut has_host = ops.drops(b"host");
         for h in self.x.req.headers.iter() {
             // Expect is answered here, not by the upstream. A request an
             // error page turned into a GET has no body any more.
+            let name = h.name.get(&self.x.head);
             if h.kind.is_hop_by_hop()
                 || h.kind == HeaderKind::Expect
                 || (self.x.as_get && h.kind == HeaderKind::ContentLength)
+                || (!ops.is_empty() && ops.drops(name))
             {
                 continue;
             }
             has_host |= h.kind == HeaderKind::Host;
-            out.extend_from_slice(h.name.get(&self.x.head));
+            out.extend_from_slice(name);
             out.extend_from_slice(b": ");
             out.extend_from_slice(h.value.get(&self.x.head));
             out.extend_from_slice(b"\r\n");
         }
         if !has_host {
             _ = write!(out, "Host: {target}\r\n");
+        }
+        if !ops.is_empty() {
+            headers::request(&mut self.x, ops, &mut out);
         }
         if self.x.req.body == Body::Chunked && !self.x.as_get {
             out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
@@ -172,14 +251,22 @@ impl Conn {
             out.extend_from_slice(b"Connection: close\r\n");
         }
         out.extend_from_slice(b"\r\n");
+        self.out = out;
     }
 
     /// Sends the head in `out` and the body, then reads the response head
-    /// into `resp`, skipping interim responses.
-    async fn exchange(&mut self, up: &mut TcpStream) -> Result<(), Fail> {
-        write_timeout(up, &self.out, SEND_TIMEOUT)
+    /// into `resp`, skipping interim responses. `Err(Ok(Retry))` means the
+    /// status is one to move on from and `last` is false; its body is not
+    /// read.
+    async fn exchange(
+        &mut self,
+        up: &mut TcpStream,
+        p: &Proxy,
+        last: bool,
+    ) -> Result<(), Result<Retry, Fail>> {
+        write_timeout(up, &self.out, p.send_timeout)
             .await
-            .map_err(upstream_fail)?;
+            .map_err(|e| Err(upstream_fail(e)))?;
         if self.x.req.expect_continue && !matches!(self.body, BodyLeft::None) && self.buf.end == 0 {
             write_timeout(
                 &mut self.client,
@@ -187,40 +274,57 @@ impl Conn {
                 CLIENT_SEND,
             )
             .await
-            .map_err(|_| Fail::Client)?;
+            .map_err(|_| Err(Fail::Client))?;
             self.x.req.expect_continue = false;
         }
-        self.pump_body(Some(up)).await?;
+        self.pump_body(Some((up, p.send_timeout)))
+            .await
+            .map_err(Err)?;
 
         let head = self.x.req.method == Method::Head;
         self.ubuf.end = 0;
         loop {
             if self.ubuf.end > 0
                 && parse_response(self.ubuf.filled(), head, &mut self.resp)
-                    .map_err(|_| Fail::Upstream)?
+                    .map_err(|_| Err(Fail::Upstream))?
             {
                 // Upgrade is never requested, so 101 is a protocol error.
                 if self.resp.status == 101 {
-                    return Err(Fail::Upstream);
+                    return Err(Err(Fail::Upstream));
                 }
                 if self.resp.status >= 200 {
+                    if !last && p.next.on_status(self.resp.status) {
+                        return Err(Ok(Retry));
+                    }
                     return Ok(());
                 }
                 self.ubuf.consume(self.resp.head_len);
                 continue;
             }
             if self.ubuf.end >= HEAD_BUF {
-                return Err(Fail::Upstream);
+                return Err(Err(Fail::Upstream));
             }
-            if read(up, &mut self.ubuf, HEAD_BUF).await? == 0 {
-                return Err(Fail::Upstream);
+            if read(up, &mut self.ubuf, HEAD_BUF, p.read_timeout)
+                .await
+                .map_err(Err)?
+                == 0
+            {
+                return Err(Err(Fail::Upstream));
             }
         }
     }
 
     /// Sends the upstream response to the client and pools the upstream
     /// connection when it is reusable.
-    async fn relay(&mut self, mut up: TcpStream, pool: &Pool, pool_ok: bool) -> KeepAlive {
+    async fn relay(
+        &mut self,
+        mut up: TcpStream,
+        pool: &Pool,
+        pool_ok: bool,
+        used: u32,
+        route: &Route,
+        read_timeout: Duration,
+    ) -> KeepAlive {
         let client11 = self.x.req.version == Version::Http11;
         let mut keep = self.x.req.keep_alive;
         let mode = match self.resp.body {
@@ -240,6 +344,17 @@ impl Conn {
             keep = false;
         }
 
+        let status = if self.x.err_status != 0 {
+            self.x.err_status
+        } else {
+            self.resp.status
+        };
+        let ops = &route.response_headers;
+        if ops.is_empty() {
+            self.x.resp_extra.clear();
+        } else {
+            headers::response(&mut self.x, ops, status);
+        }
         let out = &mut self.out;
         out.clear();
         if self.x.err_status != 0 {
@@ -250,15 +365,17 @@ impl Conn {
         for h in self.resp.headers.iter() {
             // nginx hides Date, Server, X-Pad and X-Accel-* by default and
             // sets its own Date and Server.
+            let name = h.name.get(&self.ubuf.data);
             if h.kind.is_hop_by_hop()
                 || matches!(
                     h.kind,
                     HeaderKind::Date | HeaderKind::Server | HeaderKind::Internal
                 )
+                || (!ops.is_empty() && ops.drops(name))
             {
                 continue;
             }
-            out.extend_from_slice(h.name.get(&self.ubuf.data));
+            out.extend_from_slice(name);
             out.extend_from_slice(b": ");
             out.extend_from_slice(h.value.get(&self.ubuf.data));
             out.extend_from_slice(b"\r\n");
@@ -266,24 +383,39 @@ impl Conn {
         if matches!(mode, Mode::Chunked | Mode::Encode) {
             out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
         }
-        reply::connection(out, keep);
+        reply::connection(out, keep, &self.x.resp_extra);
         out.extend_from_slice(b"\r\n");
         self.ubuf.consume(self.resp.head_len);
+        self.x.sent.status = status;
+        // `out` holds the head; flushes count it with the body.
+        self.x.sent.bytes = 0;
+        let head_bytes = out.len() as u64;
 
-        let complete = match self.body_out(&mut up, mode).await {
-            Ok(c) => c,
-            Err(()) => return false,
+        let complete = self.body_out(&mut up, mode, read_timeout).await;
+        self.x.sent.body_bytes = self.x.sent.bytes.saturating_sub(head_bytes);
+        let Ok(complete) = complete else {
+            return false;
         };
         if complete && self.resp.keep_alive && pool_ok && self.ubuf.end == 0 {
-            pool.put(up);
+            pool.put(up, used);
         }
         keep
+    }
+
+    /// Writes `out` to the client and counts it.
+    async fn flush(&mut self) -> Result<(), ()> {
+        self.x.sent.bytes += self.out.len() as u64;
+        let r = write_timeout(&mut self.client, &self.out, CLIENT_SEND)
+            .await
+            .map_err(|_| ());
+        self.out.clear();
+        r
     }
 
     /// Streams the response body. Returns whether the upstream connection is
     /// at a message boundary afterwards. `Err` means the client connection
     /// must close.
-    async fn body_out(&mut self, up: &mut TcpStream, mode: Mode) -> Result<bool, ()> {
+    async fn body_out(&mut self, up: &mut TcpStream, mode: Mode, t: Duration) -> Result<bool, ()> {
         let mut left = match mode {
             Mode::Length(n) => n,
             _ => 0,
@@ -332,29 +464,23 @@ impl Conn {
                 }
             };
             if done || self.out.len() >= BODY_BUF {
-                write_timeout(&mut self.client, &self.out, CLIENT_SEND)
-                    .await
-                    .map_err(|_| ())?;
-                self.out.clear();
+                self.flush().await?;
             }
             if done {
                 return Ok(true);
             }
-            match read(up, &mut self.ubuf, BODY_BUF).await {
+            match read(up, &mut self.ubuf, BODY_BUF, t).await {
                 Ok(0) if matches!(mode, Mode::Encode | Mode::Raw) => {
                     if mode == Mode::Encode {
                         self.out.extend_from_slice(b"0\r\n\r\n");
                     }
-                    write_timeout(&mut self.client, &self.out, CLIENT_SEND)
-                        .await
-                        .map_err(|_| ())?;
-                    self.out.clear();
+                    self.flush().await?;
                     return Ok(false);
                 }
                 // Truncated upstream response: nginx closes the client
                 // connection so the client sees the truncation.
                 Ok(0) | Err(_) => {
-                    let _ = write_timeout(&mut self.client, &self.out, CLIENT_SEND).await;
+                    let _ = self.flush().await;
                     return Err(());
                 }
                 Ok(_) => {}

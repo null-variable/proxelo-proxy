@@ -28,7 +28,10 @@ fn route(kind: path_match::Kind, path: &str, action: action::Kind) -> Route {
 }
 
 fn proxy(upstream: u32) -> action::Kind {
-    action::Kind::Proxy(ProxyAction { upstream })
+    action::Kind::Proxy(ProxyAction {
+        upstream,
+        ..Default::default()
+    })
 }
 
 fn static_root(root: &std::path::Path) -> action::Kind {
@@ -46,6 +49,7 @@ fn upstream(addrs: &[SocketAddr], keepalive: u32) -> Upstream {
             .map(|a| Target {
                 address: a.to_string(),
                 weight: 1,
+                ..Default::default()
             })
             .collect(),
         keepalive_idle: keepalive,
@@ -576,7 +580,7 @@ fn swap_keeps_serving_and_pools() {
     );
     next.revision = 2;
     next.listeners = snap.listeners.clone();
-    server.swap(runtime(&next));
+    server.swap(runtime(&next)).unwrap();
     assert_eq!(server.active().rt.revision, 2);
 
     s.write_all(req).unwrap();

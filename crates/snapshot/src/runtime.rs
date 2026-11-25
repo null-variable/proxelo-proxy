@@ -5,11 +5,15 @@ use std::collections::HashMap;
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use foldhash::fast::FixedState;
+use openssl::pkey::{PKey, Private};
+use openssl::x509::X509;
 use pcre2::bytes::{CaptureLocations, Regex, RegexBuilder};
 use proxelo_api::snapshot::v1::{
-    self as ir, action, error_page, host_match, path_match, rewrite, try_files,
+    self as ir, NextUpstream, action, error_page, host_match, listener_tls, path_match, rewrite,
+    try_files, upstream,
 };
 
 use crate::cond::{Cond, Facts};
@@ -24,6 +28,82 @@ pub struct Runtime {
     pub listeners: Box<[Listener]>,
     pub sites: Box<[Site]>,
     pub upstreams: Box<[Upstream]>,
+    pub certificates: Box<[Certificate]>,
+    pub access_logs: Box<[AccessLog]>,
+}
+
+/// A parsed certificate chain and its private key.
+#[derive(Debug)]
+pub struct Certificate {
+    pub id: Box<str>,
+    /// Leaf first.
+    pub chain: Box<[X509]>,
+    pub key: PKey<Private>,
+}
+
+impl Certificate {
+    /// Parses PEM and checks that the key belongs to the leaf.
+    pub fn parse(id: &str, chain_pem: &[u8], key_pem: &[u8]) -> Result<Self, String> {
+        let chain = X509::stack_from_pem(chain_pem).map_err(|e| format!("chain: {e}"))?;
+        if chain.is_empty() {
+            return Err("chain: no certificate".into());
+        }
+        let key = PKey::private_key_from_pem(key_pem).map_err(|e| format!("key: {e}"))?;
+        let public = chain[0].public_key().map_err(|e| format!("chain: {e}"))?;
+        if !public.public_eq(&key) {
+            return Err("key does not match the certificate".into());
+        }
+        Ok(Self {
+            id: id.into(),
+            chain: chain.into(),
+            key,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct AccessLog {
+    /// "stdout", "stderr" or an absolute path.
+    pub path: Box<str>,
+    pub format: Template,
+    pub escape_json: bool,
+}
+
+/// TLS settings of a listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenerTls {
+    /// 0x0301 (TLS 1.0) to 0x0304 (TLS 1.3).
+    pub min_version: u16,
+    pub ciphers: Box<str>,
+    pub default_certificate: Option<u32>,
+}
+
+/// Changes to a header list: remove, then set, then add.
+#[derive(Debug, Default)]
+pub struct HeaderOps {
+    pub set: Box<[HeaderValue]>,
+    pub add: Box<[HeaderValue]>,
+    /// Lowercase names.
+    pub remove: Box<[Box<[u8]>]>,
+}
+
+impl HeaderOps {
+    pub fn is_empty(&self) -> bool {
+        self.set.is_empty() && self.add.is_empty() && self.remove.is_empty()
+    }
+
+    /// Whether the original header `name` is dropped: removed or replaced.
+    pub fn drops(&self, name: &[u8]) -> bool {
+        self.remove.iter().any(|r| r.eq_ignore_ascii_case(name))
+            || self.set.iter().any(|h| h.name.eq_ignore_ascii_case(name))
+    }
+}
+
+#[derive(Debug)]
+pub struct HeaderValue {
+    pub name: Box<[u8]>,
+    pub value: Template,
+    pub always: bool,
 }
 
 #[derive(Debug)]
@@ -33,6 +113,8 @@ pub struct Listener {
     pub addrs: Box<[SocketAddr]>,
     pub reuse_port: bool,
     pub backlog: u32,
+    pub tls: Option<ListenerTls>,
+    pub http2: bool,
     hosts: Hosts,
     /// The site answering requests whose host matches no site. nginx uses the
     /// first server of a listen socket when none is marked default.
@@ -179,6 +261,12 @@ pub struct Site {
     pub rewrites: Box<[Rewrite]>,
     pub ret: Option<Return>,
     pub error_pages: Box<[ErrorPage]>,
+    /// Listener indexes.
+    pub listeners: Box<[u32]>,
+    pub certificates: Box<[u32]>,
+    pub redirect_https: bool,
+    pub response_headers: HeaderOps,
+    pub access_log: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -188,6 +276,9 @@ pub struct Route {
     pub action: Action,
     pub rewrites: Box<[Rewrite]>,
     pub error_pages: Box<[ErrorPage]>,
+    pub response_headers: HeaderOps,
+    pub request_headers: HeaderOps,
+    pub access_log: Option<u32>,
     children: Option<Level>,
 }
 
@@ -199,10 +290,79 @@ pub enum Action {
         index: Box<[Box<[u8]>]>,
         try_files: Option<TryFiles>,
     },
-    Proxy {
-        upstream: u32,
-    },
+    Proxy(Proxy),
     Return(Return),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Proxy {
+    pub upstream: u32,
+    pub connect_timeout: Duration,
+    pub send_timeout: Duration,
+    pub read_timeout: Duration,
+    pub next: NextOn,
+    /// Zero: no limit.
+    pub tries: u32,
+}
+
+/// proxy_next_upstream conditions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NextOn {
+    pub error: bool,
+    pub timeout: bool,
+    pub non_idempotent: bool,
+    /// Upstream statuses that move on: bit i for STATUSES[i].
+    statuses: u8,
+}
+
+impl NextOn {
+    const STATUSES: [u16; 7] = [500, 502, 503, 504, 403, 404, 429];
+
+    pub fn on_status(&self, status: u16) -> bool {
+        Self::STATUSES
+            .iter()
+            .position(|&s| s == status)
+            .is_some_and(|i| self.statuses >> i & 1 == 1)
+    }
+
+    pub fn any_status(&self) -> bool {
+        self.statuses != 0
+    }
+
+    fn build(list: &[i32]) -> Self {
+        if list.is_empty() {
+            return Self {
+                error: true,
+                timeout: true,
+                ..Self::default()
+            };
+        }
+        let mut n = Self::default();
+        for &v in list {
+            match NextUpstream::try_from(v).unwrap_or(NextUpstream::Unspecified) {
+                NextUpstream::Off => return Self::default(),
+                NextUpstream::Error => n.error = true,
+                NextUpstream::Timeout => n.timeout = true,
+                NextUpstream::NonIdempotent => n.non_idempotent = true,
+                NextUpstream::Unspecified => {}
+                status => {
+                    let code = match status {
+                        NextUpstream::Http500 => 500,
+                        NextUpstream::Http502 => 502,
+                        NextUpstream::Http503 => 503,
+                        NextUpstream::Http504 => 504,
+                        NextUpstream::Http403 => 403,
+                        NextUpstream::Http404 => 404,
+                        _ => 429,
+                    };
+                    if let Some(i) = Self::STATUSES.iter().position(|&s| s == code) {
+                        n.statuses |= 1 << i;
+                    }
+                }
+            }
+        }
+        n
+    }
 }
 
 #[derive(Debug)]
@@ -267,14 +427,21 @@ pub enum ErrorTarget {
 pub struct Upstream {
     pub id: Box<str>,
     pub targets: Box<[Target]>,
+    pub least_conn: bool,
     /// Idle connections kept per worker and target.
     pub keepalive_idle: u32,
+    pub keepalive_timeout: Duration,
+    pub keepalive_requests: u32,
+    /// 0 disables passive health.
+    pub max_fails: u32,
+    pub fail_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Target {
     pub addr: SocketAddr,
     pub weight: u32,
+    pub backup: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -291,6 +458,11 @@ pub enum BuildError {
     HostRegex {
         site: usize,
         host: usize,
+        error: String,
+    },
+    /// A top-level field such as `certificates[0].key_pem`.
+    Field {
+        field: String,
         error: String,
     },
     /// A field of a site or route; `field` is the path below the site, for
@@ -322,11 +494,23 @@ impl fmt::Display for BuildError {
                 write!(f, "sites[{site}].hostnames[{host}].value: {error}")
             }
             Self::Site { site, field, error } => write!(f, "sites[{site}].{field}: {error}"),
+            Self::Field { field, error } => write!(f, "{field}: {error}"),
         }
     }
 }
 
 impl std::error::Error for BuildError {}
+
+fn ms(v: u32, default: Duration) -> Duration {
+    if v == 0 {
+        default
+    } else {
+        Duration::from_millis(u64::from(v))
+    }
+}
+
+/// nginx's default for the proxy timeouts and the upstream keepalive timeout.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn resolve(addr: &str) -> Result<Box<[SocketAddr]>, String> {
     let addrs: Vec<_> = addr.to_socket_addrs().map_err(|e| e.to_string())?.collect();
@@ -346,11 +530,27 @@ impl Runtime {
         for (i, l) in snap.listeners.iter().enumerate() {
             let addrs = resolve(&l.address)
                 .map_err(|error| BuildError::ListenerAddress { listener: i, error })?;
+            let tls = l.tls.as_ref().map(|t| ListenerTls {
+                min_version: match t.min_version() {
+                    listener_tls::Version::Tls10 => 0x0301,
+                    listener_tls::Version::Tls11 => 0x0302,
+                    listener_tls::Version::Unspecified | listener_tls::Version::Tls12 => 0x0303,
+                    listener_tls::Version::Tls13 => 0x0304,
+                },
+                ciphers: if t.ciphers.is_empty() {
+                    "HIGH:!aNULL:!MD5".into()
+                } else {
+                    t.ciphers.as_str().into()
+                },
+                default_certificate: t.default_certificate,
+            });
             listeners.push(Listener {
                 id: l.id.as_str().into(),
                 addrs,
                 reuse_port: l.reuse_port,
                 backlog: l.backlog,
+                tls,
+                http2: l.http2,
                 hosts: Hosts::default(),
                 default_site: l.default_site,
             });
@@ -396,6 +596,12 @@ impl Runtime {
                     None => None,
                 },
                 error_pages: b.error_pages(&site.error_pages, "error_pages")?,
+                listeners: site.listeners.clone().into(),
+                certificates: site.certificates.clone().into(),
+                redirect_https: site.redirect_https,
+                response_headers: b
+                    .header_ops(site.response_headers.as_ref(), "response_headers")?,
+                access_log: site.access_log,
                 routes: b.routes.into(),
             });
         }
@@ -415,22 +621,78 @@ impl Runtime {
                 targets.extend(addrs.iter().map(|&addr| Target {
                     addr,
                     weight: target.weight.max(1),
+                    backup: target.backup,
                 }));
             }
             upstreams.push(Upstream {
                 id: up.id.as_str().into(),
                 targets: targets.into(),
+                least_conn: up.balancing() == upstream::Balancing::LeastConn,
                 keepalive_idle: up.keepalive_idle,
+                keepalive_timeout: ms(up.keepalive_timeout_ms, DEFAULT_TIMEOUT),
+                keepalive_requests: if up.keepalive_requests == 0 {
+                    1000
+                } else {
+                    up.keepalive_requests
+                },
+                max_fails: up.max_fails,
+                fail_timeout: ms(up.fail_timeout_ms, Duration::from_secs(10)),
             });
         }
+
+        let certificates = snap
+            .certificates
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                Certificate::parse(&c.id, c.chain_pem.as_bytes(), c.key_pem.as_bytes()).map_err(
+                    |error| BuildError::Field {
+                        field: format!("certificates[{i}]"),
+                        error,
+                    },
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        let access_logs = snap
+            .access_logs
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let at = format!("access_logs[{i}]");
+                if l.path != "stdout" && l.path != "stderr" && !l.path.starts_with('/') {
+                    return Err(BuildError::Field {
+                        field: format!("{at}.path"),
+                        error: "must be stdout, stderr or an absolute path".into(),
+                    });
+                }
+                Ok(AccessLog {
+                    path: l.path.as_str().into(),
+                    format: Template::parse(&l.format).map_err(|error| BuildError::Field {
+                        field: format!("{at}.format"),
+                        error,
+                    })?,
+                    escape_json: l.escape_json,
+                })
+            })
+            .collect::<Result<_, _>>()?;
 
         Ok(Self {
             revision: snap.revision,
             listeners: listeners.into(),
             sites: sites.into(),
             upstreams: upstreams.into(),
+            certificates,
+            access_logs,
         })
     }
+}
+
+/// An RFC 9110 token.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c))
 }
 
 fn tree_len(routes: &[ir::Route]) -> usize {
@@ -547,9 +809,14 @@ impl SiteBuilder {
                     try_files,
                 }
             }
-            Some(action::Kind::Proxy(p)) => Action::Proxy {
+            Some(action::Kind::Proxy(p)) => Action::Proxy(Proxy {
                 upstream: p.upstream,
-            },
+                connect_timeout: ms(p.connect_timeout_ms, DEFAULT_TIMEOUT),
+                send_timeout: ms(p.send_timeout_ms, DEFAULT_TIMEOUT),
+                read_timeout: ms(p.read_timeout_ms, DEFAULT_TIMEOUT),
+                next: NextOn::build(&p.next_upstream),
+                tries: p.next_upstream_tries,
+            }),
             Some(action::Kind::Return(r)) => {
                 Action::Return(self.ret(r, &format!("{at}.action.return"))?)
             }
@@ -561,7 +828,48 @@ impl SiteBuilder {
             action,
             rewrites: self.rewrites(&route.rewrites, &format!("{at}.rewrites"))?,
             error_pages: self.error_pages(&route.error_pages, &format!("{at}.error_pages"))?,
+            response_headers: self.header_ops(
+                route.response_headers.as_ref(),
+                &format!("{at}.response_headers"),
+            )?,
+            request_headers: self.header_ops(
+                route.request_headers.as_ref(),
+                &format!("{at}.request_headers"),
+            )?,
+            access_log: route.access_log,
             children: None,
+        })
+    }
+
+    fn header_ops(&self, ops: Option<&ir::HeaderOps>, at: &str) -> Result<HeaderOps, BuildError> {
+        let Some(ops) = ops else {
+            return Ok(HeaderOps::default());
+        };
+        let values = |list: &[ir::HeaderValue], field: &str| {
+            list.iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    if !valid_name(&h.name) {
+                        return Err(
+                            self.err(format!("{at}.{field}[{i}].name"), "not a header name")
+                        );
+                    }
+                    Ok(HeaderValue {
+                        name: h.name.as_bytes().into(),
+                        value: self.template(&h.value, &format!("{at}.{field}[{i}].value"))?,
+                        always: h.always,
+                    })
+                })
+                .collect::<Result<Box<[_]>, _>>()
+        };
+        Ok(HeaderOps {
+            set: values(&ops.set, "set")?,
+            add: values(&ops.add, "add")?,
+            remove: ops
+                .remove
+                .iter()
+                .map(|n| n.to_ascii_lowercase().into_bytes().into())
+                .collect(),
         })
     }
 
@@ -646,6 +954,8 @@ impl Runtime {
             listeners: Box::default(),
             sites: Box::default(),
             upstreams: Box::default(),
+            certificates: Box::default(),
+            access_logs: Box::default(),
         }
     }
 
@@ -857,7 +1167,10 @@ mod tests {
                 value: value.into(),
             }),
             action: Some(IrAction {
-                kind: Some(action::Kind::Proxy(ProxyAction { upstream })),
+                kind: Some(action::Kind::Proxy(ProxyAction {
+                    upstream,
+                    ..Default::default()
+                })),
             }),
             ..Default::default()
         }
@@ -905,6 +1218,7 @@ mod tests {
                 targets: vec![IrTarget {
                     address: "127.0.0.1:9000".into(),
                     weight: 0,
+                    ..Default::default()
                 }],
                 keepalive_idle: 4,
                 ..Default::default()
@@ -1185,7 +1499,8 @@ mod tests {
             &*rt.upstreams[0].targets,
             &[Target {
                 addr: "127.0.0.1:9000".parse().unwrap(),
-                weight: 1
+                weight: 1,
+                backup: false,
             }]
         );
         assert_eq!(rt.upstreams[0].keepalive_idle, 4);

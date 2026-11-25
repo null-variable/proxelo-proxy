@@ -10,16 +10,17 @@
 
 use std::ffi::OsStr;
 use std::fs::{File, Metadata};
-use std::io::{self, Write as _};
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 
-use proxelo_http1::{Method, push_u64};
+use proxelo_http1::Method;
 use proxelo_snapshot::{
-    Action, ErrorPage, ErrorTarget, Fallback, MatchError, Part, Return, Rewrite, RewriteFlag, Site,
-    Template, TryFiles, Var,
+    Action, ErrorPage, ErrorTarget, Fallback, MatchError, Return, Rewrite, RewriteFlag, Site,
+    TryFiles,
 };
 
 use crate::exchange::{Exchange, to_get};
+pub(crate) use crate::vars::expand;
 
 /// URI changes per request (rewrites that re-search the route and internal
 /// redirects) before answering 500, as nginx's "rewrite or internal
@@ -38,8 +39,8 @@ pub(crate) enum Outcome {
     File(File, Metadata),
     /// A directory without a trailing slash: 301 to the path with one.
     Directory,
-    /// Proxy to this upstream.
-    Proxy(u32),
+    /// Proxy to this upstream with these settings.
+    Proxy(proxelo_snapshot::Proxy),
     /// Close without a response (444).
     Close,
 }
@@ -195,7 +196,7 @@ impl<'s> Phases<'s> {
     fn content(&mut self, x: &mut Exchange, action: &Action) -> Step {
         match action {
             Action::Return(r) => self.ret(x, r),
-            Action::Proxy { upstream } => Ok(Outcome::Proxy(*upstream)),
+            Action::Proxy(p) => Ok(Outcome::Proxy(*p)),
             Action::Static {
                 root,
                 index,
@@ -415,66 +416,5 @@ fn resolve_static(x: &mut Exchange, root: &[u8], index: &[Box<[u8]>]) -> Static 
             io::ErrorKind::PermissionDenied => 403,
             _ => 500,
         }),
-    }
-}
-
-/// Expands `t` into `tmpl`.
-pub(crate) fn expand(x: &mut Exchange, t: &Template) {
-    let mut out = std::mem::take(&mut x.tmpl);
-    out.clear();
-    for part in t.parts() {
-        match part {
-            Part::Lit(l) => out.extend_from_slice(l),
-            Part::Var(v) => var(x, *v, &mut out),
-            Part::Header(name) => {
-                if let Some(v) = x.request_header(name) {
-                    out.extend_from_slice(v);
-                }
-            }
-            Part::Arg(name) => {
-                if let Some(v) = x.args.split(|&c| c == b'&').find_map(|kv| {
-                    let (k, v) = kv.split_at(kv.iter().position(|&c| c == b'=')?);
-                    k.eq_ignore_ascii_case(name).then_some(&v[1..])
-                }) {
-                    out.extend_from_slice(v);
-                }
-            }
-        }
-    }
-    x.tmpl = out;
-}
-
-fn var(x: &Exchange, v: Var, out: &mut Vec<u8>) {
-    match v {
-        Var::Uri => out.extend_from_slice(&x.path),
-        Var::Args => out.extend_from_slice(&x.args),
-        Var::IsArgs => {
-            if !x.args.is_empty() {
-                out.push(b'?');
-            }
-        }
-        Var::RequestUri => out.extend_from_slice(x.req.target.get(&x.head)),
-        Var::Host => {
-            if x.host.is_empty() {
-                _ = write!(out, "{}", x.local.ip());
-            } else {
-                out.extend_from_slice(&x.host);
-            }
-        }
-        Var::Scheme => out.extend_from_slice(b"http"),
-        Var::RequestMethod => {
-            if x.as_get {
-                out.extend_from_slice(b"GET");
-            } else {
-                out.extend_from_slice(x.req.method_span.get(&x.head));
-            }
-        }
-        Var::ServerPort => push_u64(out, u64::from(x.local.port())),
-        Var::RemoteAddr => _ = write!(out, "{}", x.peer.ip()),
-        Var::Capture(i) => {
-            if let Some(c) = x.caps.get(usize::from(i)) {
-                out.extend_from_slice(c);
-            }
-        }
     }
 }

@@ -22,7 +22,10 @@ pub(crate) fn start(out: &mut Vec<u8>, status: u16, reason_phrase: &[u8]) {
     out.extend_from_slice(b"\r\n");
 }
 
-pub(crate) fn connection(out: &mut Vec<u8>, keep_alive: bool) {
+/// Writes the headers configured for the response (`extra`, complete lines)
+/// and Connection. The caller ends the head.
+pub(crate) fn connection(out: &mut Vec<u8>, keep_alive: bool, extra: &[u8]) {
+    out.extend_from_slice(extra);
     out.extend_from_slice(if keep_alive {
         b"Connection: keep-alive\r\n"
     } else {
@@ -32,7 +35,7 @@ pub(crate) fn connection(out: &mut Vec<u8>, keep_alive: bool) {
 
 /// Finishes a head started with [`start`] with the HTML page nginx generates
 /// for `status`. `head` omits the body for HEAD requests.
-pub(crate) fn page(out: &mut Vec<u8>, status: u16, keep_alive: bool, head: bool) {
+pub(crate) fn page(out: &mut Vec<u8>, status: u16, keep_alive: bool, head: bool, extra: &[u8]) {
     const PRE: &[u8] = b"<html>\r\n<head><title>";
     const MID: &[u8] = b"</title></head>\r\n<body>\r\n<center><h1>";
     const POST: &[u8] = b"</h1></center>\r\n<hr><center>proxelo</center>\r\n</body>\r\n</html>\r\n";
@@ -44,7 +47,7 @@ pub(crate) fn page(out: &mut Vec<u8>, status: u16, keep_alive: bool, head: bool)
     out.extend_from_slice(b"Content-Type: text/html\r\nContent-Length: ");
     push_u64(out, len as u64);
     out.extend_from_slice(b"\r\n");
-    connection(out, keep_alive);
+    connection(out, keep_alive, extra);
     out.extend_from_slice(b"\r\n");
     if head {
         return;
@@ -72,10 +75,11 @@ pub(crate) fn push_uri_path(out: &mut Vec<u8>, path: &[u8]) {
     }
 }
 
-/// Appends `http://host[:port]` for an absolute Location: the request host,
-/// or the local address without one, and the port unless it is 80.
-pub(crate) fn push_origin(out: &mut Vec<u8>, host: &[u8], local: SocketAddr) {
-    out.extend_from_slice(b"http://");
+/// Appends `scheme://host[:port]` for an absolute Location: the request
+/// host, or the local address without one, and the port unless it is the
+/// scheme's default.
+pub(crate) fn push_origin(out: &mut Vec<u8>, https: bool, host: &[u8], local: SocketAddr) {
+    out.extend_from_slice(if https { b"https://" } else { b"http://" });
     if host.is_empty() {
         match local {
             SocketAddr::V4(a) => _ = write!(out, "{}", a.ip()),
@@ -84,7 +88,7 @@ pub(crate) fn push_origin(out: &mut Vec<u8>, host: &[u8], local: SocketAddr) {
     } else {
         out.extend_from_slice(host);
     }
-    if local.port() != 80 {
+    if local.port() != if https { 443 } else { 80 } {
         out.push(b':');
         push_u64(out, u64::from(local.port()));
     }
@@ -102,6 +106,17 @@ pub(crate) fn push_header_value(out: &mut Vec<u8>, value: &[u8]) {
             out.push(c);
         }
     }
+}
+
+/// Appends a configured header value. Spaces and UTF-8 are kept; CR, LF and
+/// other control bytes, which could split the head, are dropped.
+pub(crate) fn push_header_value_lenient(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend(
+        value
+            .iter()
+            .copied()
+            .filter(|&c| c >= b' ' && c != 0x7f || c == b'\t'),
+    );
 }
 
 /// Content type by file extension, as in nginx's default `mime.types`.
@@ -152,7 +167,7 @@ mod tests {
     fn page_length_matches_body() {
         for status in [301, 400, 404, 502] {
             let mut out = Vec::new();
-            page(&mut out, status, true, false);
+            page(&mut out, status, true, false, b"");
             let text = String::from_utf8(out).unwrap();
             let (head, body) = text.split_once("\r\n\r\n").unwrap();
             assert!(
@@ -166,7 +181,7 @@ mod tests {
     #[test]
     fn head_page_has_no_body() {
         let mut out = Vec::new();
-        page(&mut out, 404, false, true);
+        page(&mut out, 404, false, true, b"");
         assert!(out.ends_with(b"Connection: close\r\n\r\n"));
     }
 

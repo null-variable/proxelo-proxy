@@ -129,18 +129,30 @@ fn warm_requests_do_not_allocate() {
                         ..Default::default()
                     }),
                 ),
-                route("/api/", action::Kind::Proxy(ProxyAction { upstream: 0 })),
+                route(
+                    "/api/",
+                    action::Kind::Proxy(ProxyAction {
+                        upstream: 0,
+                        ..Default::default()
+                    }),
+                ),
                 // Regex locations: every request is checked against them, the
                 // case-insensitive one matches /img/ requests.
                 route_kind(
                     path_match::Kind::Regex,
                     r"\.php$",
-                    action::Kind::Proxy(ProxyAction { upstream: 0 }),
+                    action::Kind::Proxy(ProxyAction {
+                        upstream: 0,
+                        ..Default::default()
+                    }),
                 ),
                 route_kind(
                     path_match::Kind::RegexCi,
                     r"^/img/.+\.(png|jpg)$",
-                    action::Kind::Proxy(ProxyAction { upstream: 0 }),
+                    action::Kind::Proxy(ProxyAction {
+                        upstream: 0,
+                        ..Default::default()
+                    }),
                 ),
             ],
             ..Default::default()
@@ -149,6 +161,7 @@ fn warm_requests_do_not_allocate() {
             targets: vec![Target {
                 address: upstream().to_string(),
                 weight: 1,
+                ..Default::default()
             }],
             keepalive_idle: 4,
             ..Default::default()

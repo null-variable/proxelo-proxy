@@ -34,6 +34,8 @@ run options:
   --node-id <id>      name reported to the control plane (default: host name)
 
 run and serve options:
+  --metrics <addr>    serve Prometheus metrics at http://<addr>/metrics
+                      (default 127.0.0.1:9145; \"off\" disables)
   --workers <n>       worker threads (default: number of CPUs)
   --runtime <kind>    shared: one multi-threaded runtime (default)
                       per-core: one single-threaded runtime per worker";
@@ -45,6 +47,7 @@ enum RuntimeKind {
 }
 
 struct Options {
+    metrics: Option<std::net::SocketAddr>,
     workers: usize,
     kind: RuntimeKind,
     data: PathBuf,
@@ -105,6 +108,7 @@ fn exit(r: Result<(), String>) -> ExitCode {
 
 fn parse_options(mut opts: &[&str], run: bool) -> Option<Options> {
     let mut o = Options {
+        metrics: Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9145))),
         workers: std::thread::available_parallelism().map_or(1, |n| n.get()),
         kind: RuntimeKind::Shared,
         data: PathBuf::from("/var/lib/proxelo"),
@@ -113,6 +117,8 @@ fn parse_options(mut opts: &[&str], run: bool) -> Option<Options> {
     };
     while let [flag, value, rest @ ..] = opts {
         match *flag {
+            "--metrics" if *value == "off" => o.metrics = None,
+            "--metrics" => o.metrics = Some(value.parse().ok()?),
             "--workers" => o.workers = value.parse().ok().filter(|&n| n > 0)?,
             "--runtime" => {
                 o.kind = match *value {
@@ -141,6 +147,9 @@ fn load(path: &Path) -> Result<(Snapshot, Runtime), String> {
 fn build(bytes: &[u8]) -> Result<(Snapshot, Runtime), String> {
     let snap = proxelo_snapshot::load(bytes).map_err(|e| e.to_string())?;
     let rt = Runtime::build(&snap).map_err(|e| e.to_string())?;
+    // TLS contexts are built here too, so what OpenSSL rejects fails a
+    // check or dry-load and not only a live swap.
+    proxelo_server::check_tls(&rt)?;
     Ok((snap, rt))
 }
 
@@ -291,9 +300,11 @@ fn serve(path: &Path, o: &Options) -> Result<(), String> {
     let mut listeners = Listeners::new(workers.handles, o.kind == RuntimeKind::PerCore);
     listeners.apply(&server, rt).map_err(|e| e.to_string())?;
     eprintln!("serving revision {revision} with {}", describe(o));
-    main_runtime()?
-        .block_on(shutdown_signal())
-        .map_err(|e| e.to_string())
+    let main = main_runtime()?;
+    main.block_on(async {
+        start_metrics(&server, o.metrics)?;
+        shutdown_signal().await.map_err(|e| e.to_string())
+    })
 }
 
 /// Serves snapshots pushed by the control plane until terminated. Starts from
@@ -339,7 +350,9 @@ fn run(o: Options) -> Result<(), String> {
         node_id: o.node_id.unwrap_or_else(hostname),
         version: env!("CARGO_PKG_VERSION").to_owned(),
     };
+    let metrics = o.metrics;
     main_runtime()?.block_on(async move {
+        start_metrics(&node.server, metrics)?;
         tokio::select! {
             () = client.run(&mut node, |line| eprintln!("{line}")) => Ok(()),
             r = shutdown_signal() => r.map_err(|e| e.to_string()),
@@ -365,8 +378,25 @@ impl Apply for Node {
         &self.hash
     }
 
+    fn challenges(&mut self, c: proxelo_sync::Challenges) {
+        proxelo_server::set_http_challenges(
+            &c.http01
+                .into_iter()
+                .map(|h| (h.token, h.key_authorization))
+                .collect::<Vec<_>>(),
+        );
+        let errors = proxelo_server::set_tls_challenges(
+            &c.tls_alpn01
+                .into_iter()
+                .map(|t| (t.name, t.chain_pem, t.key_pem))
+                .collect::<Vec<_>>(),
+        );
+        for e in errors {
+            eprintln!("{e}");
+        }
+    }
+
     fn apply(&mut self, snap: Snapshot, bytes: &[u8]) -> Result<(), String> {
-        proxelo_snapshot::validate(&snap).map_err(|e| e.to_string())?;
         let rt = Runtime::build(&snap).map_err(|e| e.to_string())?;
         self.listeners
             .apply(&self.server, rt)
@@ -412,11 +442,62 @@ fn main_runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Waits for SIGINT or SIGTERM. SIGUSR1 reopens access log files, for
+/// rotation, as in nginx.
 async fn shutdown_signal() -> std::io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate())?;
-    tokio::select! {
-        r = tokio::signal::ctrl_c() => r,
-        _ = term.recv() => Ok(()),
+    let mut usr1 = signal(SignalKind::user_defined1())?;
+    loop {
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => return r,
+            _ = term.recv() => return Ok(()),
+            _ = usr1.recv() => proxelo_server::reopen_logs(),
+        }
     }
+}
+
+/// Serves `GET /metrics` on `addr`, apart from traffic listeners
+/// (a separate port, localhost by default).
+fn start_metrics(server: &Arc<Server>, addr: Option<std::net::SocketAddr>) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Some(addr) = addr else {
+        return Ok(());
+    };
+    let std = std::net::TcpListener::bind(addr).map_err(|e| format!("metrics {addr}: {e}"))?;
+    std.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let listener = tokio::net::TcpListener::from_std(std).map_err(|e| e.to_string())?;
+    let server = server.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                continue;
+            };
+            let server = server.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let mut n = 0;
+                while !buf[..n].windows(4).any(|w| w == b"\r\n\r\n") && n < buf.len() {
+                    match s.read(&mut buf[n..]).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(k) => n += k,
+                    }
+                }
+                let line = buf[..n].split(|&c| c == b'\r').next().unwrap_or_default();
+                let (status, body) = if line.starts_with(b"GET /metrics ") {
+                    ("200 OK", proxelo_server::metrics::render(&server))
+                } else {
+                    ("404 Not Found", String::new())
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = s.write_all(head.as_bytes()).await;
+                let _ = s.write_all(body.as_bytes()).await;
+            });
+        }
+    });
+    eprintln!("metrics on http://{addr}/metrics");
+    Ok(())
 }

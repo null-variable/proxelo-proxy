@@ -1,26 +1,25 @@
 //! One client connection: read a request, route it, answer, repeat.
 //!
 //! Every buffer lives in [`Conn`] and is reused for the next request, so a warm
-//! keepalive connection serves requests without allocating.
+//! keepalive connection serves requests without allocating. The connection is
+//! plain TCP, TLS, or one HTTP/2 stream bridged as HTTP/1.1 (see `h2`); the
+//! code here does not tell them apart.
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use proxelo_http1::{
     Body, ChunkedDecoder, Error as ParseError, Method, Response, parse_request, push_u64,
     request_line_complete,
 };
-use proxelo_snapshot::MatchError;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
-use tokio::time::timeout;
+use proxelo_snapshot::{HeaderOps, MatchError};
 
 use crate::buf::Buf;
 use crate::exchange::Exchange;
+use crate::io::{Stream, write_timeout};
 use crate::phases::{Outcome, Phases};
-use crate::{Active, Server, reply};
+use crate::{Active, acme, headers, log, reply};
 
 // nginx defaults.
 const CLIENT_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -32,6 +31,8 @@ const HEADER_BUF: usize = 1024;
 const MAX_HEADER: usize = 32 * 1024;
 /// `client_max_body_size`.
 pub(crate) const MAX_BODY: u64 = 1024 * 1024;
+/// `keepalive_requests`.
+const KEEPALIVE_REQUESTS: u64 = 1000;
 
 /// Unread part of the request body.
 pub(crate) enum BodyLeft {
@@ -58,18 +59,11 @@ pub(crate) fn upstream_fail(e: io::Error) -> Fail {
     }
 }
 
-pub(crate) async fn write_timeout(s: &mut TcpStream, data: &[u8], t: Duration) -> io::Result<()> {
-    match timeout(t, s.write_all(data)).await {
-        Ok(r) => r,
-        Err(_) => Err(io::ErrorKind::TimedOut.into()),
-    }
-}
-
 /// Whether the client connection stays open for another request.
 pub(crate) type KeepAlive = bool;
 
 pub(crate) struct Conn {
-    pub client: TcpStream,
+    pub client: Stream,
     /// Address of the socket that accepted the connection.
     listener: SocketAddr,
     served: bool,
@@ -82,50 +76,73 @@ pub(crate) struct Conn {
     pub x: Exchange,
 }
 
+/// Bytes after the head in a response built in one buffer.
+pub(crate) fn body_len(out: &[u8]) -> usize {
+    out.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(0, |i| out.len() - i - 4)
+}
+
 /// nginx keeps the connection after an error page except for these.
 pub(crate) fn keeps_alive(status: u16) -> bool {
     !matches!(status, 400 | 413 | 414 | 500 | 501)
 }
 
-pub(crate) async fn serve(server: Arc<Server>, listener: SocketAddr, client: TcpStream) {
-    let _ = client.set_nodelay(true);
-    let (Ok(local), Ok(peer)) = (client.local_addr(), client.peer_addr()) else {
-        return;
-    };
-    let mut c = Conn {
-        client,
-        listener,
-        served: false,
-        buf: Buf::new(),
-        ubuf: Buf::new(),
-        resp: Response::default(),
-        body: BodyLeft::None,
-        out: Vec::new(),
-        x: Exchange::new(local, peer),
-    };
-    loop {
-        match c.read_head().await {
-            Ok(true) => {}
-            Ok(false) => return,
-            Err(e) => {
-                c.error(e.status()).await;
-                return;
-            }
-        }
-        let active = server.active.load_full();
-        if !c.handle(&active).await {
-            return;
-        }
-        c.served = true;
-    }
+static CONN_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What the phases decided, for logging and metrics after the response.
+struct Done {
+    site: Option<u32>,
+    route: Option<u32>,
 }
 
 impl Conn {
+    pub fn new(client: Stream, listener: SocketAddr, local: SocketAddr, peer: SocketAddr) -> Self {
+        let mut x = Exchange::new(local, peer);
+        x.conn_id = CONN_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        Self {
+            client,
+            listener,
+            served: false,
+            buf: Buf::new(),
+            ubuf: Buf::new(),
+            resp: Response::default(),
+            body: BodyLeft::None,
+            out: Vec::new(),
+            x,
+        }
+    }
+
+    /// Serves requests until the connection ends. `active` gives the newest
+    /// snapshot, read once per request.
+    pub async fn serve(mut self, active: impl Fn() -> std::sync::Arc<Active>) {
+        loop {
+            match self.read_head().await {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(e) => {
+                    self.error(e.status()).await;
+                    return;
+                }
+            }
+            let active = active();
+            self.x.requests += 1;
+            if self.x.requests >= KEEPALIVE_REQUESTS {
+                self.x.req.keep_alive = false;
+            }
+            if !self.handle(&active).await {
+                return;
+            }
+            self.served = true;
+        }
+    }
+
     /// Reads until a full request head is buffered. `Ok(false)` means the
     /// connection ended or timed out; nginx closes silently then.
     async fn read_head(&mut self) -> Result<bool, ParseError> {
         loop {
             if self.buf.end > 0 && parse_request(self.buf.filled(), &mut self.x.req)? {
+                self.x.started = Instant::now();
                 return Ok(true);
             }
             if self.buf.end >= MAX_HEADER {
@@ -140,7 +157,7 @@ impl Conn {
             } else {
                 CLIENT_HEADER_TIMEOUT
             };
-            match timeout(
+            match tokio::time::timeout(
                 wait,
                 self.buf.fill(&mut self.client, HEADER_BUF, MAX_HEADER),
             )
@@ -156,11 +173,43 @@ impl Conn {
     async fn error(&mut self, status: u16) {
         self.out.clear();
         reply::start(&mut self.out, status, b"");
-        reply::page(&mut self.out, status, false, false);
+        reply::page(&mut self.out, status, false, false, b"");
         let _ = write_timeout(&mut self.client, &self.out, SEND_TIMEOUT).await;
     }
 
     async fn handle(&mut self, active: &Active) -> KeepAlive {
+        let mut done = Done {
+            site: None,
+            route: None,
+        };
+        let keep = self.handle_in(active, &mut done).await;
+        self.finish(active, &done);
+        keep
+    }
+
+    /// Logs the request and counts it.
+    fn finish(&mut self, active: &Active, done: &Done) {
+        let Some(site) = done.site else {
+            return;
+        };
+        let rt = &active.rt;
+        let s = &rt.sites[site as usize];
+        let log_index = match done.route {
+            Some(r) => s.routes[r as usize].access_log,
+            None => s.access_log,
+        };
+        if let Some(i) = log_index {
+            log::write(&active.logs, &rt.access_logs, i, &mut self.x);
+        }
+        active.metrics.request(
+            site,
+            done.route,
+            self.x.sent.status,
+            self.x.started.elapsed(),
+        );
+    }
+
+    async fn handle_in(&mut self, active: &Active, done: &mut Done) -> KeepAlive {
         let head_len = self.x.req.head_len;
         self.x.head.clear();
         self.x.head.extend_from_slice(&self.buf.data[..head_len]);
@@ -179,25 +228,45 @@ impl Conn {
         if let Err(status) = self.x.begin() {
             return self.page(status).await;
         }
+        // ACME HTTP-01 is answered on plain listeners before any site, so a
+        // certificate can be issued for a site that redirects to https.
+        if !self.x.https()
+            && matches!(self.x.req.method, Method::Get | Method::Head)
+            && acme::http_answer(&self.x.path, &mut self.x.tmpl)
+        {
+            return self.send_text(200).await;
+        }
         // The listener was removed by a swap after this connection was
         // accepted. Its socket is closed; close the connection too.
         let Some(listener) = active.rt.listener(self.listener) else {
             return false;
         };
-        let site = match listener.site(self.x.host()) {
+        let site_index = match listener.site(self.x.host()) {
             Ok(Some(site)) => site,
             Ok(None) => return self.page(404).await,
             Err(MatchError) => return self.page(500).await,
         };
-        let mut phases = Phases::new(&active.rt.sites[site as usize], false);
+        done.site = Some(site_index);
+        let site = &active.rt.sites[site_index as usize];
+        if site.redirect_https && !self.x.https() {
+            return self.redirect_https().await;
+        }
+        let mut phases = Phases::new(site, false);
         loop {
-            return match phases.run(&mut self.x) {
-                Outcome::Proxy(u) => {
+            let outcome = phases.run(&mut self.x);
+            done.route = phases.route;
+            let ops = match phases.route {
+                Some(r) => &site.routes[r as usize].response_headers,
+                None => &site.response_headers,
+            };
+            return match outcome {
+                Outcome::Proxy(p) => {
                     // An error page made this a GET; its body is not sent on.
                     if self.x.as_get && self.pump_body(None).await.is_err() {
                         return false;
                     }
-                    match self.proxy(&active.upstreams[u as usize]).await {
+                    let route = &site.routes[phases.route.expect("proxy has a route") as usize];
+                    match self.proxy(active, &p, route).await {
                         Ok(keep) => keep,
                         Err(status) => {
                             phases.fail(status);
@@ -205,18 +274,56 @@ impl Conn {
                         }
                     }
                 }
-                Outcome::Text(status) => self.send_text(status).await,
-                Outcome::Redirect(status) => self.send_redirect(status).await,
-                Outcome::Page(status) => self.page(status).await,
-                Outcome::File(f, m) => self.send_file(f, &m).await,
-                Outcome::Directory => self.redirect_dir().await,
-                Outcome::Close => false,
+                Outcome::Text(status) => {
+                    let st = self.x.status(status);
+                    self.extra(ops, st);
+                    self.send_text(status).await
+                }
+                Outcome::Redirect(status) => {
+                    let st = self.x.status(status);
+                    self.extra(ops, st);
+                    self.send_redirect(status).await
+                }
+                Outcome::Page(status) => {
+                    self.extra(ops, status);
+                    self.page(status).await
+                }
+                Outcome::File(f, m) => {
+                    let st = self.x.status(200);
+                    self.extra(ops, st);
+                    self.send_file(f, &m).await
+                }
+                Outcome::Directory => {
+                    self.extra(ops, 301);
+                    self.redirect_dir().await
+                }
+                Outcome::Close => {
+                    self.x.sent.status = 444;
+                    false
+                }
             };
         }
     }
 
+    /// Expands the configured response headers for `status`.
+    fn extra(&mut self, ops: &HeaderOps, status: u16) {
+        if ops.is_empty() {
+            self.x.resp_extra.clear();
+        } else {
+            headers::response(&mut self.x, ops, status);
+        }
+    }
+
+    /// Writes `out` and records what was sent.
+    async fn send(&mut self, keep: KeepAlive, status: u16, body: usize) -> KeepAlive {
+        self.x.sent.status = status;
+        self.x.sent.bytes = self.out.len() as u64;
+        self.x.sent.body_bytes = body as u64;
+        self.respond(keep).await
+    }
+
     /// Answers `status` with the body in `tmpl`.
-    async fn send_text(&mut self, status: u16) -> KeepAlive {
+    pub async fn send_text(&mut self, status: u16) -> KeepAlive {
         let status = self.x.status(status);
         let keep = self.x.req.keep_alive;
         let out = &mut self.out;
@@ -228,16 +335,18 @@ impl Conn {
         out.extend_from_slice(b"Content-Length: ");
         push_u64(out, self.x.tmpl.len() as u64);
         out.extend_from_slice(b"\r\n");
-        reply::connection(out, keep);
+        reply::connection(out, keep, &self.x.resp_extra);
         out.extend_from_slice(b"\r\n");
+        let mut body = 0;
         if self.x.req.method != Method::Head {
             out.extend_from_slice(&self.x.tmpl);
+            body = self.x.tmpl.len();
         }
-        self.respond(keep).await
+        self.send(keep, status, body).await
     }
 
     /// Redirects to the Location in `tmpl`, made absolute with the request
-    /// host and port when it is a path (nginx `absolute_redirect on`).
+    /// scheme, host and port when it is a path (nginx `absolute_redirect on`).
     async fn send_redirect(&mut self, status: u16) -> KeepAlive {
         let status = self.x.status(status);
         let keep = self.x.req.keep_alive && keeps_alive(status);
@@ -246,24 +355,50 @@ impl Conn {
         reply::start(out, status, b"");
         out.extend_from_slice(b"Location: ");
         if self.x.tmpl.starts_with(b"/") {
-            reply::push_origin(out, &self.x.host, self.x.local);
+            reply::push_origin(out, self.x.tls.is_some(), &self.x.host, self.x.local);
         }
         reply::push_header_value(out, &self.x.tmpl);
         out.extend_from_slice(b"\r\n");
-        reply::page(out, status, keep, self.x.req.method == Method::Head);
-        self.respond(keep).await
+        let head = self.x.req.method == Method::Head;
+        reply::page(out, status, keep, head, &self.x.resp_extra);
+        let body = body_len(out);
+        self.send(keep, status, body).await
+    }
+
+    /// 301 to the same URI over https on the default port, like the nginx
+    /// idiom `return 301 https://$host$request_uri`.
+    async fn redirect_https(&mut self) -> KeepAlive {
+        let keep = self.x.req.keep_alive;
+        let out = &mut self.out;
+        out.clear();
+        reply::start(out, 301, b"");
+        out.extend_from_slice(b"Location: https://");
+        if self.x.host.is_empty() {
+            let _ = std::io::Write::write_fmt(out, format_args!("{}", self.x.local.ip()));
+        } else {
+            out.extend_from_slice(&self.x.host);
+        }
+        out.extend_from_slice(self.x.req.target.get(&self.x.head));
+        out.extend_from_slice(b"\r\n");
+        let head = self.x.req.method == Method::Head;
+        reply::page(out, 301, keep, head, b"");
+        let body = body_len(out);
+        self.send(keep, 301, body).await
     }
 
     /// Reads the rest of the request body. With `up` the bytes are forwarded
     /// as framed and `client_max_body_size` applies; without it they are
     /// discarded.
-    pub async fn pump_body(&mut self, mut up: Option<&mut TcpStream>) -> Result<(), Fail> {
+    pub async fn pump_body(
+        &mut self,
+        mut up: Option<(&mut tokio::net::TcpStream, Duration)>,
+    ) -> Result<(), Fail> {
         loop {
             if matches!(self.body, BodyLeft::None) {
                 return Ok(());
             }
             if self.buf.end == 0 {
-                match timeout(
+                match tokio::time::timeout(
                     CLIENT_BODY_TIMEOUT,
                     self.buf.fill(&mut self.client, HEADER_BUF, MAX_HEADER),
                 )
@@ -292,8 +427,8 @@ impl Conn {
                     (take, dec.is_done())
                 }
             };
-            if let Some(u) = up.as_deref_mut() {
-                write_timeout(u, &self.buf.data[..take], crate::proxy::SEND_TIMEOUT)
+            if let Some((u, t)) = up.as_mut() {
+                write_timeout(*u, &self.buf.data[..take], *t)
                     .await
                     .map_err(upstream_fail)?;
             }
@@ -320,12 +455,9 @@ impl Conn {
         let keep = self.x.req.keep_alive && keeps_alive(status);
         self.out.clear();
         reply::start(&mut self.out, status, b"");
-        reply::page(
-            &mut self.out,
-            status,
-            keep,
-            self.x.req.method == Method::Head,
-        );
-        self.respond(keep).await
+        let head = self.x.req.method == Method::Head;
+        reply::page(&mut self.out, status, keep, head, &self.x.resp_extra);
+        let body = body_len(&self.out);
+        self.send(keep, status, body).await
     }
 }

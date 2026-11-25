@@ -26,20 +26,28 @@ pub struct Listeners {
     open: HashMap<SocketAddr, Vec<JoinHandle<()>>>,
 }
 
+/// Why a snapshot could not be applied; nothing changed.
 #[derive(Debug)]
-pub struct BindError {
-    pub listener: usize,
-    pub addr: SocketAddr,
-    pub error: io::Error,
+pub enum BindError {
+    Bind {
+        listener: usize,
+        addr: SocketAddr,
+        error: io::Error,
+    },
+    /// TLS contexts could not be built.
+    Tls(String),
 }
 
 impl fmt::Display for BindError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "listeners[{}]: bind {}: {}",
-            self.listener, self.addr, self.error
-        )
+        match self {
+            Self::Bind {
+                listener,
+                addr,
+                error,
+            } => write!(f, "listeners[{listener}]: bind {addr}: {error}"),
+            Self::Tls(e) => f.write_str(e),
+        }
     }
 }
 
@@ -59,7 +67,8 @@ impl Listeners {
     }
 
     /// Makes `rt` the active snapshot of `server` and opens and closes sockets
-    /// to match it. If an address cannot be bound, nothing changes.
+    /// to match it. If an address cannot be bound or TLS cannot be set up,
+    /// nothing changes.
     ///
     /// The settings of a socket that stays open (`reuse_port`, `backlog`) are
     /// kept until its address is removed; changing them on a live socket
@@ -85,7 +94,7 @@ impl Listeners {
                 for _ in 0..n {
                     // Sockets bound so far close when `fresh` drops.
                     let s = bind(addr, l.reuse_port || self.per_worker, l.backlog).map_err(
-                        |error| BindError {
+                        |error| BindError::Bind {
                             listener: i,
                             addr,
                             error,
@@ -97,7 +106,8 @@ impl Listeners {
             }
         }
 
-        server.swap(rt);
+        let next = server.prepare(rt).map_err(BindError::Tls)?;
+        server.install(next);
 
         for (addr, sockets) in fresh {
             let tasks = sockets

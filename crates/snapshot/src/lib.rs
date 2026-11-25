@@ -12,8 +12,9 @@ use std::fmt;
 
 pub use cond::{Cond, Facts};
 pub use runtime::{
-    Action, BuildError, Captures, ErrorPage, ErrorTarget, Fallback, Listener, MatchError, Pattern,
-    Return, Rewrite, RewriteFlag, Route, Runtime, Site, Target, TryFiles, Upstream,
+    AccessLog, Action, BuildError, Captures, Certificate, ErrorPage, ErrorTarget, Fallback,
+    HeaderOps, HeaderValue, Listener, ListenerTls, MatchError, NextOn, Pattern, Proxy, Return,
+    Rewrite, RewriteFlag, Route, Runtime, Site, Target, TryFiles, Upstream,
 };
 pub use template::{Part, Template, Var};
 
@@ -48,6 +49,13 @@ pub enum LoadError {
     EmptyUpstream {
         upstream: usize,
     },
+    /// A top-level field, for example `listeners[0].tls.default_certificate`.
+    Field {
+        field: String,
+        error: &'static str,
+    },
+    /// The hash does not match the bytes.
+    Hash,
 }
 
 impl fmt::Display for LoadError {
@@ -65,6 +73,8 @@ impl fmt::Display for LoadError {
             }
             Self::Site { site, field, error } => write!(f, "sites[{site}].{field}: {error}"),
             Self::EmptyUpstream { upstream } => write!(f, "upstreams[{upstream}]: no targets"),
+            Self::Field { field, error } => write!(f, "{field}: {error}"),
+            Self::Hash => f.write_str("hash does not match the snapshot"),
         }
     }
 }
@@ -77,6 +87,7 @@ type Invalid = (String, &'static str);
 struct SiteCheck {
     upstreams: usize,
     named: usize,
+    logs: usize,
 }
 
 impl SiteCheck {
@@ -128,6 +139,9 @@ impl SiteCheck {
             Some(action::Kind::Proxy(_)) => {}
         }
         self.error_pages(&route.error_pages, &format!("{at}.error_pages"))?;
+        if route.access_log.is_some_and(|l| l as usize >= self.logs) {
+            return Err((format!("{at}.access_log"), "no such access log"));
+        }
         if matched {
             self.routes(&route.children, &format!("{at}.children"), true)?;
         }
@@ -165,11 +179,57 @@ fn check_return(r: &ReturnAction, at: String) -> Result<(), Invalid> {
     Ok(())
 }
 
-/// Decodes and validates a serialized snapshot.
+/// Decodes and validates a serialized snapshot, checking its hash when it
+/// has one.
 pub fn load(bytes: &[u8]) -> Result<Snapshot, LoadError> {
     let snap = Snapshot::decode(bytes).map_err(|e| LoadError::Decode(e.to_string()))?;
+    if !snap.hash.is_empty() && hash(bytes).is_none_or(|h| h[..] != snap.hash[..]) {
+        return Err(LoadError::Hash);
+    }
     validate(&snap)?;
     Ok(snap)
+}
+
+/// SHA-256 of a serialized snapshot without its hash field (number 2), the
+/// way the control plane computes it: it serializes the snapshot without the
+/// hash, then adds the field. Dropping the field's records from the bytes
+/// gives back exactly what was hashed, whatever their position. `None` for
+/// malformed bytes.
+pub fn hash(bytes: &[u8]) -> Option<[u8; 32]> {
+    let mut h = openssl::sha::Sha256::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let start = rest;
+        let key = varint(&mut rest)?;
+        let len = match key & 7 {
+            0 => {
+                varint(&mut rest)?;
+                0
+            }
+            1 => 8,
+            2 => usize::try_from(varint(&mut rest)?).ok()?,
+            5 => 4,
+            _ => return None,
+        };
+        rest = rest.get(len..)?;
+        if key >> 3 != 2 {
+            h.update(&start[..start.len() - rest.len()]);
+        }
+    }
+    Some(h.finish())
+}
+
+fn varint(b: &mut &[u8]) -> Option<u64> {
+    let mut v = 0u64;
+    for i in 0..10 {
+        let (&c, rest) = b.split_first()?;
+        *b = rest;
+        v |= u64::from(c & 0x7f) << (7 * i);
+        if c < 0x80 {
+            return Some(v);
+        }
+    }
+    None
 }
 
 /// Checks every cross reference and required field.
@@ -178,11 +238,27 @@ pub fn validate(snap: &Snapshot) -> Result<(), LoadError> {
     let listeners = snap.listeners.len();
     let upstreams = snap.upstreams.len();
 
+    let certs = snap.certificates.len();
+    let logs = snap.access_logs.len();
+    let field = |field: String, error| Err(LoadError::Field { field, error });
     for (i, l) in snap.listeners.iter().enumerate() {
         if let Some(site) = l.default_site
             && site as usize >= sites
         {
             return Err(LoadError::ListenerSite { listener: i, site });
+        }
+        if l.tls
+            .as_ref()
+            .and_then(|t| t.default_certificate)
+            .is_some_and(|c| c as usize >= certs)
+        {
+            return field(
+                format!("listeners[{i}].tls.default_certificate"),
+                "no such certificate",
+            );
+        }
+        if l.http2 && l.tls.is_none() {
+            return field(format!("listeners[{i}].http2"), "requires tls");
         }
     }
 
@@ -195,9 +271,16 @@ pub fn validate(snap: &Snapshot) -> Result<(), LoadError> {
                 return Err(LoadError::UnspecifiedHost { site: s, host: h });
             }
         }
+        if site.certificates.iter().any(|&c| c as usize >= certs) {
+            return field(format!("sites[{s}].certificates"), "no such certificate");
+        }
+        if site.access_log.is_some_and(|l| l as usize >= logs) {
+            return field(format!("sites[{s}].access_log"), "no such access log");
+        }
         let v = SiteCheck {
             upstreams,
             named: site.named_routes.len(),
+            logs,
         };
         let at = |field: String, error| LoadError::Site {
             site: s,
@@ -239,7 +322,10 @@ mod tests {
                 value: "/".into(),
             }),
             action: Some(Action {
-                kind: Some(action::Kind::Proxy(ProxyAction { upstream })),
+                kind: Some(action::Kind::Proxy(ProxyAction {
+                    upstream,
+                    ..Default::default()
+                })),
             }),
             ..Default::default()
         }
@@ -266,6 +352,7 @@ mod tests {
                 targets: vec![Target {
                     address: "127.0.0.1:8080".into(),
                     weight: 1,
+                    ..Default::default()
                 }],
                 ..Default::default()
             }],
@@ -363,6 +450,18 @@ mod tests {
                 error: "no such upstream"
             })
         );
+    }
+
+    #[test]
+    fn checks_hash() {
+        let mut s = valid();
+        let unhashed = s.encode_to_vec();
+        s.hash = openssl::sha::sha256(&unhashed).to_vec();
+        let bytes = s.encode_to_vec();
+        assert_eq!(hash(&bytes).map(|h| h.to_vec()), Some(s.hash.clone()));
+        assert!(load(&bytes).is_ok());
+        s.revision = 2;
+        assert_eq!(load(&s.encode_to_vec()), Err(LoadError::Hash));
     }
 
     #[test]

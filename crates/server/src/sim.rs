@@ -5,12 +5,13 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use proxelo_api::sim::v1::{HttpRequest, Result as SimResult, result::Kind};
+use proxelo_api::sim::v1::{Header, HttpRequest, Result as SimResult, result::Kind};
 use proxelo_http1::parse_request;
 use proxelo_snapshot::{MatchError, Runtime};
 
 use crate::exchange::Exchange;
 use crate::phases::{Outcome, Phases};
+use crate::tls::TlsInfo;
 
 fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
@@ -45,6 +46,9 @@ pub fn simulate(rt: &Runtime, r: &HttpRequest) -> SimResult {
         }
     };
     let mut x = Exchange::new(local, SocketAddr::new(ip, 0));
+    if r.tls {
+        x.tls = Some(TlsInfo::default());
+    }
 
     // The request as a client would send it, read by the serving parser.
     let method = if r.method.is_empty() {
@@ -92,12 +96,27 @@ pub fn simulate(rt: &Runtime, r: &HttpRequest) -> SimResult {
     };
     let site = &rt.sites[site as usize];
     out.site = site.id.to_string();
+    if site.redirect_https && !r.tls {
+        out.kind = Kind::Redirect as i32;
+        out.status = 301;
+        out.location = format!(
+            "https://{}{}",
+            if x.host.is_empty() {
+                local.ip().to_string()
+            } else {
+                text(&x.host)
+            },
+            text(x.req.target.get(&x.head))
+        );
+        out.trace.push("redirect to https".into());
+        return out;
+    }
     let mut phases = Phases::new(site, true);
     let outcome = phases.run(&mut x);
     let location = |x: &Exchange| {
         if x.tmpl.starts_with(b"/") {
             let mut l = Vec::new();
-            crate::reply::push_origin(&mut l, &x.host, x.local);
+            crate::reply::push_origin(&mut l, x.tls.is_some(), &x.host, x.local);
             l.extend_from_slice(&x.tmpl);
             text(&l)
         } else {
@@ -135,8 +154,8 @@ pub fn simulate(rt: &Runtime, r: &HttpRequest) -> SimResult {
             }
             out.location = location(&x);
         }
-        Outcome::Proxy(u) => {
-            let up = &rt.upstreams[u as usize];
+        Outcome::Proxy(p) => {
+            let up = &rt.upstreams[p.upstream as usize];
             out.kind = Kind::Proxy as i32;
             out.status = x.err_status.into();
             out.upstream = up.id.to_string();
@@ -144,8 +163,37 @@ pub fn simulate(rt: &Runtime, r: &HttpRequest) -> SimResult {
         }
         Outcome::Close => out.kind = Kind::Close as i32,
     }
-    if let Some(r) = phases.route {
-        out.route = site.routes[r as usize].id.to_string();
+    let route = phases.route.map(|r| &site.routes[r as usize]);
+    if let Some(r) = route {
+        out.route = r.id.to_string();
+    }
+    let hdr = |b: &[u8]| {
+        let line = text(b);
+        line.lines()
+            .filter_map(|l| l.split_once(": "))
+            .map(|(n, v)| Header {
+                name: n.into(),
+                value: v.into(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let ops = route.map_or(&site.response_headers, |r| &r.response_headers);
+    if !ops.is_empty() {
+        let status = if out.status == 0 {
+            200
+        } else {
+            out.status as u16
+        };
+        crate::headers::response(&mut x, ops, status);
+        out.response_headers = hdr(&x.resp_extra);
+    }
+    if out.kind == Kind::Proxy as i32
+        && let Some(r) = route
+        && !r.request_headers.is_empty()
+    {
+        let mut b = Vec::new();
+        crate::headers::request(&mut x, &r.request_headers, &mut b);
+        out.request_headers = hdr(&b);
     }
     out.uri = text(&x.path);
     if !x.args.is_empty() {

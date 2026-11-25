@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
-use prost::Message;
+pub use proxelo_api::distrib::v1::Challenges;
 use proxelo_api::distrib::v1::{
     Ack, Hello, SyncRequest, distribution_service_client::DistributionServiceClient, sync_request,
     sync_response,
@@ -33,9 +33,12 @@ pub trait Apply {
     fn active_revision(&self) -> u64;
     /// Hash of the snapshot currently served, empty if none.
     fn active_hash(&self) -> &[u8];
-    /// Validates, builds and swaps in `snap`. `bytes` is its serialized form,
-    /// for persisting. On error the previous snapshot stays active.
+    /// Validates, builds and swaps in `snap`, decoded and hash-checked from
+    /// `bytes`, which are persisted as received. On error the previous
+    /// snapshot stays active.
     fn apply(&mut self, snap: Snapshot, bytes: &[u8]) -> Result<(), String>;
+    /// Replaces the ACME challenges answered.
+    fn challenges(&mut self, c: Challenges);
 }
 
 pub struct Client {
@@ -109,21 +112,31 @@ impl Client {
                 Ok(None) => return Ok(()),
                 Err(e) => return Err(Session::after(e)),
             };
-            let Some(sync_response::Kind::Snapshot(snap)) = msg.kind else {
-                continue;
-            };
-            let revision = snap.revision;
-            let result = if !snap.hash.is_empty() && snap.hash == target.active_hash() {
-                // Already serving it, typically the LKG after a restart.
-                Ok(())
-            } else {
-                let bytes = snap.encode_to_vec();
-                let r = target.apply(snap, &bytes);
-                match &r {
-                    Ok(()) => log(&format!("applied revision {revision}")),
-                    Err(e) => log(&format!("rejected revision {revision}: {e}")),
+            let bytes = match msg.kind {
+                Some(sync_response::Kind::SnapshotData(b)) => b,
+                Some(sync_response::Kind::Challenges(c)) => {
+                    target.challenges(c);
+                    continue;
                 }
-                r
+                // The deprecated embedded form cannot be verified.
+                #[allow(deprecated)]
+                Some(sync_response::Kind::Snapshot(_)) | None => continue,
+            };
+            let (revision, result) = match proxelo_snapshot::load(&bytes) {
+                Err(e) => (0, Err(e.to_string())),
+                Ok(snap) if !snap.hash.is_empty() && snap.hash == target.active_hash() => {
+                    // Already serving it, typically the LKG after a restart.
+                    (snap.revision, Ok(()))
+                }
+                Ok(snap) => {
+                    let revision = snap.revision;
+                    let r = target.apply(snap, &bytes);
+                    match &r {
+                        Ok(()) => log(&format!("applied revision {revision}")),
+                        Err(e) => log(&format!("rejected revision {revision}: {e}")),
+                    }
+                    (revision, r)
+                }
             };
             let ack = Ack {
                 revision,

@@ -3,9 +3,27 @@
 //! and the simulator run requests through the same [`Exchange`].
 
 use std::net::{IpAddr, SocketAddr};
+use std::time::Instant;
 
 use proxelo_http1::{Method, Request, normalize_path};
 use proxelo_snapshot::{Captures, Facts};
+
+use crate::tls::TlsInfo;
+
+/// What the access log and metrics need about the response.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct Sent {
+    pub status: u16,
+    /// Bytes written to the client, head included.
+    pub bytes: u64,
+    pub body_bytes: u64,
+    pub upstream_addr: Option<SocketAddr>,
+    pub upstream_status: u16,
+    /// Seconds.
+    pub upstream_connect: Option<f64>,
+    pub upstream_header: Option<f64>,
+    pub upstream_response: Option<f64>,
+}
 
 pub(crate) struct Exchange {
     pub local: SocketAddr,
@@ -34,6 +52,22 @@ pub(crate) struct Exchange {
     pub err_status: u16,
     /// An error page turned the request into a GET; its body is not sent on.
     pub as_get: bool,
+    /// Over TLS, with what the handshake chose.
+    pub tls: Option<TlsInfo>,
+    /// Served through HTTP/2.
+    pub h2: bool,
+    pub started: Instant,
+    /// Requests served on this connection, this one included.
+    pub requests: u64,
+    /// Connection serial number ($connection).
+    pub conn_id: u64,
+    /// $request_id: 32 hex digits, made when first used.
+    pub request_id: [u8; 32],
+    pub request_id_set: bool,
+    pub sent: Sent,
+    /// Response headers from the route's (or site's) HeaderOps, expanded
+    /// as complete lines, added to generated responses.
+    pub resp_extra: Vec<u8>,
 }
 
 /// Lowercases `raw` into `out` without the port and a trailing dot.
@@ -68,7 +102,36 @@ impl Exchange {
             error_paged: false,
             err_status: 0,
             as_get: false,
+            tls: None,
+            h2: false,
+            started: Instant::now(),
+            requests: 0,
+            conn_id: 0,
+            request_id: [0; 32],
+            request_id_set: false,
+            sent: Sent::default(),
+            resp_extra: Vec::new(),
         }
+    }
+
+    pub fn https(&self) -> bool {
+        self.tls.is_some()
+    }
+
+    /// The unique ID of this request, made from 16 random bytes like nginx.
+    pub fn request_id(&mut self) -> &[u8; 32] {
+        if !self.request_id_set {
+            let mut raw = [0u8; 16];
+            if openssl::rand::rand_bytes(&mut raw).is_err() {
+                raw = (self.conn_id as u128 ^ (self.requests as u128) << 64).to_le_bytes();
+            }
+            for (i, b) in raw.iter().enumerate() {
+                self.request_id[2 * i] = b"0123456789abcdef"[usize::from(b >> 4)];
+                self.request_id[2 * i + 1] = b"0123456789abcdef"[usize::from(b & 15)];
+            }
+            self.request_id_set = true;
+        }
+        &self.request_id
     }
 
     /// Starts the request parsed into `req` from `head`: host, path and
@@ -76,6 +139,9 @@ impl Exchange {
     /// the root.
     pub fn begin(&mut self) -> Result<(), u16> {
         self.caps.clear();
+        self.request_id_set = false;
+        self.sent = Sent::default();
+        self.resp_extra.clear();
         self.uri_changed = false;
         self.error_paged = false;
         self.err_status = 0;
@@ -144,7 +210,7 @@ impl Facts for Exchange {
     }
 
     fn scheme(&self) -> &[u8] {
-        b"http"
+        if self.https() { b"https" } else { b"http" }
     }
 
     fn remote_addr(&self) -> IpAddr {

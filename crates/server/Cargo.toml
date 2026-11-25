@@ -9,6 +9,11 @@ publish.workspace = true
 
 [dependencies]
 arc-swap.workspace = true
+bytes.workspace = true
+h2.workspace = true
+http.workspace = true
+openssl.workspace = true
+tokio-openssl.workspace = true
 proxelo-api.workspace = true
 proxelo-http1.workspace = true
 proxelo-snapshot.workspace = true

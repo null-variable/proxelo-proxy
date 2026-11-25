@@ -13,6 +13,7 @@ prost.workspace = true
 foldhash.workspace = true
 pcre2.workspace = true
 cel.workspace = true
+openssl.workspace = true
 
 [lints]
 workspace = true

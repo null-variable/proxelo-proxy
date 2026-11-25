@@ -2,8 +2,7 @@
 
 use std::io;
 
-use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Bytes `data[..end]` are filled. `data` stays fully initialized so reads go
 /// straight into it; it grows on demand and never shrinks.
@@ -32,9 +31,9 @@ impl Buf {
 
     /// Reads once into the free space, doubling the buffer from `initial` up
     /// to `max` when it is full. Returns 0 at end of stream.
-    pub async fn fill(
+    pub async fn fill<S: AsyncRead + Unpin>(
         &mut self,
-        s: &mut TcpStream,
+        s: &mut S,
         initial: usize,
         max: usize,
     ) -> io::Result<usize> {
