@@ -35,9 +35,9 @@ pub fn normalize_path(raw: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
             };
             c = h << 4 | l;
             i += 2;
-            if c == 0 {
-                return Err(Error::BadRequest);
-            }
+        }
+        if c == 0 {
+            return Err(Error::BadRequest);
         }
         if c == b'/' {
             if out.last() == Some(&b'/') {
@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn rejects() {
-        for raw in ["", "a", "/..", "/a/../..", "/%2e%2e", "/%zz", "/%4", "/%00"] {
+        for raw in ["", "a", "/..", "/a/../..", "/%2e%2e", "/%zz", "/%4", "/%00", "/(\0}"] {
             assert_eq!(norm(raw), Err(Error::BadRequest), "{raw}");
         }
     }
