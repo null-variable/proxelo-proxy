@@ -11,7 +11,7 @@ The wire format between the two lives in
 
 Early development. `proxelo-proxy run` receives snapshots from the control
 plane and serves them; `proxelo-proxy serve` serves a single snapshot file.
-Both serve HTTP/1.1:
+Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
 
 - Sites by nginx `server_name` order: exact name, longest `*.name` or
   `.name`, longest `name.*`, first PCRE2 regex, then the default site.
@@ -30,9 +30,33 @@ Both serve HTTP/1.1:
   snapshots and simulate requests with this engine (same parser, site lookup
   and phases; proxying reports the upstream instead of connecting).
 - Static files (`root`, `index`) and reverse proxying with smooth weighted
-  round robin and keepalive upstream connections.
+  round robin or least_conn, backup targets, passive health (`max_fails`,
+  `fail_timeout`), `proxy_next_upstream` retries on errors, timeouts and
+  listed statuses, per-route timeouts and keepalive upstream connections
+  with an idle timeout and a request limit.
+- TLS with OpenSSL 3: minimum version and cipher list per listener, one
+  certificate per site chosen by SNI with the same lookup as `Host`, a
+  default certificate for handshakes without a matching name. Certificates
+  and keys are checked when a snapshot is loaded, and the TLS contexts are
+  built before a swap, so a snapshot OpenSSL rejects is refused whole.
+- HTTP/2 through ALPN (the `h2` crate) on TLS listeners. Each stream runs
+  through the same phases, proxying, logs and metrics as HTTP/1.1.
+- Response and upstream request headers set, added or removed per route
+  (nginx `add_header` with `always`, `proxy_set_header`,
+  `proxy_hide_header`), with variables such as `$request_id` and `$scheme`.
+- Redirect to https per site, and ACME HTTP-01 and TLS-ALPN-01 challenges
+  handed down by the control plane.
+- Access logs per route in nginx `log_format` syntax with `escape=json`,
+  to stdout, stderr or files, written by a background thread; lines are
+  dropped and counted when it falls behind. SIGUSR1 reopens files.
+- Prometheus metrics on `--metrics` (default `127.0.0.1:9145/metrics`):
+  requests and latency per site and route, upstream responses, failures,
+  latency and health per target, connections, TLS handshake errors and
+  snapshot swaps. Counters survive swaps.
 
-TLS and HTTP/2 are not built yet.
+Snapshots arrive as bytes and are checked against their SHA-256 hash
+before they are applied or written as the last-known-good snapshot. A
+replaced snapshot is freed on a separate thread.
 
 Behaviour follows nginx defaults where the snapshot has no setting yet:
 timeouts (`client_header_timeout 60s`, `keepalive_timeout 75s`,
@@ -47,14 +71,15 @@ timeout` and the response headers nginx hides from upstreams.
 | `crates/proxy` | `proxelo-proxy` binary |
 | `crates/snapshot` | Validates snapshots and builds the runtime form (host and route lookup with PCRE2, route conditions with CEL, templates, resolved upstream targets) |
 | `crates/http1` | HTTP/1.1 codec: in-place parsing, strict framing, chunked decoding, path normalization |
-| `crates/server` | Accept loop, request phases (shared with the simulator), static files, proxying, upstream pools, snapshot swap, listening sockets that follow the snapshot |
+| `crates/server` | Accept loop, TLS (`tls.rs`) and HTTP/2 (`h2.rs`), request phases (shared with the simulator), variables, static files, proxying, upstream state, header changes, access logs, metrics, snapshot swap, listening sockets that follow the snapshot |
 | `crates/sync` | Control plane client: receives snapshots over the control socket and acks them |
 | `fuzz` | `cargo fuzz` targets for the codec (separate workspace, nightly) |
 
 ## Build
 
 ```sh
-cargo build --release      # builds the bundled PCRE2 with a C compiler
+cargo build --release      # builds the bundled PCRE2; links the system OpenSSL 3
+                           # (OPENSSL_DIR=$(brew --prefix openssl@3) on macOS)
 ./target/release/proxelo-proxy version
 ./target/release/proxelo-proxy check snapshot.bin
 ./target/release/proxelo-proxy serve snapshot.bin --workers 4 --runtime per-core
