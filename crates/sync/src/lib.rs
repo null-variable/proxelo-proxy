@@ -16,7 +16,7 @@ use proxelo_api::distrib::v1::{
     Ack, Hello, SyncRequest, distribution_service_client::DistributionServiceClient, sync_request,
     sync_response,
 };
-pub use proxelo_api::distrib::v1::{Challenges, Stats};
+pub use proxelo_api::distrib::v1::{Challenges, RouteStats, SiteStats, Stats, TargetStats};
 use proxelo_api::snapshot::v1::Snapshot;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;

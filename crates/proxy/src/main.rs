@@ -398,12 +398,44 @@ impl Apply for Node {
 
     fn stats(&self) -> proxelo_sync::Stats {
         let t = proxelo_server::metrics::totals();
+        let per = proxelo_server::metrics::per_resource();
         proxelo_sync::Stats {
             revision: self.revision,
             requests: t.requests,
             server_errors: t.server_errors,
             upstream_attempts: t.upstream_attempts,
             upstream_failures: t.upstream_failures,
+            sites: per
+                .sites
+                .into_iter()
+                .map(|(id, c)| proxelo_sync::SiteStats {
+                    id,
+                    requests: c.requests,
+                    server_errors: c.server_errors,
+                })
+                .collect(),
+            routes: per
+                .routes
+                .into_iter()
+                .map(|(site_id, id, c)| proxelo_sync::RouteStats {
+                    site_id,
+                    id,
+                    requests: c.requests,
+                    server_errors: c.server_errors,
+                })
+                .collect(),
+            targets: per
+                .targets
+                .into_iter()
+                .map(
+                    |(upstream_id, address, attempts, failures)| proxelo_sync::TargetStats {
+                        upstream_id,
+                        address,
+                        attempts,
+                        failures,
+                    },
+                )
+                .collect(),
         }
     }
 

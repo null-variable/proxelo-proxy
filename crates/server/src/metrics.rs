@@ -116,6 +116,67 @@ pub struct Totals {
     pub upstream_failures: u64,
 }
 
+/// Requests and 5xx of one site or route since start.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Count {
+    pub requests: u64,
+    pub server_errors: u64,
+}
+
+/// Counters per resource since start, for every resource any snapshot had.
+#[derive(Clone, Debug, Default)]
+pub struct PerResource {
+    /// By site ID.
+    pub sites: Vec<(String, Count)>,
+    /// By site ID and route ID.
+    pub routes: Vec<(String, String, Count)>,
+    /// By upstream ID and target address: attempts, failures.
+    pub targets: Vec<(String, String, u64, u64)>,
+}
+
+impl Requests {
+    fn count(&self) -> Count {
+        Count {
+            requests: self
+                .by_class
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .sum(),
+            server_errors: self.by_class[4].load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Reads the per-resource counters. Resources without traffic are left out.
+pub fn per_resource() -> PerResource {
+    let guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = PerResource::default();
+    let Some(reg) = guard.as_ref() else {
+        return out;
+    };
+    for (id, r) in &reg.sites {
+        let c = r.count();
+        if c.requests > 0 {
+            out.sites.push((id.to_string(), c));
+        }
+    }
+    for ((site, id), r) in &reg.routes {
+        let c = r.count();
+        if c.requests > 0 {
+            out.routes.push((site.to_string(), id.to_string(), c));
+        }
+    }
+    for ((up, addr), t) in &reg.targets {
+        let ok: u64 = t.responses.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        let failures = t.failures.load(Ordering::Relaxed);
+        if ok + failures > 0 {
+            out.targets
+                .push((up.to_string(), addr.clone(), ok + failures, failures));
+        }
+    }
+    out
+}
+
 /// Counters since start, across snapshots.
 pub fn totals() -> Totals {
     Totals {
