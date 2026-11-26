@@ -57,6 +57,11 @@ impl Listeners {
     /// `workers` must not be empty. With `per_worker`, each worker accepts on
     /// its own socket; otherwise one socket per address is accepted on the
     /// first worker's runtime.
+    /// The runtime background tasks run on: the first worker's.
+    pub fn background(&self) -> Handle {
+        self.workers[0].clone()
+    }
+
     pub fn new(workers: Vec<Handle>, per_worker: bool) -> Self {
         assert!(!workers.is_empty(), "at least one worker runtime");
         Self {

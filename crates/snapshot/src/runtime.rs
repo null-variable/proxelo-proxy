@@ -179,7 +179,7 @@ impl Pattern {
         &self.source
     }
 
-    pub(crate) fn is_match(&self, subject: &[u8]) -> Result<bool, MatchError> {
+    pub fn is_match(&self, subject: &[u8]) -> Result<bool, MatchError> {
         self.re.is_match(subject).map_err(|_| MatchError)
     }
 
@@ -423,11 +423,32 @@ pub enum ErrorTarget {
     Route(u32),
 }
 
+/// How an upstream picks a target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Balancing {
+    RoundRobin,
+    LeastConn,
+    IpHash,
+    Hash,
+    HashConsistent,
+    Random,
+    RandomTwo,
+}
+
 #[derive(Debug)]
 pub struct Upstream {
     pub id: Box<str>,
     pub targets: Box<[Target]>,
-    pub least_conn: bool,
+    pub balancing: Balancing,
+    /// Key of the hash methods.
+    pub hash_key: Template,
+    pub health_check: Option<HealthCheck>,
+    pub sticky: Option<Sticky>,
+    /// Requests that may wait for a target at max_conns; 0: none.
+    pub queue_size: u32,
+    pub queue_timeout: Duration,
+    /// Upstream connections close after being open this long.
+    pub keepalive_time: Duration,
     /// Idle connections kept per worker and target.
     pub keepalive_idle: u32,
     pub keepalive_timeout: Duration,
@@ -440,12 +461,66 @@ pub struct Upstream {
     pub fail_timeout: Duration,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One address of a configured target. A host name with several addresses
+/// gives one `Target` per address, all with the same `name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub addr: SocketAddr,
+    /// The address as configured, host:port.
+    pub name: Box<str>,
     pub weight: u32,
     pub backup: bool,
+    pub down: bool,
+    /// 0: no limit.
+    pub max_conns: u32,
+    pub slow_start: Duration,
+    /// Sticky route value.
+    pub route: Box<str>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckKind {
+    Http,
+    Tcp,
+}
+
+/// Active health checks of an upstream's targets.
+#[derive(Debug)]
+pub struct HealthCheck {
+    pub kind: CheckKind,
+    pub interval: Duration,
+    pub timeout: Duration,
+    pub fails: u32,
+    pub passes: u32,
+    /// HTTP request line target.
+    pub path: Box<str>,
+    /// Host header; empty: the upstream's host or the target's address.
+    pub host: Box<str>,
+    /// Passing statuses, inclusive ranges.
+    pub statuses: Box<[(u16, u16)]>,
+    pub body: Option<Pattern>,
+    /// 0: the target's port.
+    pub port: u16,
+}
+
+#[derive(Debug)]
+pub enum Sticky {
+    Cookie(StickyCookie),
+    /// Templates tried in order; the first non-empty value names a target
+    /// by its route.
+    Route(Box<[Template]>),
+}
+
+#[derive(Debug)]
+pub struct StickyCookie {
+    pub name: Box<str>,
+    /// Attributes after the value, starting with "; ".
+    pub attributes: Box<str>,
+}
+
+/// Addresses of host names, from the DNS re-resolution of targets marked
+/// `resolve`, by name as configured.
+pub type Resolved = HashMap<String, Box<[SocketAddr]>>;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum BuildError {
@@ -504,6 +579,94 @@ impl fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
+fn health_check(h: &ir::HealthCheck, at: &str) -> Result<HealthCheck, BuildError> {
+    use ir::health_check::Kind;
+    let field = |f: &str, error: String| BuildError::Field {
+        field: format!("{at}.{f}"),
+        error,
+    };
+    let body = if h.body.is_empty() {
+        None
+    } else {
+        Some(Pattern::new(&h.body, false).map_err(|e| field("body", e))?)
+    };
+    let mut statuses: Vec<(u16, u16)> = h
+        .statuses
+        .iter()
+        .map(|r| (r.from.min(999) as u16, r.to.min(999) as u16))
+        .collect();
+    if statuses.is_empty() {
+        statuses.push((200, 399));
+    }
+    Ok(HealthCheck {
+        kind: if h.kind() == Kind::Tcp {
+            CheckKind::Tcp
+        } else {
+            CheckKind::Http
+        },
+        interval: ms(h.interval_ms, Duration::from_secs(5)),
+        timeout: ms(h.timeout_ms, Duration::from_secs(1)),
+        fails: h.fails.max(1),
+        passes: h.passes.max(1),
+        path: if h.path.is_empty() { "/" } else { &h.path }.into(),
+        host: h.host.as_str().into(),
+        statuses: statuses.into(),
+        body,
+        port: u16::try_from(h.port).map_err(|_| field("port", "out of range".into()))?,
+    })
+}
+
+fn sticky(s: &ir::Sticky, at: &str) -> Result<Sticky, BuildError> {
+    use std::fmt::Write as _;
+    if s.kind() == ir::sticky::Kind::Route {
+        let route = s
+            .route
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                Template::parse(r).map_err(|error| BuildError::Field {
+                    field: format!("{at}.route[{i}]"),
+                    error,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        return Ok(Sticky::Route(route));
+    }
+    let mut attributes = String::new();
+    let _ = write!(
+        attributes,
+        "; Path={}",
+        if s.path.is_empty() { "/" } else { &s.path }
+    );
+    if !s.domain.is_empty() {
+        let _ = write!(attributes, "; Domain={}", s.domain);
+    }
+    if s.max_age_s > 0 {
+        let _ = write!(attributes, "; Max-Age={}", s.max_age_s);
+    }
+    if s.http_only {
+        attributes.push_str("; HttpOnly");
+    }
+    if s.secure {
+        attributes.push_str("; Secure");
+    }
+    match s.same_site.as_str() {
+        "strict" => attributes.push_str("; SameSite=Strict"),
+        "lax" => attributes.push_str("; SameSite=Lax"),
+        "none" => attributes.push_str("; SameSite=None"),
+        _ => {}
+    }
+    Ok(Sticky::Cookie(StickyCookie {
+        name: if s.cookie.is_empty() {
+            "route"
+        } else {
+            &s.cookie
+        }
+        .into(),
+        attributes: attributes.into(),
+    }))
+}
+
 fn ms(v: u32, default: Duration) -> Duration {
     if v == 0 {
         default
@@ -529,6 +692,13 @@ impl Runtime {
     /// Host names in listener and target addresses are resolved here, once,
     /// like nginx resolves them when it reads its configuration.
     pub fn build(snap: &ir::Snapshot) -> Result<Self, BuildError> {
+        Self::build_with(snap, &Resolved::new())
+    }
+
+    /// Like [`Self::build`], with the addresses of `resolve` targets taken
+    /// from `resolved`. A `resolve` target missing there is resolved now; one
+    /// that does not resolve has no addresses until it does, as in nginx.
+    pub fn build_with(snap: &ir::Snapshot, resolved: &Resolved) -> Result<Self, BuildError> {
         let mut listeners = Vec::with_capacity(snap.listeners.len());
         for (i, l) in snap.listeners.iter().enumerate() {
             let addrs = resolve(&l.address)
@@ -613,24 +783,67 @@ impl Runtime {
         for (u, up) in snap.upstreams.iter().enumerate() {
             let mut targets = Vec::new();
             for (t, target) in up.targets.iter().enumerate() {
-                let addrs =
-                    resolve(&target.address).map_err(|error| BuildError::TargetAddress {
-                        upstream: u,
-                        target: t,
-                        error,
-                    })?;
+                let addrs = match resolved.get(&target.address) {
+                    Some(a) if target.resolve => a.clone(),
+                    _ => match resolve(&target.address) {
+                        Ok(a) => a,
+                        Err(_) if target.resolve => Box::default(),
+                        Err(error) => {
+                            return Err(BuildError::TargetAddress {
+                                upstream: u,
+                                target: t,
+                                error,
+                            });
+                        }
+                    },
+                };
                 // A name with several addresses becomes one peer per address,
                 // each with the configured weight, as in nginx.
                 targets.extend(addrs.iter().map(|&addr| Target {
                     addr,
+                    name: target.address.as_str().into(),
                     weight: target.weight.max(1),
                     backup: target.backup,
+                    down: target.down,
+                    max_conns: target.max_conns,
+                    slow_start: Duration::from_millis(target.slow_start_ms.into()),
+                    route: target.route.as_str().into(),
                 }));
             }
+            let at = format!("upstreams[{u}]");
+            let health_check = up
+                .health_check
+                .as_ref()
+                .map(|h| health_check(h, &format!("{at}.health_check")))
+                .transpose()?;
+            let sticky = up
+                .sticky
+                .as_ref()
+                .map(|s| sticky(s, &format!("{at}.sticky")))
+                .transpose()?;
             upstreams.push(Upstream {
                 id: up.id.as_str().into(),
                 targets: targets.into(),
-                least_conn: up.balancing() == upstream::Balancing::LeastConn,
+                balancing: match up.balancing() {
+                    upstream::Balancing::LeastConn => Balancing::LeastConn,
+                    upstream::Balancing::IpHash => Balancing::IpHash,
+                    upstream::Balancing::Hash => Balancing::Hash,
+                    upstream::Balancing::HashConsistent => Balancing::HashConsistent,
+                    upstream::Balancing::Random => Balancing::Random,
+                    upstream::Balancing::RandomTwo => Balancing::RandomTwo,
+                    upstream::Balancing::RoundRobin | upstream::Balancing::Unspecified => {
+                        Balancing::RoundRobin
+                    }
+                },
+                hash_key: Template::parse(&up.hash_key).map_err(|error| BuildError::Field {
+                    field: format!("{at}.hash_key"),
+                    error,
+                })?,
+                health_check,
+                sticky,
+                queue_size: up.queue_size,
+                queue_timeout: ms(up.queue_timeout_ms, Duration::from_secs(60)),
+                keepalive_time: ms(up.keepalive_time_ms, Duration::from_secs(3600)),
                 keepalive_idle: up.keepalive_idle,
                 keepalive_timeout: ms(up.keepalive_timeout_ms, DEFAULT_TIMEOUT),
                 keepalive_requests: if up.keepalive_requests == 0 {
@@ -1503,11 +1716,55 @@ mod tests {
             &*rt.upstreams[0].targets,
             &[Target {
                 addr: "127.0.0.1:9000".parse().unwrap(),
+                name: "127.0.0.1:9000".into(),
                 weight: 1,
                 backup: false,
+                down: false,
+                max_conns: 0,
+                slow_start: Duration::ZERO,
+                route: "".into(),
             }]
         );
         assert_eq!(rt.upstreams[0].keepalive_idle, 4);
+    }
+
+    #[test]
+    fn resolve_targets_wait_for_an_address() {
+        let mut snap = snapshot(vec![], None);
+        snap.upstreams[0].targets[0].address = "no-such-host.invalid:80".into();
+        assert!(Runtime::build(&snap).is_err());
+        snap.upstreams[0].targets[0].resolve = true;
+        let rt = Runtime::build(&snap).unwrap();
+        assert!(rt.upstreams[0].targets.is_empty());
+        let mut resolved = Resolved::new();
+        resolved.insert(
+            "no-such-host.invalid:80".into(),
+            vec!["10.0.0.7:80".parse().unwrap()].into(),
+        );
+        let rt = Runtime::build_with(&snap, &resolved).unwrap();
+        assert_eq!(rt.upstreams[0].targets[0].addr.to_string(), "10.0.0.7:80");
+    }
+
+    #[test]
+    fn sticky_cookie_attributes() {
+        let mut snap = snapshot(vec![], None);
+        snap.upstreams[0].sticky = Some(ir::Sticky {
+            kind: ir::sticky::Kind::Cookie.into(),
+            cookie: "srv".into(),
+            max_age_s: 60,
+            http_only: true,
+            same_site: "lax".into(),
+            ..Default::default()
+        });
+        let rt = Runtime::build(&snap).unwrap();
+        let Some(Sticky::Cookie(c)) = &rt.upstreams[0].sticky else {
+            panic!("no cookie");
+        };
+        assert_eq!(&*c.name, "srv");
+        assert_eq!(
+            &*c.attributes,
+            "; Path=/; Max-Age=60; HttpOnly; SameSite=Lax"
+        );
     }
 
     #[test]

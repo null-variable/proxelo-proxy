@@ -5,13 +5,13 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use proxelo_http1::{Body, ChunkedDecoder, HeaderKind, Method, Version, parse_response, push_hex};
-use proxelo_snapshot::{Proxy, Route};
+use proxelo_snapshot::{Balancing, Proxy, Route, Sticky};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::conn::{BodyLeft, Conn, Fail, KeepAlive, SEND_TIMEOUT as CLIENT_SEND, upstream_fail};
 use crate::io::write_timeout;
-use crate::upstream::Pool;
+use crate::upstream::{Choice, Conn as UpConn, Pool, State};
 use crate::{Active, headers, reply};
 
 /// `proxy_buffer_size`: the upstream response head must fit.
@@ -73,30 +73,45 @@ impl Conn {
         let replayable = (self.x.req.body == Body::None || self.x.as_get)
             && (p.next.non_idempotent || idempotent(self.x.req.method));
         let started = Instant::now();
-        let mut tried = 0u64;
+        let mut choice = Choice {
+            prefer: self.sticky(active, p.upstream),
+            ..Default::default()
+        };
+        // The key of the hash methods, in `tmpl`.
+        self.balancing_key(active, p.upstream);
+        let mut queue_deadline = None;
         let mut tries = 0u32;
         let mut status = 502;
         loop {
             if p.tries != 0 && tries >= p.tries {
                 break;
             }
-            let Some(picked) = ups.pick(tried) else {
+            let Some(picked) = ups.pick(&mut choice, &self.x.tmpl) else {
+                // Every target that could take it is at max_conns: wait in
+                // the queue (nginx queue), then pick again.
+                if ups.full(choice.tried) {
+                    let deadline = *queue_deadline.get_or_insert_with(|| ups.queue_deadline());
+                    if ups.wait(Some(deadline)).await {
+                        continue;
+                    }
+                }
                 break;
             };
             tries += 1;
             let i = picked.index;
-            if i < 64 {
-                tried |= 1 << i;
-            }
             let pool = &ups.pools()[i];
             self.x.sent.upstream_addr = Some(pool.addr);
             let connect = Instant::now();
-            let (mut up, used) = match pool.take() {
-                Some(s) => s,
+            let mut up = match pool.take() {
+                Some(c) => c,
                 None => match timeout(p.connect_timeout, TcpStream::connect(pool.addr)).await {
                     Ok(Ok(s)) => {
                         let _ = s.set_nodelay(true);
-                        (s, 0)
+                        UpConn {
+                            stream: s,
+                            used: 0,
+                            opened: Instant::now(),
+                        }
                     }
                     // Nothing was sent, so any request may move on.
                     Ok(Err(_)) => {
@@ -119,11 +134,12 @@ impl Conn {
                     }
                 },
             };
-            let reused = used > 0;
+            let reused = up.used > 0;
             self.x.sent.upstream_connect = Some(connect.elapsed().as_secs_f64());
             self.upstream_head(pool.addr, &ups.host, ups.keepalive, route);
-            let last = !replayable || !ups.has_next(tried) || (p.tries != 0 && tries >= p.tries);
-            match self.exchange(&mut up, p, last).await {
+            let last =
+                !replayable || !ups.has_next(choice.tried) || (p.tries != 0 && tries >= p.tries);
+            match self.exchange(&mut up.stream, p, last).await {
                 Ok(()) => {
                     let st = self.resp.status;
                     self.x.sent.upstream_status = st;
@@ -134,10 +150,12 @@ impl Conn {
                     } else {
                         ups.succeeded(i);
                     }
-                    let keep_up = ups.keepalive && used + 1 < ups.keepalive_requests;
-                    let keep = self
-                        .relay(up, pool, keep_up, used + 1, route, p.read_timeout)
-                        .await;
+                    self.sticky_cookie(active, p.upstream, i);
+                    up.used += 1;
+                    let keep_up = ups.keepalive
+                        && up.used < ups.keepalive_requests
+                        && up.opened.elapsed() < ups.keepalive_time;
+                    let keep = self.relay(up, pool, keep_up, route, p.read_timeout).await;
                     let took = started.elapsed();
                     self.x.sent.upstream_response = Some(connect.elapsed().as_secs_f64());
                     active.metrics.upstream_response(p.upstream, i, st, took);
@@ -171,7 +189,7 @@ impl Conn {
                     // nothing about the target; allow it again on a fresh one.
                     if reused && matches!(f, Fail::Upstream) {
                         if i < 64 {
-                            tried &= !(1 << i);
+                            choice.tried &= !(1 << i);
                         }
                         tries -= 1;
                         continue;
@@ -195,6 +213,60 @@ impl Conn {
             self.x.req.keep_alive = false;
         }
         Err(status)
+    }
+
+    /// The target a sticky session names: the sticky cookie's value, or the
+    /// first non-empty route template matched against target routes.
+    fn sticky(&mut self, active: &Active, upstream: u32) -> Option<usize> {
+        let ups: &State = &active.upstreams[upstream as usize];
+        match &active.rt.upstreams[upstream as usize].sticky {
+            None => None,
+            Some(Sticky::Cookie(c)) => ups.by_cookie(self.x.cookie(c.name.as_bytes())?),
+            Some(Sticky::Route(ts)) => ts.iter().find_map(|t| {
+                crate::vars::expand(&mut self.x, t);
+                (!self.x.tmpl.is_empty())
+                    .then(|| ups.by_route(&self.x.tmpl))
+                    .flatten()
+            }),
+        }
+    }
+
+    /// Leaves the balancing key in `tmpl`: the client network for ip_hash,
+    /// the expanded hash key for the hash methods, nothing otherwise.
+    fn balancing_key(&mut self, active: &Active, upstream: u32) {
+        let up = &active.rt.upstreams[upstream as usize];
+        self.x.tmpl.clear();
+        match up.balancing {
+            Balancing::IpHash => match self.x.peer.ip() {
+                std::net::IpAddr::V4(a) => self.x.tmpl.extend_from_slice(&a.octets()[..3]),
+                std::net::IpAddr::V6(a) => self.x.tmpl.extend_from_slice(&a.octets()),
+            },
+            Balancing::Hash | Balancing::HashConsistent => {
+                crate::vars::expand(&mut self.x, &up.hash_key);
+            }
+            _ => {}
+        }
+    }
+
+    /// Sets the sticky cookie naming target `i` unless the request already
+    /// carries it.
+    fn sticky_cookie(&mut self, active: &Active, upstream: u32, i: usize) {
+        let Some(Sticky::Cookie(c)) = &active.rt.upstreams[upstream as usize].sticky else {
+            return;
+        };
+        let value = active.upstreams[upstream as usize].cookie(i);
+        if self.x.cookie(c.name.as_bytes()) == Some(&value[..]) {
+            return;
+        }
+        self.x.sticky_cookie.clear();
+        self.x.sticky_cookie.extend_from_slice(b"Set-Cookie: ");
+        self.x.sticky_cookie.extend_from_slice(c.name.as_bytes());
+        self.x.sticky_cookie.push(b'=');
+        self.x.sticky_cookie.extend_from_slice(value);
+        self.x
+            .sticky_cookie
+            .extend_from_slice(c.attributes.as_bytes());
+        self.x.sticky_cookie.extend_from_slice(b"\r\n");
     }
 
     /// Builds the upstream request head into `out`: the original target, or
@@ -326,10 +398,9 @@ impl Conn {
     /// connection when it is reusable.
     async fn relay(
         &mut self,
-        mut up: TcpStream,
+        mut up: UpConn,
         pool: &Pool,
         pool_ok: bool,
-        used: u32,
         route: &Route,
         read_timeout: Duration,
     ) -> KeepAlive {
@@ -391,6 +462,7 @@ impl Conn {
         if matches!(mode, Mode::Chunked | Mode::Encode) {
             out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
         }
+        out.extend_from_slice(&self.x.sticky_cookie);
         reply::connection(out, keep, &self.x.resp_extra);
         out.extend_from_slice(b"\r\n");
         self.ubuf.consume(self.resp.head_len);
@@ -399,13 +471,13 @@ impl Conn {
         self.x.sent.bytes = 0;
         let head_bytes = out.len() as u64;
 
-        let complete = self.body_out(&mut up, mode, read_timeout).await;
+        let complete = self.body_out(&mut up.stream, mode, read_timeout).await;
         self.x.sent.body_bytes = self.x.sent.bytes.saturating_sub(head_bytes);
         let Ok(complete) = complete else {
             return false;
         };
         if complete && self.resp.keep_alive && pool_ok && self.ubuf.end == 0 {
-            pool.put(up, used);
+            pool.put(up);
         }
         keep
     }

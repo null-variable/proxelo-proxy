@@ -71,6 +71,11 @@ pub(crate) fn expand_into(x: &mut Exchange, t: &Template, out: &mut Vec<u8>, log
                     out.extend_from_slice(v);
                 }
             }
+            Part::Cookie(name) => {
+                if let Some(v) = x.cookie(name) {
+                    out.extend_from_slice(v);
+                }
+            }
             Part::Arg(name) => {
                 if let Some(v) = x.args.split(|&c| c == b'&').find_map(|kv| {
                     let (k, v) = kv.split_at(kv.iter().position(|&c| c == b'=')?);

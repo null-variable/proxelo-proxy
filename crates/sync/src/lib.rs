@@ -41,7 +41,15 @@ pub trait Apply {
     fn challenges(&mut self, c: Challenges);
     /// Traffic counters since start, sent every [`STATS_INTERVAL`].
     fn stats(&self) -> Stats;
+    /// Periodic work, every [`TICK_INTERVAL`], also while the control plane
+    /// is unreachable.
+    fn tick(&mut self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
 }
+
+/// How often [`Apply::tick`] runs.
+pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often [`Apply::stats`] is reported.
 pub const STATS_INTERVAL: Duration = Duration::from_secs(5);
@@ -55,7 +63,7 @@ pub struct Client {
 impl Client {
     /// Keeps a stream to the control plane open forever, reconnecting after
     /// failures. `log` receives one line per state change.
-    pub async fn run<A: Apply>(&self, target: &mut A, log: impl Fn(&str)) {
+    pub async fn run<A: Apply + Send>(&self, target: &mut A, log: impl Fn(&str)) {
         let mut backoff = MIN_BACKOFF;
         let mut last_err = String::new();
         loop {
@@ -77,7 +85,13 @@ impl Client {
                     }
                 }
             }
-            tokio::time::sleep(backoff).await;
+            // Keep ticking while waiting to reconnect.
+            let until = tokio::time::Instant::now() + backoff;
+            while tokio::time::Instant::now() < until {
+                tokio::time::sleep_until(until.min(tokio::time::Instant::now() + TICK_INTERVAL))
+                    .await;
+                target.tick().await;
+            }
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
@@ -113,8 +127,14 @@ impl Client {
 
         let mut ticker = tokio::time::interval(STATS_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut tick = tokio::time::interval(TICK_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let msg = tokio::select! {
+                _ = tick.tick() => {
+                    target.tick().await;
+                    continue;
+                }
                 m = inbound.message() => match m {
                     Ok(Some(m)) => m,
                     Ok(None) => return Ok(()),

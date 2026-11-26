@@ -12,9 +12,10 @@ use std::fmt;
 
 pub use cond::{Cond, Facts};
 pub use runtime::{
-    AccessLog, Action, BuildError, Captures, Certificate, ErrorPage, ErrorTarget, Fallback,
-    HeaderOps, HeaderValue, Listener, ListenerTls, MatchError, NextOn, Pattern, Proxy, Return,
-    Rewrite, RewriteFlag, Route, Runtime, Site, Target, TryFiles, Upstream,
+    AccessLog, Action, Balancing, BuildError, Captures, Certificate, CheckKind, ErrorPage,
+    ErrorTarget, Fallback, HeaderOps, HeaderValue, HealthCheck, Listener, ListenerTls, MatchError,
+    NextOn, Pattern, Proxy, Resolved, Return, Rewrite, RewriteFlag, Route, Runtime, Site, Sticky,
+    StickyCookie, Target, TryFiles, Upstream,
 };
 pub use template::{Part, Template, Var};
 

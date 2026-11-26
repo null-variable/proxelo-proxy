@@ -298,6 +298,7 @@ fn serve(path: &Path, o: &Options) -> Result<(), String> {
     let revision = rt.revision;
     let server = Server::new(Runtime::empty(), o.workers);
     let mut listeners = Listeners::new(workers.handles, o.kind == RuntimeKind::PerCore);
+    server.set_background(listeners.background());
     listeners.apply(&server, rt).map_err(|e| e.to_string())?;
     eprintln!("serving revision {revision} with {}", describe(o));
     let main = main_runtime()?;
@@ -320,22 +321,22 @@ fn run(o: Options) -> Result<(), String> {
         lkg,
         revision: 0,
         hash: Vec::new(),
+        snap: None,
+        resolved: proxelo_snapshot::Resolved::new(),
+        names: Vec::new(),
     };
+    node.server.set_background(node.listeners.background());
 
     match std::fs::read(&node.lkg) {
-        Ok(bytes) => match build(&bytes) {
-            Ok((snap, rt)) => match node.listeners.apply(&node.server, rt) {
-                Ok(()) => {
-                    node.revision = snap.revision;
-                    node.hash = snap.hash;
-                    eprintln!(
-                        "serving last-known-good revision {} from {}",
-                        node.revision,
-                        node.lkg.display()
-                    );
-                }
-                Err(e) => eprintln!("{}: {e}; waiting for the control plane", node.lkg.display()),
-            },
+        Ok(bytes) => match proxelo_snapshot::load(&bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|snap| node.install(snap))
+        {
+            Ok(()) => eprintln!(
+                "serving last-known-good revision {} from {}",
+                node.revision,
+                node.lkg.display()
+            ),
             Err(e) => eprintln!("{}: {e}; waiting for the control plane", node.lkg.display()),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -367,6 +368,54 @@ struct Node {
     lkg: PathBuf,
     revision: u64,
     hash: Vec<u8>,
+    /// The active snapshot, kept to rebuild it when a re-resolved host name
+    /// of a `resolve` target changes addresses.
+    snap: Option<Snapshot>,
+    resolved: proxelo_snapshot::Resolved,
+    /// Names to re-resolve, their interval and when they are next due.
+    names: Vec<(String, std::time::Duration, std::time::Instant)>,
+}
+
+impl Node {
+    /// Serves `snap`, resolving its `resolve` names now.
+    fn install(&mut self, snap: Snapshot) -> Result<(), String> {
+        let names = proxelo_server::resolve_names(&snap);
+        let resolved = if names.is_empty() {
+            proxelo_snapshot::Resolved::new()
+        } else {
+            block_in_place(proxelo_server::resolve_all(&names))
+        };
+        let rt = Runtime::build_with(&snap, &resolved).map_err(|e| e.to_string())?;
+        self.listeners
+            .apply(&self.server, rt)
+            .map_err(|e| e.to_string())?;
+        let now = std::time::Instant::now();
+        self.names = names.into_iter().map(|(n, d)| (n, d, now + d)).collect();
+        self.resolved = resolved;
+        self.revision = snap.revision;
+        self.hash = snap.hash.clone();
+        self.snap = Some(snap);
+        Ok(())
+    }
+}
+
+/// Runs `f` to completion from synchronous code that may itself run inside
+/// the single-threaded main runtime.
+fn block_in_place<F: std::future::Future + Send>(f: F) -> F::Output
+where
+    F::Output: Send,
+{
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(f)
+        })
+        .join()
+        .expect("resolver thread")
+    })
 }
 
 impl Apply for Node {
@@ -396,9 +445,54 @@ impl Apply for Node {
         }
     }
 
+    /// Re-resolves the `resolve` names that are due; a changed answer
+    /// rebuilds the snapshot with the new addresses (nginx resolve).
+    async fn tick(&mut self) {
+        let now = std::time::Instant::now();
+        let due: Vec<(String, std::time::Duration)> = self
+            .names
+            .iter()
+            .filter(|(_, _, at)| *at <= now)
+            .map(|(n, d, _)| (n.clone(), *d))
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        for (_, d, at) in &mut self.names {
+            if *at <= now {
+                *at = now + *d;
+            }
+        }
+        let fresh = proxelo_server::resolve_all(&due).await;
+        let mut changed = false;
+        for (name, _) in &due {
+            // A failed lookup keeps the last addresses, as nginx does.
+            if let Some(a) = fresh.get(name)
+                && self.resolved.get(name) != Some(a)
+            {
+                self.resolved.insert(name.clone(), a.clone());
+                changed = true;
+            }
+        }
+        let Some(snap) = &self.snap else {
+            return;
+        };
+        if !changed {
+            return;
+        }
+        match Runtime::build_with(snap, &self.resolved) {
+            Ok(rt) => {
+                if let Err(e) = self.listeners.apply(&self.server, rt) {
+                    eprintln!("re-resolved targets: {e}");
+                }
+            }
+            Err(e) => eprintln!("re-resolved targets: {e}"),
+        }
+    }
+
     fn stats(&self) -> proxelo_sync::Stats {
         let t = proxelo_server::metrics::totals();
-        let per = proxelo_server::metrics::per_resource();
+        let per = proxelo_server::metrics::per_resource(&self.server);
         proxelo_sync::Stats {
             revision: self.revision,
             requests: t.requests,
@@ -427,25 +521,20 @@ impl Apply for Node {
             targets: per
                 .targets
                 .into_iter()
-                .map(
-                    |(upstream_id, address, attempts, failures)| proxelo_sync::TargetStats {
-                        upstream_id,
-                        address,
-                        attempts,
-                        failures,
-                    },
-                )
+                .map(|t| proxelo_sync::TargetStats {
+                    upstream_id: t.upstream,
+                    address: t.address,
+                    attempts: t.attempts,
+                    failures: t.failures,
+                    healthy: t.healthy,
+                    check_error: t.check_error,
+                })
                 .collect(),
         }
     }
 
     fn apply(&mut self, snap: Snapshot, bytes: &[u8]) -> Result<(), String> {
-        let rt = Runtime::build(&snap).map_err(|e| e.to_string())?;
-        self.listeners
-            .apply(&self.server, rt)
-            .map_err(|e| e.to_string())?;
-        self.revision = snap.revision;
-        self.hash = snap.hash;
+        self.install(snap)?;
         // The snapshot is live either way; a failed write only means a
         // restart without the control plane comes up on an older one.
         if let Err(e) = write_atomic(&self.lkg, bytes) {

@@ -130,8 +130,21 @@ pub struct PerResource {
     pub sites: Vec<(String, Count)>,
     /// By site ID and route ID.
     pub routes: Vec<(String, String, Count)>,
-    /// By upstream ID and target address: attempts, failures.
-    pub targets: Vec<(String, String, u64, u64)>,
+    /// By upstream ID and configured target address.
+    pub targets: Vec<TargetCount>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TargetCount {
+    pub upstream: String,
+    /// As configured, host:port.
+    pub address: String,
+    pub attempts: u64,
+    pub failures: u64,
+    /// Takes requests now: in the active snapshot and not down.
+    pub healthy: bool,
+    /// Why the active health check fails it.
+    pub check_error: String,
 }
 
 impl Requests {
@@ -147,8 +160,10 @@ impl Requests {
     }
 }
 
-/// Reads the per-resource counters. Resources without traffic are left out.
-pub fn per_resource() -> PerResource {
+/// Reads the per-resource counters. Sites and routes without traffic are
+/// left out; targets of the active snapshot are always in, with their
+/// health, summed over the addresses of a name.
+pub fn per_resource(server: &Server) -> PerResource {
     let guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = PerResource::default();
     let Some(reg) = guard.as_ref() else {
@@ -166,12 +181,36 @@ pub fn per_resource() -> PerResource {
             out.routes.push((site.to_string(), id.to_string(), c));
         }
     }
-    for ((up, addr), t) in &reg.targets {
-        let ok: u64 = t.responses.iter().map(|c| c.load(Ordering::Relaxed)).sum();
-        let failures = t.failures.load(Ordering::Relaxed);
-        if ok + failures > 0 {
-            out.targets
-                .push((up.to_string(), addr.clone(), ok + failures, failures));
+    drop(guard);
+    let active = server.active();
+    for (u, up) in active.rt.upstreams.iter().enumerate() {
+        for (i, target) in up.targets.iter().enumerate() {
+            let st = &active.metrics.targets[u][i];
+            let ok: u64 = st.responses.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+            let failures = st.failures.load(Ordering::Relaxed);
+            let (healthy, check_error) = active.upstreams[u].health(i);
+            match out
+                .targets
+                .iter_mut()
+                .find(|t| *t.upstream == *up.id && *t.address == *target.name)
+            {
+                Some(t) => {
+                    t.attempts += ok + failures;
+                    t.failures += failures;
+                    t.healthy |= healthy;
+                    if t.check_error.is_empty() {
+                        t.check_error = check_error;
+                    }
+                }
+                None => out.targets.push(TargetCount {
+                    upstream: up.id.to_string(),
+                    address: target.name.to_string(),
+                    attempts: ok + failures,
+                    failures,
+                    healthy,
+                    check_error,
+                }),
+            }
         }
     }
     out

@@ -68,6 +68,8 @@ pub(crate) struct Exchange {
     /// Response headers from the route's (or site's) HeaderOps, expanded
     /// as complete lines, added to generated responses.
     pub resp_extra: Vec<u8>,
+    /// A Set-Cookie line for a sticky session, added to a proxied response.
+    pub sticky_cookie: Vec<u8>,
 }
 
 /// Lowercases `raw` into `out` without the port and a trailing dot.
@@ -111,6 +113,7 @@ impl Exchange {
             request_id_set: false,
             sent: Sent::default(),
             resp_extra: Vec::new(),
+            sticky_cookie: Vec::new(),
         }
     }
 
@@ -142,6 +145,7 @@ impl Exchange {
         self.request_id_set = false;
         self.sent = Sent::default();
         self.resp_extra.clear();
+        self.sticky_cookie.clear();
         self.uri_changed = false;
         self.error_paged = false;
         self.err_status = 0;
@@ -173,6 +177,20 @@ impl Exchange {
         } else {
             status
         }
+    }
+
+    /// The value of cookie `name` from the Cookie headers ($cookie_<name>).
+    pub fn cookie(&self, name: &[u8]) -> Option<&[u8]> {
+        self.req
+            .headers
+            .iter()
+            .filter(|h| h.name.get(&self.head).eq_ignore_ascii_case(b"cookie"))
+            .flat_map(|h| h.value.get(&self.head).split(|&c| c == b';'))
+            .find_map(|pair| {
+                let pair = pair.trim_ascii_start();
+                let eq = pair.iter().position(|&c| c == b'=')?;
+                (&pair[..eq] == name).then(|| pair[eq + 1..].trim_ascii_end())
+            })
     }
 
     pub fn request_header(&self, name: &[u8]) -> Option<&[u8]> {

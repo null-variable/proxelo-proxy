@@ -12,6 +12,7 @@ mod conn;
 mod exchange;
 mod h2;
 mod headers;
+mod health;
 mod io;
 mod listeners;
 mod log;
@@ -36,6 +37,7 @@ use proxelo_snapshot::Runtime;
 use socket2::{Domain, Protocol, Socket, Type};
 
 pub use acme::set_http_challenges;
+pub use health::{resolve_all, resolve_names};
 pub use listeners::{BindError, Listeners};
 pub use log::reopen as reopen_logs;
 pub use sim::simulate;
@@ -59,6 +61,8 @@ pub struct Server {
     active: ArcSwap<Active>,
     /// Number of workers; per-worker state is sharded this many ways.
     shards: usize,
+    /// Runtime for background tasks such as active health checks.
+    background: std::sync::OnceLock<tokio::runtime::Handle>,
 }
 
 impl Server {
@@ -68,7 +72,14 @@ impl Server {
         Arc::new(Self {
             active: ArcSwap::from_pointee(active),
             shards,
+            background: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Sets the runtime background tasks run on when a snapshot is
+    /// installed outside one.
+    pub fn set_background(&self, h: tokio::runtime::Handle) {
+        let _ = self.background.set(h);
     }
 
     pub fn active(&self) -> Arc<Active> {
@@ -102,7 +113,16 @@ impl Server {
     /// worker.
     pub(crate) fn install(&self, next: Active) {
         let started = Instant::now();
-        let old = self.active.swap(Arc::new(next));
+        let next = Arc::new(next);
+        // Checks run on the caller's runtime, or on the one set with
+        // `set_background`; without either there is nothing to run them on.
+        if let Some(h) = tokio::runtime::Handle::try_current()
+            .ok()
+            .or_else(|| self.background.get().cloned())
+        {
+            health::start_checks(&next, &h);
+        }
+        let old = self.active.swap(next);
         metrics::swapped(started.elapsed());
         std::thread::spawn(move || drop(old));
     }

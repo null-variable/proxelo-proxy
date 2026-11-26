@@ -63,6 +63,8 @@ pub enum Part {
     Header(Box<[u8]>),
     /// `$arg_<name>`.
     Arg(Box<[u8]>),
+    /// `$cookie_<name>`.
+    Cookie(Box<[u8]>),
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -194,6 +196,9 @@ fn var(name: &str) -> Option<Part> {
             }
             if let Some(a) = name.strip_prefix("arg_").filter(|a| !a.is_empty()) {
                 return Some(Part::Arg(a.as_bytes().into()));
+            }
+            if let Some(c) = name.strip_prefix("cookie_").filter(|c| !c.is_empty()) {
+                return Some(Part::Cookie(c.as_bytes().into()));
             }
             return None;
         }
