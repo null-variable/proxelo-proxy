@@ -396,6 +396,17 @@ impl Apply for Node {
         }
     }
 
+    fn stats(&self) -> proxelo_sync::Stats {
+        let t = proxelo_server::metrics::totals();
+        proxelo_sync::Stats {
+            revision: self.revision,
+            requests: t.requests,
+            server_errors: t.server_errors,
+            upstream_attempts: t.upstream_attempts,
+            upstream_failures: t.upstream_failures,
+        }
+    }
+
     fn apply(&mut self, snap: Snapshot, bytes: &[u8]) -> Result<(), String> {
         let rt = Runtime::build(&snap).map_err(|e| e.to_string())?;
         self.listeners

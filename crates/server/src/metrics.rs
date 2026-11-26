@@ -100,8 +100,31 @@ static CONNECTIONS_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static CONNECTIONS_ACTIVE: AtomicU64 = AtomicU64::new(0);
 static TLS_HANDSHAKE_ERRORS: AtomicU64 = AtomicU64::new(0);
 static LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
+static REQUESTS: AtomicU64 = AtomicU64::new(0);
+static SERVER_ERRORS: AtomicU64 = AtomicU64::new(0);
+static UPSTREAM_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static UPSTREAM_FAILURES: AtomicU64 = AtomicU64::new(0);
 static SWAPS: AtomicU64 = AtomicU64::new(0);
 static SWAP_SECONDS_US: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide traffic counters, reported to the control plane.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Totals {
+    pub requests: u64,
+    pub server_errors: u64,
+    pub upstream_attempts: u64,
+    pub upstream_failures: u64,
+}
+
+/// Counters since start, across snapshots.
+pub fn totals() -> Totals {
+    Totals {
+        requests: REQUESTS.load(Ordering::Relaxed),
+        server_errors: SERVER_ERRORS.load(Ordering::Relaxed),
+        upstream_attempts: UPSTREAM_ATTEMPTS.load(Ordering::Relaxed),
+        upstream_failures: UPSTREAM_FAILURES.load(Ordering::Relaxed),
+    }
+}
 
 pub(crate) fn connection_opened() {
     CONNECTIONS_ACCEPTED.fetch_add(1, Ordering::Relaxed);
@@ -173,6 +196,10 @@ impl Table {
 
     /// A finished request. `route` is the route number in the site.
     pub fn request(&self, site: u32, route: Option<u32>, status: u16, d: Duration) {
+        REQUESTS.fetch_add(1, Ordering::Relaxed);
+        if status >= 500 {
+            SERVER_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(s) = self.sites.get(site as usize) {
             s.record(status, d);
         }
@@ -182,6 +209,7 @@ impl Table {
     }
 
     pub fn upstream_response(&self, upstream: u32, target: usize, status: u16, d: Duration) {
+        UPSTREAM_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
         if let Some(t) = self.target(upstream, target) {
             let class = usize::from(status / 100).clamp(1, 5) - 1;
             t.responses[class].fetch_add(1, Ordering::Relaxed);
@@ -190,6 +218,8 @@ impl Table {
     }
 
     pub fn upstream_failure(&self, upstream: u32, target: usize) {
+        UPSTREAM_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        UPSTREAM_FAILURES.fetch_add(1, Ordering::Relaxed);
         if let Some(t) = self.target(upstream, target) {
             t.failures.fetch_add(1, Ordering::Relaxed);
         }

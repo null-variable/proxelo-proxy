@@ -72,7 +72,7 @@ timeout` and the response headers nginx hides from upstreams.
 | `crates/snapshot` | Validates snapshots and builds the runtime form (host and route lookup with PCRE2, route conditions with CEL, templates, resolved upstream targets) |
 | `crates/http1` | HTTP/1.1 codec: in-place parsing, strict framing, chunked decoding, path normalization |
 | `crates/server` | Accept loop, TLS (`tls.rs`) and HTTP/2 (`h2.rs`), request phases (shared with the simulator), variables, static files, proxying, upstream state, header changes, access logs, metrics, snapshot swap, listening sockets that follow the snapshot |
-| `crates/sync` | Control plane client: receives snapshots over the control socket and acks them |
+| `crates/sync` | Control plane client: receives snapshots over the control socket, acks them and reports traffic counters every 5 s for the commit-confirm guard |
 | `fuzz` | `cargo fuzz` targets for the codec (separate workspace, nightly) |
 
 ## Build

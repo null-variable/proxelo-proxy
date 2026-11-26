@@ -12,11 +12,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
-pub use proxelo_api::distrib::v1::Challenges;
 use proxelo_api::distrib::v1::{
     Ack, Hello, SyncRequest, distribution_service_client::DistributionServiceClient, sync_request,
     sync_response,
 };
+pub use proxelo_api::distrib::v1::{Challenges, Stats};
 use proxelo_api::snapshot::v1::Snapshot;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -39,7 +39,12 @@ pub trait Apply {
     fn apply(&mut self, snap: Snapshot, bytes: &[u8]) -> Result<(), String>;
     /// Replaces the ACME challenges answered.
     fn challenges(&mut self, c: Challenges);
+    /// Traffic counters since start, sent every [`STATS_INTERVAL`].
+    fn stats(&self) -> Stats;
 }
+
+/// How often [`Apply::stats`] is reported.
+pub const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct Client {
     pub socket: PathBuf,
@@ -106,11 +111,22 @@ impl Client {
             .into_inner();
         log("connected to control plane");
 
+        let mut ticker = tokio::time::interval(STATS_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let msg = match inbound.message().await {
-                Ok(Some(m)) => m,
-                Ok(None) => return Ok(()),
-                Err(e) => return Err(Session::after(e)),
+            let msg = tokio::select! {
+                m = inbound.message() => match m {
+                    Ok(Some(m)) => m,
+                    Ok(None) => return Ok(()),
+                    Err(e) => return Err(Session::after(e)),
+                },
+                _ = ticker.tick() => {
+                    let req = SyncRequest {
+                        kind: Some(sync_request::Kind::Stats(target.stats())),
+                    };
+                    tx.send(req).await.map_err(Session::after)?;
+                    continue;
+                }
             };
             let bytes = match msg.kind {
                 Some(sync_response::Kind::SnapshotData(b)) => b,
