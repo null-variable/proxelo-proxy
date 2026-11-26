@@ -19,9 +19,11 @@ proxelo-http1.workspace = true
 proxelo-snapshot.workspace = true
 socket2.workspace = true
 tokio.workspace = true
+jiff = { version = "1.0.3", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 
 [dev-dependencies]
 stats_alloc.workspace = true
+tokio-openssl.workspace = true
 
 [lints]
 workspace = true

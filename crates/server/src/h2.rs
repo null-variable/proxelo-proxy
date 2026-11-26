@@ -8,6 +8,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
 use h2::server::SendResponse;
@@ -26,6 +27,8 @@ use crate::{Active, Server};
 
 /// nginx http2_max_concurrent_streams.
 const MAX_STREAMS: u32 = 128;
+/// nginx keepalive_requests, which also bounds streams per HTTP/2 connection.
+const KEEPALIVE_REQUESTS: u64 = 1000;
 const PIPE: usize = 64 * 1024;
 /// The response head of a stream must fit, as for upstream heads.
 const MAX_HEAD: usize = 64 * 1024;
@@ -43,21 +46,54 @@ pub(crate) async fn serve(
     builder
         .max_concurrent_streams(MAX_STREAMS)
         .max_header_list_size(32 * 1024)
-        // Rapid reset (CVE-2023-44487): the h2 defaults bound pending
-        // resets; keep them.
         .max_send_buffer_size(PIPE);
     let Ok(mut conn) = builder.handshake::<_, Bytes>(tls).await else {
         return;
     };
+    // Rapid reset (CVE-2023-44487): a stream the client resets no longer
+    // counts against max_concurrent_streams, but its request may still be
+    // running. Streams in flight here are counted until their task ends, so
+    // resets cannot pile up work beyond the stream limit.
+    let in_flight = Arc::new(AtomicU32::new(0));
+    let mut accepted = 0u64;
+    let mut refused = 0u32;
     while let Some(next) = conn.accept().await {
-        let Ok((req, respond)) = next else {
+        let Ok((req, mut respond)) = next else {
             return;
         };
+        accepted += 1;
+        if accepted == KEEPALIVE_REQUESTS {
+            // nginx keepalive_requests: GOAWAY, then finish open streams.
+            conn.graceful_shutdown();
+        }
+        if in_flight.load(Ordering::Relaxed) >= MAX_STREAMS {
+            respond.send_reset(h2::Reason::REFUSED_STREAM);
+            refused += 1;
+            if refused > MAX_STREAMS {
+                conn.abrupt_shutdown(h2::Reason::ENHANCE_YOUR_CALM);
+            }
+            continue;
+        }
+        // Only refusals in a row count: a client that waits for its streams
+        // to finish is not pushing.
+        refused = 0;
+        in_flight.fetch_add(1, Ordering::Relaxed);
+        let done = InFlight(in_flight.clone());
         let server = server.clone();
         let info = info.clone();
         tokio::spawn(async move {
             stream(server, listener, local, peer, info, req, respond).await;
+            drop(done);
         });
+    }
+}
+
+/// Counts a stream as in flight until dropped.
+struct InFlight(Arc<AtomicU32>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -139,9 +175,11 @@ async fn stream(
     let (sent, received) = tokio::join!(send, recv);
     if received.is_err() {
         respond.send_reset(h2::Reason::INTERNAL_ERROR);
-    } else if sent.is_err() {
-        // The client reset its side; the response went out or is moot.
     }
+    // A send error means the client stopped sending the body or reset the
+    // stream. The request still finishes (and is logged) before the stream
+    // stops counting as in flight.
+    let _ = sent;
     drop(ours);
     let _ = served.await;
 }

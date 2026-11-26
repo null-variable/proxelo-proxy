@@ -168,8 +168,8 @@ fn var(x: &mut Exchange, v: Var, out: &mut Vec<u8>) {
                 .unwrap_or_default();
             _ = write!(out, "{}.{:03}", now.as_secs(), now.subsec_millis());
         }
-        Var::TimeLocal => out.extend_from_slice(&crate::worker::time_local()),
-        Var::TimeIso8601 => out.extend_from_slice(&crate::worker::time_iso8601()),
+        Var::TimeLocal => out.extend_from_slice(&crate::worker::clock().local),
+        Var::TimeIso8601 => out.extend_from_slice(&crate::worker::clock().iso8601),
         Var::Status => {
             if x.sent.status != 0 {
                 push_u64(out, u64::from(x.sent.status));
