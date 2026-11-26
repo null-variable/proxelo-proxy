@@ -305,6 +305,38 @@ fn static_files() {
     assert!(h.contains("Content-Type: text/plain\r\n"));
     assert_eq!(b, b"space");
 
+    // Byte ranges, as nginx: one part, several, and none in the file.
+    let (h, b) = get(
+        addr,
+        &format!("GET /a%20b.txt HTTP/1.1\r\n{host}Range: bytes=-3\r\n\r\n"),
+    );
+    assert_eq!(status(&h), 206, "{h}");
+    assert!(h.contains("Content-Range: bytes 2-4/5\r\n"), "{h}");
+    assert!(!h.contains("Accept-Ranges"), "{h}");
+    assert_eq!(b, b"ace");
+    let (h, b) = get(
+        addr,
+        &format!("GET /a%20b.txt HTTP/1.1\r\n{host}Range: bytes=0-0,3-4\r\n\r\n"),
+    );
+    assert_eq!(status(&h), 206, "{h}");
+    let boundary = h
+        .split("boundary=")
+        .nth(1)
+        .and_then(|r| r.split("\r\n").next())
+        .expect("multipart boundary");
+    assert_eq!(
+        String::from_utf8(b).unwrap(),
+        format!(
+            "\r\n--{boundary}\r\nContent-Type: text/plain\r\nContent-Range: bytes 0-0/5\r\n\r\ns\r\n--{boundary}\r\nContent-Type: text/plain\r\nContent-Range: bytes 3-4/5\r\n\r\nce\r\n--{boundary}--\r\n"
+        )
+    );
+    let (h, _) = get(
+        addr,
+        &format!("GET /a%20b.txt HTTP/1.1\r\n{host}Range: bytes=9-\r\n\r\n"),
+    );
+    assert_eq!(status(&h), 416, "{h}");
+    assert!(h.contains("Content-Range: bytes */5\r\n"), "{h}");
+
     let (h, b) = get(addr, &format!("GET /big.bin HTTP/1.1\r\n{host}\r\n"));
     assert_eq!(status(&h), 200);
     assert_eq!(b.len(), 200_000);
@@ -429,7 +461,13 @@ fn proxies_and_balances() {
             route(Prefix, "/api/", proxy(0)),
             route(Exact, "/docs/index.html", proxy(1)),
         ],
-        vec![upstream(&[a.addr, b.addr], 8), upstream(&[a.addr], 0)],
+        vec![
+            Upstream {
+                host: "backend".into(),
+                ..upstream(&[a.addr, b.addr], 8)
+            },
+            upstream(&[a.addr], 0),
+        ],
     );
     let (_, addr) = start(&snap);
 
@@ -445,9 +483,7 @@ fn proxies_and_balances() {
         assert!(!h.contains("X-Accel"), "internal headers hidden: {h}");
         let body = String::from_utf8(body).unwrap();
         assert!(
-            body.ends_with(&format!(
-                "GET /api/x?i={i} HTTP/1.1 host=Example.com:80 body="
-            )),
+            body.ends_with(&format!("GET /api/x?i={i} HTTP/1.1 host=backend body=")),
             "{body}"
         );
         seen.push(body[..1].to_string());
@@ -481,8 +517,12 @@ fn proxies_and_balances() {
             .starts_with("a GET /docs/index.html?q=1 HTTP/1.1"),
     );
 
-    // HTTP/1.0 client without Host gets the upstream address as Host.
-    let (h, body) = get(addr, "GET /api/ HTTP/1.0\r\n\r\n");
+    // An upstream without a name sends its target address, whatever the
+    // client sent.
+    let (h, body) = get(
+        addr,
+        "GET /docs/index.html HTTP/1.0\r\nHost: example.com\r\n\r\n",
+    );
     assert!(h.contains("Connection: close"));
     let body = String::from_utf8(body).unwrap();
     assert!(body.contains("host=127.0.0.1:"), "{body}");

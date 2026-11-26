@@ -44,6 +44,7 @@ pub(crate) struct State {
     current: Box<[Mutex<Box<[i64]>>]>,
     pub keepalive: bool,
     pub keepalive_requests: u32,
+    pub host: Box<str>,
 }
 
 /// State from the previous snapshot, so warm connections and health survive
@@ -114,6 +115,7 @@ impl State {
             current,
             keepalive: up.keepalive_idle > 0,
             keepalive_requests: up.keepalive_requests,
+            host: up.host.clone(),
         }
     }
 
@@ -335,6 +337,7 @@ mod tests {
             keepalive_idle: 0,
             keepalive_timeout: Duration::from_secs(60),
             keepalive_requests: 1000,
+            host: "".into(),
             max_fails: 1,
             fail_timeout: Duration::from_secs(10),
         };

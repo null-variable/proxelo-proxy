@@ -1,20 +1,33 @@
 //! Sending a static file and the directory redirect.
 
 use std::fs::{File, Metadata};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 use proxelo_http1::{Method, http_date, push_hex, push_u64};
+use proxelo_snapshot::HeaderOps;
 
 use crate::conn::{Conn, KeepAlive, SEND_TIMEOUT, body_len};
 use crate::io::write_timeout;
+use crate::range::{self, Answer, Ranges, Span};
 use crate::reply;
 
 /// File bytes read per write.
 const FILE_CHUNK: usize = 64 * 1024;
 
+/// Multipart boundaries, a process-wide counter as in nginx.
+static BOUNDARIES: AtomicU64 = AtomicU64::new(0);
+
 impl Conn {
-    pub async fn send_file(&mut self, mut file: File, meta: &Metadata) -> KeepAlive {
+    /// Sends a static file, or the parts a Range header asks for (nginx's
+    /// range filter, which runs after error_page: a 416 is not redirected).
+    pub async fn send_file(
+        &mut self,
+        mut file: File,
+        meta: &Metadata,
+        ops: &HeaderOps,
+    ) -> KeepAlive {
         let len = meta.len();
         let mtime = meta
             .modified()
@@ -34,21 +47,50 @@ impl Conn {
             Some(v) => v == b"*" || v == &self.x.scratch[..],
             None => self.x.request_header(b"if-modified-since") == Some(&modified[..]),
         };
-
-        let keep = self.x.req.keep_alive;
-        let status = if not_modified {
-            304
-        } else {
-            self.x.status(200)
+        // Ranges apply to a 200 only: not to a 304 or a page error_page set.
+        let ranges = match self.x.request_header(b"range") {
+            Some(v) if !not_modified && self.x.err_status == 0 && self.if_range(&modified) => {
+                range::parse(v, len)
+            }
+            _ => Ranges::WHOLE,
         };
+        let status = match (ranges.answer, not_modified) {
+            (_, true) => 304,
+            (Answer::Unsatisfiable, _) => 416,
+            (Answer::Partial, _) => 206,
+            (Answer::Whole, _) => self.x.status(200),
+        };
+        self.extra(ops, status);
+        let keep = self.x.req.keep_alive;
+        if status == 416 {
+            return self.unsatisfiable(len, keep).await;
+        }
+        let mime = reply::mime(&self.x.path);
+        let parts = ranges.parts();
+        let boundary = if parts.len() > 1 {
+            BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            0
+        };
+        let body_len = match parts {
+            [] => len,
+            [one] => one.end - one.start,
+            many => range::multipart_len(many, mime, len),
+        };
+
         let out = &mut self.out;
         out.clear();
         reply::start(out, status, b"");
         if !not_modified {
             out.extend_from_slice(b"Content-Type: ");
-            out.extend_from_slice(reply::mime(&self.x.path));
+            if boundary != 0 {
+                out.extend_from_slice(b"multipart/byteranges; boundary=");
+                range::push_boundary(out, boundary);
+            } else {
+                out.extend_from_slice(mime);
+            }
             out.extend_from_slice(b"\r\nContent-Length: ");
-            push_u64(out, len);
+            push_u64(out, body_len);
             out.extend_from_slice(b"\r\n");
         }
         out.extend_from_slice(b"Last-Modified: ");
@@ -56,7 +98,11 @@ impl Conn {
         out.extend_from_slice(b"\r\nETag: ");
         out.extend_from_slice(&self.x.scratch);
         out.extend_from_slice(b"\r\n");
-        if !not_modified {
+        if let [one] = parts {
+            out.extend_from_slice(b"Content-Range: bytes ");
+            range::push_span(out, *one, len);
+            out.extend_from_slice(b"\r\n");
+        } else if status != 304 && parts.is_empty() {
             out.extend_from_slice(b"Accept-Ranges: bytes\r\n");
         }
         reply::connection(out, keep, &self.x.resp_extra);
@@ -67,13 +113,40 @@ impl Conn {
         if not_modified || self.x.req.method == Method::Head {
             return self.respond(keep).await;
         }
-        self.x.sent.bytes += len;
-        self.x.sent.body_bytes = len;
+        self.x.sent.bytes += body_len;
+        self.x.sent.body_bytes = body_len;
         if keep && self.pump_body(None).await.is_err() {
             return false;
         }
         // The head and the first part of the file go out in one write.
-        let mut left = len;
+        let whole = [Span { start: 0, end: len }];
+        let spans = if parts.is_empty() { &whole[..] } else { parts };
+        for &span in spans {
+            if boundary != 0 {
+                range::push_part_head(&mut self.out, boundary, mime, span, len);
+            }
+            if !self.send_span(&mut file, span).await {
+                return false;
+            }
+        }
+        if boundary != 0 {
+            range::push_close(&mut self.out, boundary);
+        }
+        if !self.out.is_empty() {
+            return write_timeout(&mut self.client, &self.out, SEND_TIMEOUT)
+                .await
+                .is_ok()
+                && keep;
+        }
+        keep
+    }
+
+    /// Writes `out` followed by `span` of the file, leaving `out` empty.
+    async fn send_span(&mut self, file: &mut File, span: Span) -> bool {
+        if file.seek(SeekFrom::Start(span.start)).is_err() {
+            return false;
+        }
+        let mut left = span.end - span.start;
         while left > 0 {
             let start = self.out.len();
             let want = left.min(FILE_CHUNK as u64) as usize;
@@ -93,13 +166,33 @@ impl Conn {
             }
             self.out.clear();
         }
-        if len == 0 {
-            return write_timeout(&mut self.client, &self.out, SEND_TIMEOUT)
-                .await
-                .is_ok()
-                && keep;
+        true
+    }
+
+    /// nginx If-Range: a quoted value must equal the ETag, anything else the
+    /// Last-Modified date; otherwise the whole file is sent.
+    fn if_range(&self, modified: &[u8]) -> bool {
+        match self.x.request_header(b"if-range") {
+            None => true,
+            Some(v) if v.len() >= 2 && v.ends_with(b"\"") => v == &self.x.scratch[..],
+            Some(v) => v == modified,
         }
-        keep
+    }
+
+    /// 416 with nginx's page and `Content-Range: bytes */len`.
+    async fn unsatisfiable(&mut self, len: u64, keep: KeepAlive) -> KeepAlive {
+        let out = &mut self.out;
+        out.clear();
+        reply::start(out, 416, b"");
+        out.extend_from_slice(b"Content-Range: bytes */");
+        push_u64(out, len);
+        out.extend_from_slice(b"\r\n");
+        let head = self.x.req.method == Method::Head;
+        reply::page(out, 416, keep, head, &self.x.resp_extra);
+        self.x.sent.status = 416;
+        self.x.sent.bytes = out.len() as u64;
+        self.x.sent.body_bytes = body_len(out) as u64;
+        self.respond(keep).await
     }
 
     /// A directory without a trailing slash gets a 301 to the same URI with

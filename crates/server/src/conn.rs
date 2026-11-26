@@ -288,11 +288,7 @@ impl Conn {
                     self.extra(ops, status);
                     self.page(status).await
                 }
-                Outcome::File(f, m) => {
-                    let st = self.x.status(200);
-                    self.extra(ops, st);
-                    self.send_file(f, &m).await
-                }
+                Outcome::File(f, m) => self.send_file(f, &m, ops).await,
                 Outcome::Directory => {
                     self.extra(ops, 301);
                     self.redirect_dir().await
@@ -306,7 +302,7 @@ impl Conn {
     }
 
     /// Expands the configured response headers for `status`.
-    fn extra(&mut self, ops: &HeaderOps, status: u16) {
+    pub(crate) fn extra(&mut self, ops: &HeaderOps, status: u16) {
         if ops.is_empty() {
             self.x.resp_extra.clear();
         } else {
@@ -330,7 +326,11 @@ impl Conn {
         out.clear();
         reply::start(out, status, b"");
         if !self.x.tmpl.is_empty() {
-            out.extend_from_slice(b"Content-Type: text/plain\r\n");
+            // nginx types the body by the URI's extension, like a file,
+            // falling back to `default_type application/octet-stream`.
+            out.extend_from_slice(b"Content-Type: ");
+            out.extend_from_slice(reply::mime(&self.x.path));
+            out.extend_from_slice(b"\r\n");
         }
         out.extend_from_slice(b"Content-Length: ");
         push_u64(out, self.x.tmpl.len() as u64);

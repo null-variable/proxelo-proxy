@@ -121,7 +121,7 @@ impl Conn {
             };
             let reused = used > 0;
             self.x.sent.upstream_connect = Some(connect.elapsed().as_secs_f64());
-            self.upstream_head(pool.addr, ups.keepalive, route);
+            self.upstream_head(pool.addr, &ups.host, ups.keepalive, route);
             let last = !replayable || !ups.has_next(tried) || (p.tries != 0 && tries >= p.tries);
             match self.exchange(&mut up, p, last).await {
                 Ok(()) => {
@@ -199,8 +199,10 @@ impl Conn {
 
     /// Builds the upstream request head into `out`: the original target, or
     /// the changed URI after a rewrite or internal redirect, as `proxy_pass`
-    /// without a URI part does. The route's request headers are applied.
-    fn upstream_head(&mut self, target: SocketAddr, keepalive: bool, route: &Route) {
+    /// without a URI part does. Host is the upstream's ($proxy_host) unless a
+    /// header operation sets it, as nginx's default `proxy_set_header Host
+    /// $proxy_host`. The route's request headers are applied.
+    fn upstream_head(&mut self, target: SocketAddr, host: &str, keepalive: bool, route: &Route) {
         let mut out = std::mem::take(&mut self.out);
         out.clear();
         if self.x.as_get {
@@ -220,26 +222,32 @@ impl Conn {
         }
         out.extend_from_slice(b" HTTP/1.1\r\n");
         let ops = &route.request_headers;
-        let mut has_host = ops.drops(b"host");
+        let has_host = ops.drops(b"host");
         for h in self.x.req.headers.iter() {
             // Expect is answered here, not by the upstream. A request an
             // error page turned into a GET has no body any more.
             let name = h.name.get(&self.x.head);
             if h.kind.is_hop_by_hop()
+                || h.kind == HeaderKind::Host
                 || h.kind == HeaderKind::Expect
                 || (self.x.as_get && h.kind == HeaderKind::ContentLength)
                 || (!ops.is_empty() && ops.drops(name))
             {
                 continue;
             }
-            has_host |= h.kind == HeaderKind::Host;
             out.extend_from_slice(name);
             out.extend_from_slice(b": ");
             out.extend_from_slice(h.value.get(&self.x.head));
             out.extend_from_slice(b"\r\n");
         }
         if !has_host {
-            _ = write!(out, "Host: {target}\r\n");
+            if host.is_empty() {
+                _ = write!(out, "Host: {target}\r\n");
+            } else {
+                out.extend_from_slice(b"Host: ");
+                out.extend_from_slice(host.as_bytes());
+                out.extend_from_slice(b"\r\n");
+            }
         }
         if !ops.is_empty() {
             headers::request(&mut self.x, ops, &mut out);

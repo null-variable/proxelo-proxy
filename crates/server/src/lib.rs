@@ -18,6 +18,7 @@ mod log;
 pub mod metrics;
 mod phases;
 mod proxy;
+mod range;
 mod reply;
 mod sim;
 mod static_file;

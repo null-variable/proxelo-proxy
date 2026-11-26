@@ -432,6 +432,9 @@ pub struct Upstream {
     pub keepalive_idle: u32,
     pub keepalive_timeout: Duration,
     pub keepalive_requests: u32,
+    /// Host header for requests to it unless a header operation sets one;
+    /// empty: the target's address.
+    pub host: Box<str>,
     /// 0 disables passive health.
     pub max_fails: u32,
     pub fail_timeout: Duration,
@@ -635,6 +638,7 @@ impl Runtime {
                 } else {
                     up.keepalive_requests
                 },
+                host: up.host.as_str().into(),
                 max_fails: up.max_fails,
                 fail_timeout: ms(up.fail_timeout_ms, Duration::from_secs(10)),
             });

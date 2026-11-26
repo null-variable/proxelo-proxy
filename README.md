@@ -31,7 +31,8 @@ Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
 - `proxelo-proxy sim`: the dry-load helper the control plane uses to validate
   snapshots and simulate requests with this engine (same parser, site lookup
   and phases; proxying reports the upstream instead of connecting).
-- Static files (`root`, `index`) and reverse proxying with smooth weighted
+- Static files (`root`, `index`) with byte ranges (single, multipart,
+  `If-Range`, 416 as nginx) and reverse proxying with smooth weighted
   round robin or least_conn, backup targets, passive health (`max_fails`,
   `fail_timeout`), `proxy_next_upstream` retries on errors, timeouts and
   listed statuses, per-route timeouts and keepalive upstream connections
@@ -59,6 +60,10 @@ Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
 Snapshots arrive as bytes and are checked against their SHA-256 hash
 before they are applied or written as the last-known-good snapshot. A
 replaced snapshot is freed on a separate thread.
+
+Requests go upstream with `Host` set to the upstream's name, as nginx's
+default `proxy_set_header Host $proxy_host`, unless a header operation sets
+it.
 
 Behaviour follows nginx defaults where the snapshot has no setting yet:
 timeouts (`client_header_timeout 60s`, `keepalive_timeout 75s`,
