@@ -13,7 +13,7 @@ use proxelo_http1::{
     Body, ChunkedDecoder, Error as ParseError, Method, Response, parse_request, push_u64,
     request_line_complete,
 };
-use proxelo_snapshot::{HeaderOps, MatchError};
+use proxelo_snapshot::{Action, HeaderOps, MatchError};
 
 use crate::buf::Buf;
 use crate::exchange::Exchange;
@@ -23,12 +23,12 @@ use crate::{Active, acme, headers, log, reply};
 
 // nginx defaults.
 const CLIENT_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
-const CLIENT_BODY_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const CLIENT_BODY_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(75);
 /// `client_header_buffer_size`, growing up to `large_client_header_buffers`.
-const HEADER_BUF: usize = 1024;
-const MAX_HEADER: usize = 32 * 1024;
+pub(crate) const HEADER_BUF: usize = 1024;
+pub(crate) const MAX_HEADER: usize = 32 * 1024;
 /// `client_max_body_size`.
 pub(crate) const MAX_BODY: u64 = 1024 * 1024;
 /// `keepalive_requests`.
@@ -59,6 +59,14 @@ pub(crate) fn upstream_fail(e: io::Error) -> Fail {
     }
 }
 
+/// Where [`Conn::pump_body`] puts the request body.
+pub(crate) enum Sink<'a> {
+    Drop,
+    Upstream(&'a mut tokio::net::TcpStream, Duration),
+    /// The body without framing, at most [`MAX_BODY`] bytes.
+    Collect(&'a mut Vec<u8>),
+}
+
 /// Whether the client connection stays open for another request.
 pub(crate) type KeepAlive = bool;
 
@@ -79,6 +87,9 @@ pub(crate) struct Conn {
     /// Compression input and output buffers.
     pub zin: Vec<u8>,
     pub zout: Vec<u8>,
+    /// Gateway request body and request or response head scratch.
+    pub gw_body: Vec<u8>,
+    pub gw_buf: Vec<u8>,
 }
 
 /// Bytes after the head in a response built in one buffer.
@@ -118,6 +129,8 @@ impl Conn {
             holds: Vec::new(),
             zin: Vec::new(),
             zout: Vec::new(),
+            gw_body: Vec::new(),
+            gw_buf: Vec::new(),
         }
     }
 
@@ -280,11 +293,27 @@ impl Conn {
             return match outcome {
                 Outcome::Proxy(p) => {
                     // An error page made this a GET; its body is not sent on.
-                    if self.x.as_get && self.pump_body(None).await.is_err() {
+                    if self.x.as_get && self.pump_body(Sink::Drop).await.is_err() {
                         return false;
                     }
                     let route = &site.routes[phases.route.expect("proxy has a route") as usize];
                     match self.proxy(active, &p, route).await {
+                        Ok(keep) => keep,
+                        Err(status) => {
+                            phases.fail(status);
+                            continue;
+                        }
+                    }
+                }
+                Outcome::Pass(_) => {
+                    let route = &site.routes[phases.route.expect("pass has a route") as usize];
+                    let r = match &route.action {
+                        Action::Gateway(g) => self.gateway(active, g, route).await,
+                        Action::Memcached(m) => self.memcached(active, m, route).await,
+                        Action::Grpc(p) => self.grpc(active, p, route).await,
+                        _ => unreachable!("pass outcomes come from these actions"),
+                    };
+                    match r {
                         Ok(keep) => keep,
                         Err(status) => {
                             phases.fail(status);
@@ -417,10 +446,7 @@ impl Conn {
     /// Reads the rest of the request body. With `up` the bytes are forwarded
     /// as framed and `client_max_body_size` applies; without it they are
     /// discarded.
-    pub async fn pump_body(
-        &mut self,
-        mut up: Option<(&mut tokio::net::TcpStream, Duration)>,
-    ) -> Result<(), Fail> {
+    pub async fn pump_body(&mut self, mut sink: Sink<'_>) -> Result<(), Fail> {
         loop {
             if matches!(self.body, BodyLeft::None) {
                 return Ok(());
@@ -445,20 +471,34 @@ impl Conn {
                 }
                 BodyLeft::Chunked(dec, total) => {
                     let mut data = 0;
+                    let filled = &self.buf.data[..self.buf.end];
                     let take = dec
-                        .advance_with(self.buf.filled(), |r| data += r.len() as u64)
+                        .advance_with(filled, |r| {
+                            data += r.len() as u64;
+                            if let Sink::Collect(v) = &mut sink {
+                                v.extend_from_slice(&filled[r]);
+                            }
+                        })
                         .map_err(|_| Fail::BadBody)?;
                     *total += data;
-                    if up.is_some() && *total > MAX_BODY {
+                    if !matches!(sink, Sink::Drop) && *total > MAX_BODY {
                         return Err(Fail::TooLarge);
                     }
                     (take, dec.is_done())
                 }
             };
-            if let Some((u, t)) = up.as_mut() {
-                write_timeout(*u, &self.buf.data[..take], *t)
-                    .await
-                    .map_err(upstream_fail)?;
+            match &mut sink {
+                Sink::Drop => {}
+                Sink::Upstream(u, t) => {
+                    write_timeout(*u, &self.buf.data[..take], *t)
+                        .await
+                        .map_err(upstream_fail)?;
+                }
+                Sink::Collect(v) => {
+                    if matches!(self.body, BodyLeft::Length(_)) {
+                        v.extend_from_slice(&self.buf.data[..take]);
+                    }
+                }
             }
             self.buf.consume(take);
             if done {
@@ -470,7 +510,7 @@ impl Conn {
     /// Writes `out` after draining the request body, so the connection is at
     /// the next request when `keep` holds.
     pub async fn respond(&mut self, keep: KeepAlive) -> KeepAlive {
-        if keep && self.pump_body(None).await.is_err() {
+        if keep && self.pump_body(Sink::Drop).await.is_err() {
             return false;
         }
         write_timeout(&mut self.client, &self.out, SEND_TIMEOUT)

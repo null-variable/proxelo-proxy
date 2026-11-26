@@ -42,6 +42,9 @@ pub(crate) enum Outcome {
     Directory,
     /// Proxy to this upstream with these settings.
     Proxy(proxelo_snapshot::Proxy),
+    /// A gateway, memcached or grpc action of the route, with its upstream
+    /// settings.
+    Pass(proxelo_snapshot::Proxy),
     /// Close without a response (444).
     Close,
     /// The route's access phase must run; continue with
@@ -223,6 +226,9 @@ impl<'s> Phases<'s> {
         match action {
             Action::Return(r) => self.ret(x, r),
             Action::Proxy(p) => Ok(Outcome::Proxy(*p)),
+            Action::Gateway(g) => Ok(Outcome::Pass(g.proxy)),
+            Action::Memcached(m) => Ok(Outcome::Pass(m.proxy)),
+            Action::Grpc(p) => Ok(Outcome::Pass(*p)),
             Action::Static {
                 root,
                 index,

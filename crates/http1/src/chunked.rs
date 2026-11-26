@@ -54,7 +54,19 @@ impl ChunkedDecoder {
     pub fn advance_with(
         &mut self,
         buf: &[u8],
+        on_data: impl FnMut(std::ops::Range<usize>),
+    ) -> Result<usize, Error> {
+        self.advance_full(buf, on_data, |_| {})
+    }
+
+    /// Like [`advance_with`](Self::advance_with), and calls `on_trailer`
+    /// with each byte of the trailer section: its field lines, each ending
+    /// in CRLF, without the final empty line.
+    pub fn advance_full(
+        &mut self,
+        buf: &[u8],
         mut on_data: impl FnMut(std::ops::Range<usize>),
+        mut on_trailer: impl FnMut(u8),
     ) -> Result<usize, Error> {
         let mut i = 0;
         while i < buf.len() {
@@ -116,17 +128,24 @@ impl ChunkedDecoder {
                 State::TrailerStart => match c {
                     b'\r' => self.state = State::FinalLf,
                     b' ' | b'\t' | b'\n' => return Err(Error::BadRequest),
-                    _ => self.state = State::Trailer,
+                    _ => {
+                        on_trailer(c);
+                        self.state = State::Trailer;
+                    }
                 },
                 State::Trailer => match c {
-                    b'\r' => self.state = State::TrailerLf,
+                    b'\r' => {
+                        on_trailer(c);
+                        self.state = State::TrailerLf;
+                    }
                     b'\n' => return Err(Error::BadRequest),
-                    _ => {}
+                    _ => on_trailer(c),
                 },
                 State::TrailerLf => {
                     if c != b'\n' {
                         return Err(Error::BadRequest);
                     }
+                    on_trailer(c);
                     self.state = State::TrailerStart;
                 }
                 State::FinalLf => {
@@ -211,6 +230,18 @@ mod tests {
         }
         assert!(d.is_done());
         assert_eq!(data, b"abcde");
+    }
+
+    #[test]
+    fn reports_trailers() {
+        let body = b"1\r\na\r\n0\r\ngrpc-status: 0\r\nx: y\r\n\r\n";
+        let mut t = Vec::new();
+        let mut d = ChunkedDecoder::new();
+        for part in body.chunks(3) {
+            d.advance_full(part, |_| {}, |c| t.push(c)).unwrap();
+        }
+        assert!(d.is_done());
+        assert_eq!(t, b"grpc-status: 0\r\nx: y\r\n");
     }
 
     #[test]

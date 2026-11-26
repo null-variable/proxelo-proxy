@@ -174,7 +174,7 @@ impl Conn {
         }
         self.x.sent.bytes += body_len;
         self.x.sent.body_bytes = body_len;
-        if keep && self.pump_body(None).await.is_err() {
+        if keep && self.pump_body(crate::conn::Sink::Drop).await.is_err() {
             return false;
         }
         // The head and the first part of the file go out in one write.
@@ -244,7 +244,7 @@ impl Conn {
         }
         // Flushes count what they write, the head included.
         self.x.sent.bytes = 0;
-        if keep && self.pump_body(None).await.is_err() {
+        if keep && self.pump_body(crate::conn::Sink::Drop).await.is_err() {
             return false;
         }
         let mut plain = std::mem::take(&mut self.zin);

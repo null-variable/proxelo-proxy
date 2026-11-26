@@ -181,7 +181,7 @@ pub fn simulate(rt: &Runtime, r: &HttpRequest) -> SimResult {
             }
             out.location = location(&x);
         }
-        Outcome::Proxy(p) => {
+        Outcome::Proxy(p) | Outcome::Pass(p) => {
             let up = &rt.upstreams[p.upstream as usize];
             out.kind = Kind::Proxy as i32;
             out.status = x.err_status.into();

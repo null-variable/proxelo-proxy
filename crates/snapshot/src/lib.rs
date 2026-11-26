@@ -22,9 +22,10 @@ pub use cond::{Cond, Facts};
 pub use lookup::{GeoTable, Lookup, MapTable, SplitTable, Table, murmur2};
 pub use runtime::{
     AccessLog, Action, Balancing, BuildError, Captures, Certificate, CheckKind, ErrorPage,
-    ErrorTarget, Fallback, HeaderOps, HeaderValue, HealthCheck, Listener, ListenerTls, MatchError,
-    NextOn, Pattern, Proxy, Resolved, Return, Rewrite, RewriteFlag, Route, Runtime, Site, Sticky,
-    StickyCookie, Target, TryFiles, Upstream,
+    ErrorTarget, Fallback, Gateway, GatewayParam, GatewayProtocol, HeaderOps, HeaderValue,
+    HealthCheck, Listener, ListenerTls, MatchError, Memcached, NextOn, Pattern, Proxy, Resolved,
+    Return, Rewrite, RewriteFlag, Route, Runtime, Site, Sticky, StickyCookie, Target, TryFiles,
+    Upstream,
 };
 pub use template::{Part, Template, Var};
 
@@ -108,6 +109,23 @@ impl SiteCheck {
         Ok(())
     }
 
+    /// The upstream settings of a gateway, memcached or grpc action.
+    fn upstream(
+        &self,
+        p: Option<&proxelo_api::snapshot::v1::ProxyAction>,
+        at: &str,
+        kind: &str,
+    ) -> Result<(), Invalid> {
+        match p {
+            None => Err((format!("{at}.action.{kind}.proxy"), "missing")),
+            Some(p) if p.upstream as usize >= self.upstreams => Err((
+                format!("{at}.action.{kind}.proxy.upstream"),
+                "no such upstream",
+            )),
+            Some(_) => Ok(()),
+        }
+    }
+
     fn route(&self, route: &IrRoute, at: &str, matched: bool) -> Result<(), Invalid> {
         let kind = route.path.as_ref().map(|p| p.kind());
         if matched {
@@ -147,6 +165,9 @@ impl SiteCheck {
             }
             Some(action::Kind::Return(r)) => check_return(r, format!("{at}.action.return"))?,
             Some(action::Kind::Proxy(_)) => {}
+            Some(action::Kind::Gateway(g)) => self.upstream(g.proxy.as_ref(), at, "gateway")?,
+            Some(action::Kind::Memcached(m)) => self.upstream(m.proxy.as_ref(), at, "memcached")?,
+            Some(action::Kind::Grpc(g)) => self.upstream(g.proxy.as_ref(), at, "grpc")?,
         }
         self.error_pages(&route.error_pages, &format!("{at}.error_pages"))?;
         if route.access_log.is_some_and(|l| l as usize >= self.logs) {

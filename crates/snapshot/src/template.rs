@@ -56,6 +56,14 @@ pub enum Var {
     /// The connection's address before real_ip.
     RealipRemoteAddr,
     RealipRemotePort,
+    /// `$document_root`: the gateway's document root.
+    DocumentRoot,
+    /// `$content_length`: the Content-Length header, or the length of a
+    /// body read in full.
+    ContentLength,
+    ContentType,
+    FastcgiScriptName,
+    FastcgiPathInfo,
     /// `$0`..`$9`: groups of the last regex that matched.
     Capture(u8),
 }
@@ -214,6 +222,11 @@ fn var(name: &str) -> Option<Part> {
         "remote_user" => Var::RemoteUser,
         "realip_remote_addr" => Var::RealipRemoteAddr,
         "realip_remote_port" => Var::RealipRemotePort,
+        "document_root" => Var::DocumentRoot,
+        "content_length" => Var::ContentLength,
+        "content_type" => Var::ContentType,
+        "fastcgi_script_name" => Var::FastcgiScriptName,
+        "fastcgi_path_info" => Var::FastcgiPathInfo,
         _ => {
             let header = |h: &str| -> Box<[u8]> {
                 h.bytes()

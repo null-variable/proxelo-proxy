@@ -6,16 +6,17 @@ use std::time::{Duration, Instant};
 
 use proxelo_http1::{Body, ChunkedDecoder, HeaderKind, Method, Version, parse_response, push_hex};
 use proxelo_snapshot::{Balancing, Proxy, Route, Sticky};
+use tokio::io::AsyncRead;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::conn::{BodyLeft, Conn, Fail, KeepAlive, SEND_TIMEOUT as CLIENT_SEND, upstream_fail};
 use crate::io::write_timeout;
-use crate::upstream::{Choice, Conn as UpConn, Pool, State};
+use crate::upstream::{Choice, Conn as UpConn, State};
 use crate::{Active, compress, headers, reply};
 
 /// `proxy_buffer_size`: the upstream response head must fit.
-const HEAD_BUF: usize = 16 * 1024;
+pub(crate) const HEAD_BUF: usize = 16 * 1024;
 /// Upstream body bytes read per client write.
 const BODY_BUF: usize = 64 * 1024;
 
@@ -34,15 +35,15 @@ enum Mode {
     Raw,
 }
 
-fn idempotent(m: Method) -> bool {
+pub(crate) fn idempotent(m: Method) -> bool {
     !matches!(
         m,
         Method::Post | Method::Patch | Method::Connect | Method::Other
     )
 }
 
-async fn read(
-    s: &mut TcpStream,
+pub(crate) async fn read<S: AsyncRead + Unpin>(
+    s: &mut S,
     buf: &mut crate::buf::Buf,
     max: usize,
     t: Duration,
@@ -178,7 +179,10 @@ impl Conn {
                     let keep_up = ups.keepalive
                         && up.used < ups.keepalive_requests
                         && up.opened.elapsed() < ups.keepalive_time;
-                    let keep = self.relay(up, pool, keep_up, route, p.read_timeout).await;
+                    let (keep, complete) = self.relay(&mut up.stream, route, p.read_timeout).await;
+                    if complete && self.resp.keep_alive && keep_up && self.ubuf.end == 0 {
+                        pool.put(up);
+                    }
                     let took = started.elapsed();
                     self.x.sent.upstream_response = Some(connect.elapsed().as_secs_f64());
                     active.metrics.upstream_response(p.upstream, i, st, took);
@@ -240,7 +244,7 @@ impl Conn {
 
     /// The target a sticky session names: the sticky cookie's value, or the
     /// first non-empty route template matched against target routes.
-    fn sticky(&mut self, active: &Active, upstream: u32) -> Option<usize> {
+    pub(crate) fn sticky(&mut self, active: &Active, upstream: u32) -> Option<usize> {
         let ups: &State = &active.upstreams[upstream as usize];
         match &active.rt.upstreams[upstream as usize].sticky {
             None => None,
@@ -273,7 +277,7 @@ impl Conn {
 
     /// Sets the sticky cookie naming target `i` unless the request already
     /// carries it.
-    fn sticky_cookie(&mut self, active: &Active, upstream: u32, i: usize) {
+    pub(crate) fn sticky_cookie(&mut self, active: &Active, upstream: u32, i: usize) {
         let Some(Sticky::Cookie(c)) = &active.rt.upstreams[upstream as usize].sticky else {
             return;
         };
@@ -297,7 +301,13 @@ impl Conn {
     /// without a URI part does. Host is the upstream's ($proxy_host) unless a
     /// header operation sets it, as nginx's default `proxy_set_header Host
     /// $proxy_host`. The route's request headers are applied.
-    fn upstream_head(&mut self, target: SocketAddr, host: &str, keepalive: bool, route: &Route) {
+    pub(crate) fn upstream_head(
+        &mut self,
+        target: SocketAddr,
+        host: &str,
+        keepalive: bool,
+        route: &Route,
+    ) {
         let mut out = std::mem::take(&mut self.out);
         out.clear();
         if self.x.as_get {
@@ -381,7 +391,7 @@ impl Conn {
             .map_err(|_| Err(Fail::Client))?;
             self.x.req.expect_continue = false;
         }
-        self.pump_body(Some((up, p.send_timeout)))
+        self.pump_body(crate::conn::Sink::Upstream(up, p.send_timeout))
             .await
             .map_err(Err)?;
 
@@ -418,16 +428,15 @@ impl Conn {
         }
     }
 
-    /// Sends the upstream response to the client and pools the upstream
-    /// connection when it is reusable.
-    async fn relay(
+    /// Sends the upstream response head in `resp` and its body to the
+    /// client. Returns whether the client connection stays and whether the
+    /// upstream is at a message boundary afterwards.
+    pub(crate) async fn relay<S: AsyncRead + Unpin>(
         &mut self,
-        mut up: UpConn,
-        pool: &Pool,
-        pool_ok: bool,
+        up: &mut S,
         route: &Route,
         read_timeout: Duration,
-    ) -> KeepAlive {
+    ) -> (KeepAlive, bool) {
         let client11 = self.x.req.version == Version::Http11;
         let mut keep = self.x.req.keep_alive;
         let mode = match self.resp.body {
@@ -550,19 +559,16 @@ impl Conn {
         let complete = match coder.take() {
             Some((k, _)) if mode != Mode::None => {
                 let k = k.into_coder(&std::sync::Arc::clone(&self.x.compressions));
-                self.body_coded(&mut up.stream, mode, read_timeout, k, client_chunked)
+                self.body_coded(up, mode, read_timeout, k, client_chunked)
                     .await
             }
-            _ => self.body_out(&mut up.stream, mode, read_timeout).await,
+            _ => self.body_out(up, mode, read_timeout).await,
         };
         self.x.sent.body_bytes = self.x.sent.bytes.saturating_sub(head_bytes);
-        let Ok(complete) = complete else {
-            return false;
-        };
-        if complete && self.resp.keep_alive && pool_ok && self.ubuf.end == 0 {
-            pool.put(up);
+        match complete {
+            Ok(complete) => (keep, complete),
+            Err(()) => (false, false),
         }
-        keep
     }
 
     /// The encoder for the upstream response, `(coder, gunzip)`, and whether
@@ -620,9 +626,9 @@ impl Conn {
     /// Streams the response body through an encoder or decoder. The
     /// upstream framing is removed first; the result goes out chunked when
     /// `chunked`, raw otherwise (the connection then ends with it).
-    async fn body_coded(
+    async fn body_coded<S: AsyncRead + Unpin>(
         &mut self,
-        up: &mut TcpStream,
+        up: &mut S,
         mode: Mode,
         t: Duration,
         coder: std::io::Result<compress::Coder>,
@@ -709,7 +715,7 @@ impl Conn {
     }
 
     /// Writes `out` to the client and counts it.
-    async fn flush(&mut self) -> Result<(), ()> {
+    pub(crate) async fn flush(&mut self) -> Result<(), ()> {
         self.x.sent.bytes += self.out.len() as u64;
         let r = write_timeout(&mut self.client, &self.out, CLIENT_SEND)
             .await
@@ -726,7 +732,12 @@ impl Conn {
     /// Streams the response body. Returns whether the upstream connection is
     /// at a message boundary afterwards. `Err` means the client connection
     /// must close.
-    async fn body_out(&mut self, up: &mut TcpStream, mode: Mode, t: Duration) -> Result<bool, ()> {
+    async fn body_out<S: AsyncRead + Unpin>(
+        &mut self,
+        up: &mut S,
+        mode: Mode,
+        t: Duration,
+    ) -> Result<bool, ()> {
         let mut left = match mode {
             Mode::Length(n) => n,
             _ => 0,

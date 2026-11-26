@@ -233,6 +233,8 @@ async fn relay<R: tokio::io::AsyncRead + Unpin>(
     };
     let mut dec = ChunkedDecoder::new();
     let mut chunk = Vec::new();
+    // A chunked response's trailer section, sent as HTTP/2 trailers.
+    let mut trailer = Vec::new();
     loop {
         chunk.clear();
         let done = match resp.body {
@@ -246,7 +248,11 @@ async fn relay<R: tokio::io::AsyncRead + Unpin>(
             Body::Chunked => {
                 let data = &buf.data[..buf.end];
                 let take = dec
-                    .advance_with(data, |r| chunk.extend_from_slice(&data[r]))
+                    .advance_full(
+                        data,
+                        |r| chunk.extend_from_slice(&data[r]),
+                        |c| trailer.push(c),
+                    )
                     .map_err(|_| ())?;
                 buf.consume(take);
                 dec.is_done()
@@ -257,8 +263,17 @@ async fn relay<R: tokio::io::AsyncRead + Unpin>(
                 false
             }
         };
-        if !chunk.is_empty() || done {
-            data(&mut send, Bytes::copy_from_slice(&chunk), done).await?;
+        let trailers = if done && !trailer.is_empty() {
+            Some(trailer_map(&trailer))
+        } else {
+            None
+        };
+        if !chunk.is_empty() || (done && trailers.is_none()) {
+            let end = done && trailers.is_none();
+            data(&mut send, Bytes::copy_from_slice(&chunk), end).await?;
+        }
+        if let Some(t) = trailers {
+            return send.send_trailers(t).map_err(|_| ());
         }
         if done {
             return Ok(());
@@ -281,8 +296,30 @@ async fn relay<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+/// The fields of a chunked trailer section.
+fn trailer_map(raw: &[u8]) -> http::HeaderMap {
+    let mut map = http::HeaderMap::new();
+    for line in raw.split(|&c| c == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon) = line.iter().position(|&c| c == b':') else {
+            continue;
+        };
+        if let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(&line[..colon]),
+            HeaderValue::from_bytes(line[colon + 1..].trim_ascii()),
+        ) {
+            map.append(n, v);
+        }
+    }
+    map
+}
+
 /// Sends `bytes` within the stream's flow control window.
-async fn data(send: &mut SendStream<Bytes>, mut bytes: Bytes, end: bool) -> Result<(), ()> {
+pub(crate) async fn data(
+    send: &mut SendStream<Bytes>,
+    mut bytes: Bytes,
+    end: bool,
+) -> Result<(), ()> {
     if bytes.is_empty() {
         return send.send_data(bytes, end).map_err(|_| ());
     }

@@ -294,6 +294,22 @@ fn var(x: &mut Exchange, v: Var, out: &mut Vec<u8>) {
         }
         Var::RealipRemoteAddr => _ = write!(out, "{}", x.conn_peer.ip()),
         Var::RealipRemotePort => push_u64(out, u64::from(x.conn_peer.port())),
+        Var::DocumentRoot => out.extend_from_slice(&x.doc_root),
+        Var::ContentLength => match x.request_header(b"content-length") {
+            Some(v) => out.extend_from_slice(v),
+            None => {
+                if let Some(n) = x.body_len {
+                    push_u64(out, n);
+                }
+            }
+        },
+        Var::ContentType => {
+            if let Some(v) = x.request_header(b"content-type") {
+                out.extend_from_slice(v);
+            }
+        }
+        Var::FastcgiScriptName => out.extend_from_slice(&x.script_name),
+        Var::FastcgiPathInfo => out.extend_from_slice(&x.path_info),
         Var::Capture(i) => {
             if let Some(c) = x.caps.get(usize::from(i)) {
                 out.extend_from_slice(c);

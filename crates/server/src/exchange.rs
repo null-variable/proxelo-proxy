@@ -101,6 +101,15 @@ pub(crate) struct Exchange {
     pub compression: Option<u32>,
     /// Vary: Accept-Encoding goes out with the response.
     pub vary: bool,
+    /// $document_root, $fastcgi_script_name and $fastcgi_path_info of a
+    /// gateway request.
+    pub doc_root: Vec<u8>,
+    pub script_name: Vec<u8>,
+    pub path_info: Vec<u8>,
+    /// The request body was read in full with this length.
+    pub body_len: Option<u64>,
+    /// Groups of fastcgi_split_path_info, kept apart from `$1`..`$9`.
+    pub gw_caps: Captures,
 }
 
 /// Lowercases `raw` into `out` without the port and a trailing dot.
@@ -159,6 +168,11 @@ impl Exchange {
             compressions: std::sync::Arc::from([]),
             compression: None,
             vary: false,
+            doc_root: Vec::new(),
+            script_name: Vec::new(),
+            path_info: Vec::new(),
+            body_len: None,
+            gw_caps: Captures::default(),
         }
     }
 
@@ -202,6 +216,10 @@ impl Exchange {
         self.lookup_buf.clear();
         self.compression = None;
         self.vary = false;
+        self.doc_root.clear();
+        self.script_name.clear();
+        self.path_info.clear();
+        self.body_len = None;
         self.uri_changed = false;
         self.error_paged = false;
         self.err_status = 0;

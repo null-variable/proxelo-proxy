@@ -753,6 +753,8 @@ pub(crate) struct Conn {
 /// Idle connections to one target, one LIFO stack per worker.
 pub(crate) struct Pool {
     pub addr: SocketAddr,
+    /// The HTTP/2 connection grpc requests to this target share.
+    pub h2: tokio::sync::Mutex<Option<h2::client::SendRequest<bytes::Bytes>>>,
     max_idle: usize,
     timeout: Duration,
     shards: Box<[Mutex<Vec<Idle>>]>,
@@ -763,6 +765,7 @@ impl Pool {
         let max_idle = max_idle as usize;
         Self {
             addr,
+            h2: tokio::sync::Mutex::new(None),
             max_idle,
             timeout,
             shards: (0..shards)

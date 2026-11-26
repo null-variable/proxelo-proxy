@@ -308,6 +308,43 @@ pub enum Action {
     },
     Proxy(Proxy),
     Return(Return),
+    /// FastCGI, uwsgi or SCGI.
+    Gateway(Box<Gateway>),
+    Memcached(Memcached),
+    Grpc(Proxy),
+}
+
+/// How a gateway frames the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayProtocol {
+    FastCgi,
+    Uwsgi,
+    Scgi,
+}
+
+#[derive(Debug)]
+pub struct Gateway {
+    pub protocol: GatewayProtocol,
+    pub proxy: Proxy,
+    pub params: Box<[GatewayParam]>,
+    pub pass_request_headers: bool,
+    pub document_root: Box<[u8]>,
+    pub index: Box<[u8]>,
+    pub split_path_info: Option<Pattern>,
+}
+
+#[derive(Debug)]
+pub struct GatewayParam {
+    pub name: Box<[u8]>,
+    pub value: Template,
+    pub if_not_empty: bool,
+}
+
+#[derive(Debug)]
+pub struct Memcached {
+    pub proxy: Proxy,
+    /// `None`: `$uri`.
+    pub key: Option<Template>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -681,6 +718,17 @@ fn sticky(s: &ir::Sticky, at: &str, names: &[Box<str>]) -> Result<Sticky, BuildE
         .into(),
         attributes: attributes.into(),
     }))
+}
+
+fn proxy(p: &ir::ProxyAction) -> Proxy {
+    Proxy {
+        upstream: p.upstream,
+        connect_timeout: ms(p.connect_timeout_ms, DEFAULT_TIMEOUT),
+        send_timeout: ms(p.send_timeout_ms, DEFAULT_TIMEOUT),
+        read_timeout: ms(p.read_timeout_ms, DEFAULT_TIMEOUT),
+        next: NextOn::build(&p.next_upstream),
+        tries: p.next_upstream_tries,
+    }
 }
 
 fn ms(v: u32, default: Duration) -> Duration {
@@ -1106,14 +1154,21 @@ impl SiteBuilder<'_> {
                     try_files,
                 }
             }
-            Some(action::Kind::Proxy(p)) => Action::Proxy(Proxy {
-                upstream: p.upstream,
-                connect_timeout: ms(p.connect_timeout_ms, DEFAULT_TIMEOUT),
-                send_timeout: ms(p.send_timeout_ms, DEFAULT_TIMEOUT),
-                read_timeout: ms(p.read_timeout_ms, DEFAULT_TIMEOUT),
-                next: NextOn::build(&p.next_upstream),
-                tries: p.next_upstream_tries,
+            Some(action::Kind::Proxy(p)) => Action::Proxy(proxy(p)),
+            Some(action::Kind::Gateway(g)) => {
+                Action::Gateway(Box::new(self.gateway(g, &format!("{at}.action.gateway"))?))
+            }
+            Some(action::Kind::Memcached(m)) => Action::Memcached(Memcached {
+                proxy: proxy(m.proxy.as_ref().expect("validated")),
+                key: if m.key.is_empty() {
+                    None
+                } else {
+                    Some(self.template(&m.key, &format!("{at}.action.memcached.key"))?)
+                },
             }),
+            Some(action::Kind::Grpc(g)) => {
+                Action::Grpc(proxy(g.proxy.as_ref().expect("validated")))
+            }
             Some(action::Kind::Return(r)) => {
                 Action::Return(self.ret(r, &format!("{at}.action.return"))?)
             }
@@ -1181,6 +1236,47 @@ impl SiteBuilder<'_> {
                 .iter()
                 .map(|n| n.to_ascii_lowercase().into_bytes().into())
                 .collect(),
+        })
+    }
+
+    fn gateway(&self, g: &ir::GatewayAction, at: &str) -> Result<Gateway, BuildError> {
+        use ir::gateway_action::Protocol as P;
+        let protocol = match g.protocol() {
+            P::Uwsgi => GatewayProtocol::Uwsgi,
+            P::Scgi => GatewayProtocol::Scgi,
+            P::Fastcgi | P::Unspecified => GatewayProtocol::FastCgi,
+        };
+        let params = g
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if p.name.is_empty() || p.name.bytes().any(|c| c == 0) {
+                    return Err(self.err(format!("{at}.params[{i}].name"), "must not be empty"));
+                }
+                Ok(GatewayParam {
+                    name: p.name.as_bytes().into(),
+                    value: self.template(&p.value, &format!("{at}.params[{i}].value"))?,
+                    if_not_empty: p.if_not_empty,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let split_path_info = if g.split_path_info.is_empty() {
+            None
+        } else {
+            Some(
+                Pattern::new(&g.split_path_info, false)
+                    .map_err(|e| self.err(format!("{at}.split_path_info"), e))?,
+            )
+        };
+        Ok(Gateway {
+            protocol,
+            proxy: proxy(g.proxy.as_ref().expect("validated")),
+            params,
+            pass_request_headers: g.pass_request_headers,
+            document_root: g.document_root.trim_end_matches('/').as_bytes().into(),
+            index: g.index.as_bytes().into(),
+            split_path_info,
         })
     }
 

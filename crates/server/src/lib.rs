@@ -12,6 +12,8 @@ mod buf;
 mod compress;
 mod conn;
 mod exchange;
+mod gateway;
+mod grpc;
 mod h2;
 mod headers;
 mod health;
