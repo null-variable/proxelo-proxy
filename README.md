@@ -78,6 +78,16 @@ Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
   requests and latency per site and route, upstream responses, failures,
   latency and health per target, connections, TLS handshake errors and
   snapshot swaps. Counters survive swaps.
+- Binary upgrades without dropping connections, as nginx's USR2: on SIGUSR2
+  (or when a new binary is started by hand on the same `--data`) the new
+  process takes the listening sockets from the running one over
+  `<data>/proxy/upgrade.sock` (SCM_RIGHTS), loads the last-known-good
+  snapshot and starts accepting; the old one then stops accepting, closes
+  idle keepalive connections, sends HTTP/2 GOAWAY, lets requests in progress
+  finish for up to `--drain` seconds and exits. A new process that fails to
+  start leaves the old one serving. SIGQUIT is the same graceful stop
+  without a successor. Under systemd, run as `Type=notify` with
+  `NotifyAccess=all`; the new process reports itself as `MAINPID`.
 - Live Tap: while the control plane asks, finished requests matching its
   filter (sites, routes, client CIDRs, sampling) are sent in batches with
   status, timing, upstream and the requested headers, at most 100 a second;

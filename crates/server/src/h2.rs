@@ -23,7 +23,7 @@ use crate::buf::Buf;
 use crate::conn::Conn;
 use crate::io::Stream;
 use crate::tls::TlsInfo;
-use crate::{Active, Server};
+use crate::{Active, Server, drain};
 
 /// nginx http2_max_concurrent_streams.
 const MAX_STREAMS: u32 = 128;
@@ -57,14 +57,32 @@ pub(crate) async fn serve(
     let in_flight = Arc::new(AtomicU32::new(0));
     let mut accepted = 0u64;
     let mut refused = 0u32;
-    while let Some(next) = conn.accept().await {
+    let mut closing = false;
+    loop {
+        let next = if closing {
+            conn.accept().await
+        } else {
+            tokio::select! {
+                next = conn.accept() => next,
+                () = drain::started() => {
+                    // GOAWAY; streams already open finish.
+                    conn.graceful_shutdown();
+                    closing = true;
+                    continue;
+                }
+            }
+        };
+        let Some(next) = next else {
+            return;
+        };
         let Ok((req, mut respond)) = next else {
             return;
         };
         accepted += 1;
-        if accepted == KEEPALIVE_REQUESTS {
+        if accepted == KEEPALIVE_REQUESTS && !closing {
             // nginx keepalive_requests: GOAWAY, then finish open streams.
             conn.graceful_shutdown();
+            closing = true;
         }
         if in_flight.load(Ordering::Relaxed) >= MAX_STREAMS {
             respond.send_reset(h2::Reason::REFUSED_STREAM);

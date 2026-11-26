@@ -1174,6 +1174,7 @@ dependencies = [
  "proxelo-api",
  "proxelo-http1",
  "proxelo-snapshot",
+ "rustix",
  "sha-crypt",
  "socket2",
  "stats_alloc",

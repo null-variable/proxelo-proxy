@@ -32,6 +32,17 @@ run options:
                       in <dir>/proxy/lkg.snap (default /var/lib/proxelo)
   --socket <path>     control plane socket (default /run/proxelo/control.sock)
   --node-id <id>      name reported to the control plane (default: host name)
+  --drain <seconds>   how long open connections may finish after a graceful
+                      stop or binary upgrade (default 60)
+
+signals (run):
+  SIGTERM, SIGINT     stop now
+  SIGQUIT             stop accepting, let open connections finish, stop
+  SIGUSR1             reopen access log files
+  SIGUSR2             binary upgrade: start the binary at this path again;
+                      it takes over the listening sockets, then this process
+                      stops accepting and finishes its connections. A process
+                      started by hand on the same --data does the same.
 
 run and serve options:
   --metrics <addr>    serve Prometheus metrics at http://<addr>/metrics
@@ -53,6 +64,7 @@ struct Options {
     data: PathBuf,
     socket: PathBuf,
     node_id: Option<String>,
+    drain: std::time::Duration,
 }
 
 fn main() -> ExitCode {
@@ -114,6 +126,7 @@ fn parse_options(mut opts: &[&str], run: bool) -> Option<Options> {
         data: PathBuf::from("/var/lib/proxelo"),
         socket: PathBuf::from("/run/proxelo/control.sock"),
         node_id: None,
+        drain: std::time::Duration::from_secs(60),
     };
     while let [flag, value, rest @ ..] = opts {
         match *flag {
@@ -130,6 +143,7 @@ fn parse_options(mut opts: &[&str], run: bool) -> Option<Options> {
             "--data" if run => o.data = PathBuf::from(value),
             "--socket" if run => o.socket = PathBuf::from(value),
             "--node-id" if run && !value.is_empty() => o.node_id = Some((*value).to_owned()),
+            "--drain" if run => o.drain = std::time::Duration::from_secs(value.parse().ok()?),
             _ => return None,
         }
         opts = rest;
@@ -303,7 +317,7 @@ fn serve(path: &Path, o: &Options) -> Result<(), String> {
     eprintln!("serving revision {revision} with {}", describe(o));
     let main = main_runtime()?;
     main.block_on(async {
-        start_metrics(&server, o.metrics)?;
+        let _metrics = start_metrics(&server, o.metrics)?;
         shutdown_signal().await.map_err(|e| e.to_string())
     })
 }
@@ -313,6 +327,11 @@ fn serve(path: &Path, o: &Options) -> Result<(), String> {
 /// while the control plane is down.
 fn run(o: Options) -> Result<(), String> {
     let lkg = o.data.join("proxy").join("lkg.snap");
+    let upgrade = o.data.join("proxy").join("upgrade.sock");
+    // A proxy already running on this data directory hands over its
+    // listening sockets: this is a binary upgrade.
+    let taken = proxelo_server::take_over(&upgrade)
+        .map_err(|e| format!("binary upgrade from {}: {e}", upgrade.display()))?;
     let workers = start_workers(o.workers, o.kind).map_err(|e| e.to_string())?;
     let server = Server::new(Runtime::empty(), o.workers);
     let mut node = Node {
@@ -326,23 +345,38 @@ fn run(o: Options) -> Result<(), String> {
         names: Vec::new(),
     };
     node.server.set_background(node.listeners.background());
+    let predecessor = taken.map(|(p, sockets)| {
+        eprintln!("binary upgrade: took over {} sockets", sockets.len());
+        node.listeners.inherit(sockets);
+        p
+    });
 
-    match std::fs::read(&node.lkg) {
+    let restored = match std::fs::read(&node.lkg) {
         Ok(bytes) => match proxelo_snapshot::load(&bytes)
             .map_err(|e| e.to_string())
             .and_then(|snap| node.install(snap))
         {
-            Ok(()) => eprintln!(
-                "serving last-known-good revision {} from {}",
-                node.revision,
-                node.lkg.display()
-            ),
-            Err(e) => eprintln!("{}: {e}; waiting for the control plane", node.lkg.display()),
+            Ok(()) => {
+                eprintln!(
+                    "serving last-known-good revision {} from {}",
+                    node.revision,
+                    node.lkg.display()
+                );
+                Ok(())
+            }
+            Err(e) => Err(format!("{}: {e}", node.lkg.display())),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("no last-known-good snapshot; waiting for the control plane");
+            Err("no last-known-good snapshot".to_owned())
         }
-        Err(e) => eprintln!("{}: {e}; waiting for the control plane", node.lkg.display()),
+        Err(e) => Err(format!("{}: {e}", node.lkg.display())),
+    };
+    match restored {
+        Ok(()) => {}
+        // The old process keeps serving when this one cannot take over what
+        // it serves; dropping the predecessor tells it so.
+        Err(e) if predecessor.is_some() => return Err(format!("binary upgrade: {e}")),
+        Err(e) => eprintln!("{e}; waiting for the control plane"),
     }
     eprintln!("running with {}", describe(&o));
 
@@ -352,13 +386,143 @@ fn run(o: Options) -> Result<(), String> {
         version: env!("CARGO_PKG_VERSION").to_owned(),
     };
     let metrics = o.metrics;
+    let drain = o.drain;
     main_runtime()?.block_on(async move {
-        start_metrics(&node.server, metrics)?;
-        tokio::select! {
-            () = client.run(&mut node, |line| eprintln!("{line}")) => Ok(()),
-            r = shutdown_signal() => r.map_err(|e| e.to_string()),
+        if let Some(p) = predecessor {
+            // Both processes accept until the old one confirms it stopped.
+            match tokio::task::spawn_blocking(move || p.ready()).await {
+                Ok(Ok(())) => eprintln!("binary upgrade: previous process stopped accepting"),
+                Ok(Err(e)) => eprintln!("binary upgrade: previous process: {e}"),
+                Err(e) => eprintln!("binary upgrade: {e}"),
+            }
         }
+        let listener = proxelo_server::listen_upgrade(&upgrade)
+            .map_err(|e| format!("{}: {e}", upgrade.display()))?;
+        let metrics = start_metrics(&node.server, metrics)?;
+        systemd_notify(&format!("READY=1\nMAINPID={}", std::process::id()));
+        let handoff = node.listeners.handoff();
+        let stop = tokio::select! {
+            () = client.run(&mut node, |line| eprintln!("{line}")) => return Ok(()),
+            r = signals() => r.map_err(|e| e.to_string())?,
+            r = listener.successor(&handoff) => {
+                Stop::Upgraded(r.map_err(|e| format!("{}: {e}", upgrade.display()))?)
+            }
+        };
+        let successor = match stop {
+            Stop::Upgraded(s) => Some(s),
+            // After an upgrade the socket file is the successor's.
+            Stop::Now => {
+                let _ = std::fs::remove_file(&upgrade);
+                return Ok(());
+            }
+            Stop::Graceful => {
+                let _ = std::fs::remove_file(&upgrade);
+                None
+            }
+        };
+        systemd_notify("STOPPING=1");
+        node.listeners.close();
+        if let Some(m) = metrics {
+            m.abort();
+            let _ = m.await;
+        }
+        if let Some(s) = successor {
+            s.done();
+            eprintln!("binary upgrade: the new process serves; finishing connections");
+        }
+        proxelo_server::drain::start();
+        match proxelo_server::drain::wait(drain).await {
+            0 => eprintln!("all connections finished"),
+            n => eprintln!("closing {n} connections still open"),
+        }
+        Ok(())
     })
+}
+
+/// Why `run` stops.
+enum Stop {
+    /// SIGINT or SIGTERM.
+    Now,
+    /// SIGQUIT: stop accepting, let connections finish.
+    Graceful,
+    /// A new process serves the sockets; finish connections as for SIGQUIT.
+    Upgraded(proxelo_server::Successor),
+}
+
+/// Waits for a signal that stops `run`. SIGUSR1 reopens access log files;
+/// SIGUSR2 starts the binary again for an upgrade.
+async fn signals() -> std::io::Result<Stop> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut quit = signal(SignalKind::quit())?;
+    let mut usr1 = signal(SignalKind::user_defined1())?;
+    let mut usr2 = signal(SignalKind::user_defined2())?;
+    loop {
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => return r.map(|()| Stop::Now),
+            _ = term.recv() => return Ok(Stop::Now),
+            _ = quit.recv() => return Ok(Stop::Graceful),
+            _ = usr1.recv() => proxelo_server::reopen_logs(),
+            _ = usr2.recv() => start_successor(),
+        }
+    }
+}
+
+/// Starts the binary at this process's path with its arguments, as nginx
+/// does on USR2. The new process connects to the upgrade socket itself; if
+/// it fails, this one carries on.
+fn start_successor() {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("binary upgrade: {e}");
+            return;
+        }
+    };
+    match std::process::Command::new(&exe)
+        .args(std::env::args_os().skip(1))
+        .spawn()
+    {
+        Ok(mut child) => {
+            eprintln!(
+                "binary upgrade: started {} (pid {})",
+                exe.display(),
+                child.id()
+            );
+            // Reaped here if it exits while this process still runs.
+            std::thread::spawn(move || {
+                if let Ok(status) = child.wait()
+                    && !status.success()
+                {
+                    eprintln!("binary upgrade: new process exited with {status}");
+                }
+            });
+        }
+        Err(e) => eprintln!("binary upgrade: {}: {e}", exe.display()),
+    }
+}
+
+/// Sends a state to systemd when started as a `Type=notify` unit. After a
+/// binary upgrade the new process reports itself as the main process, which
+/// needs `NotifyAccess=all`.
+fn systemd_notify(state: &str) {
+    let Some(path) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let Ok(socket) = std::os::unix::net::UnixDatagram::unbound() else {
+        return;
+    };
+    let bytes = path.as_encoded_bytes();
+    #[cfg(target_os = "linux")]
+    if let Some(name) = bytes.strip_prefix(b"@") {
+        use std::os::linux::net::SocketAddrExt;
+        if let Ok(addr) = std::os::unix::net::SocketAddr::from_abstract_name(name) {
+            let _ = socket.send_to_addr(state.as_bytes(), &addr);
+        }
+        return;
+    }
+    let _ = bytes;
+    let _ = socket.send_to(state.as_bytes(), &path);
 }
 
 /// The snapshot state of a running proxy.
@@ -582,8 +746,8 @@ fn main_runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Waits for SIGINT or SIGTERM. SIGUSR1 reopens access log files, for
-/// rotation, as in nginx.
+/// Waits for SIGINT or SIGTERM, for `serve`. SIGUSR1 reopens access log
+/// files, for rotation, as in nginx.
 async fn shutdown_signal() -> std::io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate())?;
@@ -599,16 +763,19 @@ async fn shutdown_signal() -> std::io::Result<()> {
 
 /// Serves `GET /metrics` on `addr`, apart from traffic listeners
 /// (a separate port, localhost by default).
-fn start_metrics(server: &Arc<Server>, addr: Option<std::net::SocketAddr>) -> Result<(), String> {
+fn start_metrics(
+    server: &Arc<Server>,
+    addr: Option<std::net::SocketAddr>,
+) -> Result<Option<tokio::task::JoinHandle<()>>, String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let Some(addr) = addr else {
-        return Ok(());
+        return Ok(None);
     };
     let std = std::net::TcpListener::bind(addr).map_err(|e| format!("metrics {addr}: {e}"))?;
     std.set_nonblocking(true).map_err(|e| e.to_string())?;
     let listener = tokio::net::TcpListener::from_std(std).map_err(|e| e.to_string())?;
     let server = server.clone();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         loop {
             let Ok((mut s, _)) = listener.accept().await else {
                 continue;
@@ -639,5 +806,5 @@ fn start_metrics(server: &Arc<Server>, addr: Option<std::net::SocketAddr>) -> Re
         }
     });
     eprintln!("metrics on http://{addr}/metrics");
-    Ok(())
+    Ok(Some(task))
 }

@@ -25,6 +25,7 @@ memchr = "2.8"
 pcre2 = "0.2"
 mimalloc = "0.1"
 socket2 = { version = "0.6", features = ["all"] }
+rustix = { version = "1.1", features = ["net"] }
 stats_alloc = "0.1"
 tikv-jemallocator = "0.7"
 tokio-stream = "0.1"

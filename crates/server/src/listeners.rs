@@ -10,12 +10,14 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use proxelo_snapshot::Runtime;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
+use crate::handoff::{Handoff, Inherited};
 use crate::{Server, bind, bind_udp};
 
 pub struct Listeners {
@@ -25,19 +27,59 @@ pub struct Listeners {
     /// per address.
     per_worker: bool,
     open: HashMap<(SocketAddr, Kind), Vec<JoinHandle<()>>>,
+    /// Duplicates of the open sockets, for a successor process.
+    handoff: Handoff,
+    /// Sockets taken over from a predecessor and not yet claimed by a
+    /// snapshot.
+    inherited: Inherited,
 }
 
 /// What a socket serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum Kind {
+pub(crate) enum Kind {
     Http,
     Tcp,
     Udp,
 }
 
-enum Socket {
+impl Kind {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "http" => Some(Self::Http),
+            "tcp" => Some(Self::Tcp),
+            "udp" => Some(Self::Udp),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) enum Socket {
     Tcp(std::net::TcpListener),
     Udp(std::net::UdpSocket),
+}
+
+impl Socket {
+    pub(crate) fn set_nonblocking(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(s) => s.set_nonblocking(true),
+            Self::Udp(s) => s.set_nonblocking(true),
+        }
+    }
+
+    fn dup(&self) -> io::Result<OwnedFd> {
+        match self {
+            Self::Tcp(s) => s.try_clone().map(OwnedFd::from),
+            Self::Udp(s) => s.try_clone().map(OwnedFd::from),
+        }
+    }
 }
 
 /// Why a snapshot could not be applied; nothing changed.
@@ -79,7 +121,31 @@ impl Listeners {
             workers,
             per_worker,
             open: HashMap::new(),
+            handoff: Handoff::default(),
+            inherited: Inherited(HashMap::new()),
         }
+    }
+
+    /// Serves the sockets of a predecessor instead of binding new ones for
+    /// the addresses they were bound for. Call before the first
+    /// [`Self::apply`]; sockets that snapshot does not list are closed.
+    pub fn inherit(&mut self, sockets: Inherited) {
+        self.inherited = sockets;
+    }
+
+    /// The sockets to hand to a successor process; follows later applies.
+    pub fn handoff(&self) -> Handoff {
+        self.handoff.clone()
+    }
+
+    /// Stops accepting on every socket; connections already accepted carry
+    /// on. Used once a successor serves the same sockets.
+    pub fn close(&mut self) {
+        for tasks in self.open.values() {
+            tasks.iter().for_each(JoinHandle::abort);
+        }
+        self.open.clear();
+        self.handoff.retain(|_| false);
     }
 
     /// Makes `rt` the active snapshot of `server` and opens and closes sockets
@@ -91,7 +157,8 @@ impl Listeners {
     /// would drop its queued connections.
     pub fn apply(&mut self, server: &Arc<Server>, rt: Runtime) -> Result<(), BindError> {
         let mut want: Vec<(SocketAddr, Kind)> = Vec::new();
-        let mut fresh: Vec<((SocketAddr, Kind), Vec<Socket>)> = Vec::new();
+        // The flag marks sockets taken from `inherited`.
+        let mut fresh: Vec<((SocketAddr, Kind), Vec<Socket>, bool)> = Vec::new();
         let listeners = rt.listeners.iter().enumerate().map(|(i, l)| {
             (
                 format!("listeners[{i}]"),
@@ -121,6 +188,10 @@ impl Listeners {
                 if self.open.contains_key(&key) {
                     continue;
                 }
+                if let Some(sockets) = self.inherited.0.remove(&key) {
+                    fresh.push((key, sockets, true));
+                    continue;
+                }
                 // One UDP socket per address: sessions are kept by client
                 // address, and SO_REUSEPORT would spread them over sockets.
                 let n = if self.per_worker && kind != Kind::Udp {
@@ -134,26 +205,49 @@ impl Listeners {
                     let s = match kind {
                         Kind::Udp => bind_udp(addr, reuse_port).map(Socket::Udp),
                         _ => bind(addr, reuse_port || self.per_worker, backlog).map(Socket::Tcp),
+                    };
+                    match s {
+                        Ok(s) => sockets.push(s),
+                        Err(error) => {
+                            self.restore(fresh);
+                            return Err(BindError::Bind {
+                                at: at.clone(),
+                                addr,
+                                error,
+                            });
+                        }
                     }
-                    .map_err(|error| BindError::Bind {
-                        at: at.clone(),
-                        addr,
-                        error,
-                    })?;
-                    sockets.push(s);
                 }
-                fresh.push((key, sockets));
+                fresh.push((key, sockets, false));
             }
         }
 
-        let next = server.prepare(rt).map_err(BindError::Tls)?;
+        let next = match server.prepare(rt) {
+            Ok(next) => next,
+            Err(e) => {
+                self.restore(fresh);
+                return Err(BindError::Tls(e));
+            }
+        };
         server.install(next);
+        // Inherited sockets the snapshot does not list close here.
+        self.inherited.0.clear();
 
-        for (key, sockets) in fresh {
+        for (key, sockets, _) in fresh {
             let (addr, kind) = key;
+            let dups = sockets
+                .iter()
+                .map(Socket::dup)
+                .collect::<io::Result<Vec<_>>>();
+            match dups {
+                Ok(fds) => self.handoff.insert(key, fds),
+                Err(e) => eprintln!("{addr}: cannot keep for a binary upgrade: {e}"),
+            }
+            // Inherited sockets may number other than the workers (an
+            // upgrade that changed --workers); they are spread round-robin.
             let tasks = sockets
                 .into_iter()
-                .zip(&self.workers)
+                .zip(self.workers.iter().cycle())
                 .map(|(s, worker)| {
                     let server = server.clone();
                     worker.spawn(async move {
@@ -176,7 +270,18 @@ impl Listeners {
             }
             keep
         });
+        self.handoff.retain(|key| want.contains(key));
         Ok(())
+    }
+
+    /// Puts inherited sockets back after a failed apply, for the next
+    /// attempt; the ones bound here close.
+    fn restore(&mut self, fresh: Vec<((SocketAddr, Kind), Vec<Socket>, bool)>) {
+        for (key, sockets, inherited) in fresh {
+            if inherited {
+                self.inherited.0.insert(key, sockets);
+            }
+        }
     }
 
     /// Addresses currently open, sorted.

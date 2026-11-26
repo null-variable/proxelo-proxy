@@ -19,7 +19,7 @@ use crate::buf::Buf;
 use crate::exchange::Exchange;
 use crate::io::{Stream, write_timeout};
 use crate::phases::{Outcome, Phases};
-use crate::{Active, acme, headers, log, reply};
+use crate::{Active, acme, drain, headers, log, reply};
 
 // nginx defaults.
 const CLIENT_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
@@ -153,7 +153,7 @@ impl Conn {
             }
             let active = active();
             self.x.requests += 1;
-            if self.x.requests >= KEEPALIVE_REQUESTS {
+            if self.x.requests >= KEEPALIVE_REQUESTS || drain::draining() {
                 self.x.req.keep_alive = false;
             }
             if !self.handle(&active).await {
@@ -178,17 +178,26 @@ impl Conn {
                     ParseError::UriTooLong
                 });
             }
-            let wait = if self.buf.end == 0 && self.served {
+            let idle = self.buf.end == 0 && self.served;
+            let wait = if idle {
                 KEEPALIVE_TIMEOUT
             } else {
                 CLIENT_HEADER_TIMEOUT
             };
-            match tokio::time::timeout(
+            let read = tokio::time::timeout(
                 wait,
                 self.buf.fill(&mut self.client, HEADER_BUF, MAX_HEADER),
-            )
-            .await
-            {
+            );
+            // An idle keepalive connection closes when draining starts.
+            let r = if idle {
+                tokio::select! {
+                    r = read => r,
+                    () = drain::started() => return Ok(false),
+                }
+            } else {
+                read.await
+            };
+            match r {
                 Ok(Ok(n)) if n > 0 => {}
                 _ => return Ok(false),
             }

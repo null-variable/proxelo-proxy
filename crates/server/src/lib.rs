@@ -11,10 +11,12 @@ mod acme;
 mod buf;
 mod compress;
 mod conn;
+pub mod drain;
 mod exchange;
 mod gateway;
 mod grpc;
 mod h2;
+mod handoff;
 mod headers;
 mod health;
 mod io;
@@ -45,6 +47,10 @@ use proxelo_snapshot::Runtime;
 use socket2::{Domain, Protocol, Socket, Type};
 
 pub use acme::set_http_challenges;
+pub use handoff::{
+    Handoff, Inherited, Predecessor, Successor, UpgradeListener, listen as listen_upgrade,
+    take_over,
+};
 pub use health::{resolve_all, resolve_names};
 pub use listeners::{BindError, Listeners};
 pub use log::reopen as reopen_logs;

@@ -226,6 +226,11 @@ pub fn totals() -> Totals {
     }
 }
 
+/// Client connections open now.
+pub(crate) fn connections_active() -> u64 {
+    CONNECTIONS_ACTIVE.load(Ordering::Relaxed)
+}
+
 pub(crate) fn connection_opened() {
     CONNECTIONS_ACCEPTED.fetch_add(1, Ordering::Relaxed);
     CONNECTIONS_ACTIVE.fetch_add(1, Ordering::Relaxed);
