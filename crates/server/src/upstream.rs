@@ -80,6 +80,9 @@ pub(crate) struct State {
     /// Signalled when a request releases a target with max_conns.
     freed: Notify,
     limited: bool,
+    /// TLS to the targets: the connector, the name for SNI and verification,
+    /// and whether SNI is sent.
+    tls: Option<(openssl::ssl::SslConnector, Box<str>, bool)>,
 }
 
 /// State from the previous snapshot, so warm connections and health survive
@@ -228,7 +231,31 @@ fn ring(up: &Upstream, name_id: &[u32]) -> Box<[(u32, u32)]> {
 }
 
 impl State {
-    pub fn new(up: &Upstream, shards: usize, reuse: &Reuse) -> Self {
+    /// `certs` are the snapshot's, for a client certificate. Fails when
+    /// OpenSSL rejects the TLS settings.
+    pub fn new(
+        up: &Upstream,
+        shards: usize,
+        reuse: &Reuse,
+        certs: &[proxelo_snapshot::Certificate],
+    ) -> Result<Self, String> {
+        let tls = match &up.tls {
+            None => None,
+            Some(t) => {
+                let cert = t.certificate.map(|c| &certs[c as usize]);
+                let c =
+                    crate::tls::connector(t, cert).map_err(|e| format!("{}.tls: {e}", up.id))?;
+                let name = if t.server_name.is_empty() {
+                    up.host
+                        .rsplit_once(':')
+                        .map_or(&*up.host, |(h, _)| h)
+                        .into()
+                } else {
+                    t.server_name.clone()
+                };
+                Some((c, name, t.sni))
+            }
+        };
         let pools = up
             .targets
             .iter()
@@ -290,7 +317,7 @@ impl State {
             .collect();
         // nginx does not track the health of a single server.
         let single = up.targets.len() == 1;
-        Self {
+        Ok(Self {
             id: up.id.clone(),
             pools,
             peers,
@@ -326,7 +353,8 @@ impl State {
             queue_timeout: up.queue_timeout,
             queued: AtomicU32::new(0),
             freed: Notify::new(),
-        }
+            tls,
+        })
     }
 
     pub fn pools(&self) -> &[Arc<Pool>] {
@@ -736,7 +764,7 @@ impl State {
 }
 
 struct Idle {
-    stream: TcpStream,
+    stream: UpStream,
     since: Instant,
     opened: Instant,
     used: u32,
@@ -744,7 +772,7 @@ struct Idle {
 
 /// An upstream connection taken from or returned to a pool.
 pub(crate) struct Conn {
-    pub stream: TcpStream,
+    pub stream: UpStream,
     /// Requests it served.
     pub used: u32,
     pub opened: Instant,
@@ -818,11 +846,114 @@ impl Pool {
     }
 }
 
+/// An upstream connection: plain TCP or TLS (proxy_pass https://).
+pub(crate) enum UpStream {
+    Tcp(TcpStream),
+    Tls(Box<tokio_openssl::SslStream<TcpStream>>),
+}
+
+impl UpStream {
+    fn tcp(&self) -> &TcpStream {
+        match self {
+            Self::Tcp(s) => s,
+            Self::Tls(s) => s.get_ref(),
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for UpStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            Self::Tls(s) => std::pin::Pin::new(&mut **s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for UpStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            Self::Tls(s) => std::pin::Pin::new(&mut **s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
+            Self::Tls(s) => std::pin::Pin::new(&mut **s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            Self::Tls(s) => std::pin::Pin::new(&mut **s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Why a new upstream connection could not be made.
+pub(crate) enum ConnectError {
+    Failed,
+    TimedOut,
+}
+
+impl State {
+    /// Opens a connection to target `i`, with TLS when the upstream has it;
+    /// `limit` bounds the TCP connect and the handshake together.
+    pub async fn connect(&self, i: usize, limit: Duration) -> Result<UpStream, ConnectError> {
+        let addr = self.pools[i].addr;
+        let run = async {
+            let s = TcpStream::connect(addr)
+                .await
+                .map_err(|_| ConnectError::Failed)?;
+            let _ = s.set_nodelay(true);
+            let Some((connector, name, sni)) = &self.tls else {
+                return Ok(UpStream::Tcp(s));
+            };
+            let mut cfg = connector.configure().map_err(|_| ConnectError::Failed)?;
+            cfg.set_use_server_name_indication(*sni);
+            let name = if name.is_empty() {
+                addr.ip().to_string()
+            } else {
+                name.to_string()
+            };
+            let ssl = cfg.into_ssl(&name).map_err(|_| ConnectError::Failed)?;
+            let mut tls =
+                tokio_openssl::SslStream::new(ssl, s).map_err(|_| ConnectError::Failed)?;
+            std::pin::Pin::new(&mut tls)
+                .connect()
+                .await
+                .map_err(|_| ConnectError::Failed)?;
+            Ok(UpStream::Tls(Box::new(tls)))
+        };
+        match tokio::time::timeout(limit, run).await {
+            Ok(r) => r,
+            Err(_) => Err(ConnectError::TimedOut),
+        }
+    }
+}
+
 /// An idle connection has nothing to read. EOF means the upstream closed it,
 /// and unsolicited bytes mean it can no longer be framed.
-fn open(stream: &TcpStream) -> bool {
+fn open(stream: &UpStream) -> bool {
     let mut b = [0u8; 1];
-    matches!(stream.try_read(&mut b), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+    matches!(stream.tcp().try_read(&mut b), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
 }
 
 #[cfg(test)]
@@ -857,6 +988,7 @@ mod tests {
             queue_size: 0,
             queue_timeout: Duration::from_secs(60),
             keepalive_time: Duration::from_secs(3600),
+            tls: None,
             keepalive_idle: 0,
             keepalive_timeout: Duration::from_secs(60),
             keepalive_requests: 1000,
@@ -867,7 +999,7 @@ mod tests {
     }
 
     fn state(weights: &[u32], balancing: Balancing) -> State {
-        State::new(&upstream(weights, balancing), 1, &Reuse::default())
+        State::new(&upstream(weights, balancing), 1, &Reuse::default(), &[]).unwrap()
     }
 
     fn pick(s: &State, tried: u64) -> Option<usize> {
@@ -992,7 +1124,7 @@ mod tests {
         let mut up = upstream(&[1], Balancing::RoundRobin);
         up.targets[0].max_conns = 1;
         up.queue_size = 1;
-        let s = State::new(&up, 1, &Reuse::default());
+        let s = State::new(&up, 1, &Reuse::default(), &[]).unwrap();
         let held = s.pick(&mut Choice::default(), b"").unwrap();
         assert!(s.pick(&mut Choice::default(), b"").is_none());
         assert!(s.full(0));
@@ -1011,7 +1143,7 @@ mod tests {
         let mut up = upstream(&[1, 1, 1], Balancing::RoundRobin);
         up.targets[1].down = true;
         up.targets[2].route = "c".into();
-        let s = State::new(&up, 1, &Reuse::default());
+        let s = State::new(&up, 1, &Reuse::default(), &[]).unwrap();
         assert!((0..6).all(|_| pick(&s, 0) != Some(1)));
         let mut c = Choice {
             prefer: s.by_route(b"c"),
@@ -1029,7 +1161,7 @@ mod tests {
     fn active_check_takes_a_target_out_and_slow_start_brings_it_back() {
         let mut up = upstream(&[4, 4], Balancing::RoundRobin);
         up.targets[0].slow_start = Duration::from_secs(60);
-        let s = State::new(&up, 1, &Reuse::default());
+        let s = State::new(&up, 1, &Reuse::default(), &[]).unwrap();
         s.probed(0, Err("refused".into()), 2, 1);
         assert!(s.health(0).0);
         s.probed(0, Err("refused".into()), 2, 1);

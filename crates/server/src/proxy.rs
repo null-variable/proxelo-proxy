@@ -7,12 +7,11 @@ use std::time::{Duration, Instant};
 use proxelo_http1::{Body, ChunkedDecoder, HeaderKind, Method, Version, parse_response, push_hex};
 use proxelo_snapshot::{Balancing, Proxy, Route, Sticky};
 use tokio::io::AsyncRead;
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::conn::{BodyLeft, Conn, Fail, KeepAlive, SEND_TIMEOUT as CLIENT_SEND, upstream_fail};
 use crate::io::write_timeout;
-use crate::upstream::{Choice, Conn as UpConn, State};
+use crate::upstream::{Choice, Conn as UpConn, ConnectError, State, UpStream};
 use crate::{Active, compress, headers, reply};
 
 /// `proxy_buffer_size`: the upstream response head must fit.
@@ -128,17 +127,14 @@ impl Conn {
             let connect = Instant::now();
             let mut up = match pool.take() {
                 Some(c) => c,
-                None => match timeout(p.connect_timeout, TcpStream::connect(pool.addr)).await {
-                    Ok(Ok(s)) => {
-                        let _ = s.set_nodelay(true);
-                        UpConn {
-                            stream: s,
-                            used: 0,
-                            opened: Instant::now(),
-                        }
-                    }
+                None => match ups.connect(i, p.connect_timeout).await {
+                    Ok(s) => UpConn {
+                        stream: s,
+                        used: 0,
+                        opened: Instant::now(),
+                    },
                     // Nothing was sent, so any request may move on.
-                    Ok(Err(_)) => {
+                    Err(ConnectError::Failed) => {
                         ups.failed(i);
                         active.metrics.upstream_failure(p.upstream, i);
                         status = 502;
@@ -147,7 +143,7 @@ impl Conn {
                         }
                         continue;
                     }
-                    Err(_) => {
+                    Err(ConnectError::TimedOut) => {
                         ups.failed(i);
                         active.metrics.upstream_failure(p.upstream, i);
                         status = 504;
@@ -374,7 +370,7 @@ impl Conn {
     /// read.
     async fn exchange(
         &mut self,
-        up: &mut TcpStream,
+        up: &mut UpStream,
         p: &Proxy,
         last: bool,
     ) -> Result<(), Result<Retry, Fail>> {

@@ -21,11 +21,11 @@ pub use compression::{Compression, Encoding, Proxied, StaticGz};
 pub use cond::{Cond, Facts};
 pub use lookup::{GeoTable, Lookup, MapTable, SplitTable, Table, murmur2};
 pub use runtime::{
-    AccessLog, Action, Balancing, BuildError, Captures, Certificate, CheckKind, ErrorPage,
-    ErrorTarget, Fallback, Gateway, GatewayParam, GatewayProtocol, HeaderOps, HeaderValue,
-    HealthCheck, Listener, ListenerTls, MatchError, Memcached, NextOn, Pattern, Proxy, Resolved,
-    Return, Rewrite, RewriteFlag, Route, Runtime, Site, Sticky, StickyCookie, Target, TryFiles,
-    Upstream,
+    AccessLog, Action, Balancing, BuildError, Captures, Certificate, CheckKind, ClientAuth,
+    ClientAuthMode, ErrorPage, ErrorTarget, Fallback, Gateway, GatewayParam, GatewayProtocol,
+    HeaderOps, HeaderValue, HealthCheck, Listener, ListenerTls, MatchError, Memcached, NextOn,
+    Pattern, Proxy, Resolved, Return, Rewrite, RewriteFlag, Route, Runtime, Site, Sticky,
+    StickyCookie, Target, TryFiles, Upstream, UpstreamTls,
 };
 pub use template::{Part, Template, Var};
 
@@ -290,6 +290,18 @@ pub fn validate(snap: &Snapshot) -> Result<(), LoadError> {
         }
         if l.http2 && l.tls.is_none() {
             return field(format!("listeners[{i}].http2"), "requires tls");
+        }
+    }
+    for (i, u) in snap.upstreams.iter().enumerate() {
+        if u.tls
+            .as_ref()
+            .and_then(|t| t.certificate)
+            .is_some_and(|c| c as usize >= certs)
+        {
+            return field(
+                format!("upstreams[{i}].tls.certificate"),
+                "no such certificate",
+            );
         }
     }
 

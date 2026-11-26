@@ -56,6 +56,16 @@ pub enum Var {
     /// The connection's address before real_ip.
     RealipRemoteAddr,
     RealipRemotePort,
+    SslSessionReused,
+    /// `$ssl_client_verify`: NONE, SUCCESS or FAILED:<reason>.
+    SslClientVerify,
+    SslClientSDn,
+    SslClientIDn,
+    SslClientSerial,
+    /// `$ssl_client_cert`: PEM with each line after the first indented.
+    SslClientCert,
+    /// `$ssl_client_escaped_cert`: PEM, URL-encoded.
+    SslClientEscapedCert,
     /// `$document_root`: the gateway's document root.
     DocumentRoot,
     /// `$content_length`: the Content-Length header, or the length of a
@@ -222,6 +232,13 @@ fn var(name: &str) -> Option<Part> {
         "remote_user" => Var::RemoteUser,
         "realip_remote_addr" => Var::RealipRemoteAddr,
         "realip_remote_port" => Var::RealipRemotePort,
+        "ssl_session_reused" => Var::SslSessionReused,
+        "ssl_client_verify" => Var::SslClientVerify,
+        "ssl_client_s_dn" => Var::SslClientSDn,
+        "ssl_client_i_dn" => Var::SslClientIDn,
+        "ssl_client_serial" => Var::SslClientSerial,
+        "ssl_client_cert" => Var::SslClientCert,
+        "ssl_client_escaped_cert" => Var::SslClientEscapedCert,
         "document_root" => Var::DocumentRoot,
         "content_length" => Var::ContentLength,
         "content_type" => Var::ContentType,

@@ -180,6 +180,10 @@ impl Server {
             .iter()
             .position(|l| l.addrs.contains(&addr));
         let acceptor = index.and_then(|i| active.tls[i].as_ref());
+        let client_auth = index
+            .and_then(|i| active.rt.listeners[i].tls.as_ref())
+            .and_then(|t| t.client_auth.as_ref())
+            .map(|c| c.mode);
         let Some(acceptor) = acceptor else {
             drop(active);
             let me = self.clone();
@@ -203,7 +207,7 @@ impl Server {
             metrics::tls_handshake_error();
             return;
         }
-        let info = tls::TlsInfo::of(tls.ssl());
+        let info = tls::TlsInfo::of(tls.ssl(), client_auth);
         match tls.ssl().selected_alpn_protocol() {
             Some(b"h2") => h2::serve(self, addr, tls, local, peer, info).await,
             // A TLS-ALPN-01 validation only needs the handshake.
@@ -241,8 +245,12 @@ fn build(
     let upstreams = rt
         .upstreams
         .iter()
-        .map(|u| upstream::State::new(u, shards, reuse))
-        .collect();
+        .enumerate()
+        .map(|(i, u)| {
+            upstream::State::new(u, shards, reuse, &rt.certificates)
+                .map_err(|e| format!("upstreams[{i}]: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
     Ok(Active {
         metrics: metrics::Table::new(&rt),
         logs: log::Logs::new(&rt.access_logs),

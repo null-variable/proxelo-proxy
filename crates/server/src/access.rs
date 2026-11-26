@@ -5,7 +5,6 @@ use std::net::{IpAddr, SocketAddr};
 
 use proxelo_http1::{Body, HeaderKind, parse_response};
 use proxelo_snapshot::{Access, BasicAuth, ForwardAuth, RealIp};
-use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use crate::Active;
@@ -223,16 +222,13 @@ impl Conn {
         let pool = &ups.pools()[i];
         let mut up = match pool.take() {
             Some(c) => c,
-            None => match timeout(f.timeout, TcpStream::connect(pool.addr)).await {
-                Ok(Ok(s)) => {
-                    let _ = s.set_nodelay(true);
-                    UpConn {
-                        stream: s,
-                        used: 0,
-                        opened: std::time::Instant::now(),
-                    }
-                }
-                _ => {
+            None => match ups.connect(i, f.timeout).await {
+                Ok(s) => UpConn {
+                    stream: s,
+                    used: 0,
+                    opened: std::time::Instant::now(),
+                },
+                Err(_) => {
                     ups.failed(i);
                     active.metrics.upstream_failure(f.upstream, i);
                     return Err(500);

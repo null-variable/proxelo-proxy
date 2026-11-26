@@ -83,8 +83,82 @@ pub struct AccessLog {
 pub struct ListenerTls {
     /// 0x0301 (TLS 1.0) to 0x0304 (TLS 1.3).
     pub min_version: u16,
+    pub max_version: u16,
     pub ciphers: Box<str>,
+    /// Empty: OpenSSL's.
+    pub ciphersuites: Box<str>,
+    pub prefer_server_ciphers: bool,
+    /// Empty: OpenSSL's.
+    pub groups: Box<str>,
+    pub session_tickets: bool,
+    /// Zero: no session ID cache.
+    pub session_cache_size: u32,
+    /// PEM; empty: none.
+    pub dh_params: Box<str>,
+    pub client_auth: Option<ClientAuth>,
     pub default_certificate: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientAuthMode {
+    Require,
+    Optional,
+    OptionalNoCa,
+}
+
+/// ssl_verify_client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientAuth {
+    pub mode: ClientAuthMode,
+    /// PEM CA certificates.
+    pub ca: Box<str>,
+    pub depth: u32,
+}
+
+/// proxy_ssl_* settings of an upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamTls {
+    /// Empty: the upstream's host, else the target address.
+    pub server_name: Box<str>,
+    pub sni: bool,
+    pub verify: bool,
+    /// PEM; empty: the system's trust store.
+    pub ca: Box<str>,
+    pub depth: u32,
+    pub certificate: Option<u32>,
+    pub min_version: u16,
+    pub max_version: u16,
+    pub ciphers: Box<str>,
+    pub ciphersuites: Box<str>,
+}
+
+fn tls_version(v: listener_tls::Version, default: u16) -> u16 {
+    match v {
+        listener_tls::Version::Tls10 => 0x0301,
+        listener_tls::Version::Tls11 => 0x0302,
+        listener_tls::Version::Tls12 => 0x0303,
+        listener_tls::Version::Tls13 => 0x0304,
+        listener_tls::Version::Unspecified => default,
+    }
+}
+
+fn upstream_tls(t: &ir::UpstreamTls) -> UpstreamTls {
+    UpstreamTls {
+        server_name: t.server_name.as_str().into(),
+        sni: t.sni,
+        verify: t.verify,
+        ca: t.ca.as_str().into(),
+        depth: t.depth.max(1),
+        certificate: t.certificate,
+        min_version: tls_version(t.min_version(), 0x0303),
+        max_version: tls_version(t.max_version(), 0x0304),
+        ciphers: if t.ciphers.is_empty() {
+            "DEFAULT".into()
+        } else {
+            t.ciphers.as_str().into()
+        },
+        ciphersuites: t.ciphersuites.as_str().into(),
+    }
 }
 
 /// Changes to a header list: remove, then set, then add.
@@ -512,6 +586,7 @@ pub struct Upstream {
     /// 0 disables passive health.
     pub max_fails: u32,
     pub fail_timeout: Duration,
+    pub tls: Option<UpstreamTls>,
 }
 
 /// One address of a configured target. A host name with several addresses
@@ -771,17 +846,33 @@ impl Runtime {
             let addrs = resolve(&l.address)
                 .map_err(|error| BuildError::ListenerAddress { listener: i, error })?;
             let tls = l.tls.as_ref().map(|t| ListenerTls {
-                min_version: match t.min_version() {
-                    listener_tls::Version::Tls10 => 0x0301,
-                    listener_tls::Version::Tls11 => 0x0302,
-                    listener_tls::Version::Unspecified | listener_tls::Version::Tls12 => 0x0303,
-                    listener_tls::Version::Tls13 => 0x0304,
-                },
+                min_version: tls_version(t.min_version(), 0x0303),
+                max_version: tls_version(t.max_version(), 0x0304),
                 ciphers: if t.ciphers.is_empty() {
                     "HIGH:!aNULL:!MD5".into()
                 } else {
                     t.ciphers.as_str().into()
                 },
+                ciphersuites: t.ciphersuites.as_str().into(),
+                prefer_server_ciphers: t.prefer_server_ciphers,
+                groups: t.groups.as_str().into(),
+                session_tickets: !t.no_session_tickets,
+                session_cache_size: t.session_cache_size,
+                dh_params: t.dh_params.as_str().into(),
+                client_auth: t.client_auth.as_ref().and_then(|c| {
+                    use ir::client_auth::Mode;
+                    let mode = match c.mode() {
+                        Mode::Require => ClientAuthMode::Require,
+                        Mode::Optional => ClientAuthMode::Optional,
+                        Mode::OptionalNoCa => ClientAuthMode::OptionalNoCa,
+                        Mode::Unspecified => return None,
+                    };
+                    Some(ClientAuth {
+                        mode,
+                        ca: c.ca.as_str().into(),
+                        depth: c.depth.max(1),
+                    })
+                }),
                 default_certificate: t.default_certificate,
             });
             listeners.push(Listener {
@@ -933,6 +1024,7 @@ impl Runtime {
                     up.keepalive_requests
                 },
                 host: up.host.as_str().into(),
+                tls: up.tls.as_ref().map(upstream_tls),
                 max_fails: up.max_fails,
                 fail_timeout: ms(up.fail_timeout_ms, Duration::from_secs(10)),
             });

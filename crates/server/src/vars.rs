@@ -7,6 +7,7 @@ use proxelo_http1::{Version, push_u64};
 use proxelo_snapshot::{Part, Table, Template, Var, murmur2};
 
 use crate::exchange::Exchange;
+use crate::tls::ClientVerify;
 
 /// Expands `t` into `tmpl`.
 pub(crate) fn expand(x: &mut Exchange, t: &Template) {
@@ -294,6 +295,61 @@ fn var(x: &mut Exchange, v: Var, out: &mut Vec<u8>) {
         }
         Var::RealipRemoteAddr => _ = write!(out, "{}", x.conn_peer.ip()),
         Var::RealipRemotePort => push_u64(out, u64::from(x.conn_peer.port())),
+        Var::SslSessionReused => {
+            if let Some(t) = &x.tls {
+                out.extend_from_slice(if t.session_reused { b"r" } else { b"." });
+            }
+        }
+        Var::SslClientVerify => {
+            if let Some(t) = &x.tls {
+                match t.verify {
+                    ClientVerify::None => out.extend_from_slice(b"NONE"),
+                    ClientVerify::Success => out.extend_from_slice(b"SUCCESS"),
+                    ClientVerify::Failed(r) => {
+                        out.extend_from_slice(b"FAILED:");
+                        out.extend_from_slice(r.error_string().as_bytes());
+                    }
+                }
+            }
+        }
+        Var::SslClientSDn => {
+            if let Some(t) = &x.tls {
+                out.extend_from_slice(t.client_subject.as_bytes());
+            }
+        }
+        Var::SslClientIDn => {
+            if let Some(t) = &x.tls {
+                out.extend_from_slice(t.client_issuer.as_bytes());
+            }
+        }
+        Var::SslClientSerial => {
+            if let Some(t) = &x.tls {
+                out.extend_from_slice(t.client_serial.as_bytes());
+            }
+        }
+        Var::SslClientCert => {
+            if let Some(t) = &x.tls {
+                // nginx indents continuation lines so the value fits a header.
+                let pem = t.client_cert.trim_end().as_bytes();
+                for (i, line) in pem.split(|&c| c == b'\n').enumerate() {
+                    if i > 0 {
+                        out.extend_from_slice(b"\n\t");
+                    }
+                    out.extend_from_slice(line);
+                }
+            }
+        }
+        Var::SslClientEscapedCert => {
+            if let Some(t) = &x.tls {
+                for &c in t.client_cert.as_bytes() {
+                    if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~') {
+                        out.push(c);
+                    } else {
+                        _ = write!(out, "%{c:02X}");
+                    }
+                }
+            }
+        }
         Var::DocumentRoot => out.extend_from_slice(&x.doc_root),
         Var::ContentLength => match x.request_header(b"content-length") {
             Some(v) => out.extend_from_slice(v),

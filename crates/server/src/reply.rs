@@ -36,6 +36,31 @@ pub(crate) fn connection(out: &mut Vec<u8>, keep_alive: bool, extra: &[u8]) {
 /// Finishes a head started with [`start`] with the HTML page nginx generates
 /// for `status`. `head` omits the body for HEAD requests.
 pub(crate) fn page(out: &mut Vec<u8>, status: u16, keep_alive: bool, head: bool, extra: &[u8]) {
+    // ssl_verify_client failures: 400 with nginx's explanation.
+    let detail: &[u8] = match status {
+        495 => b"The SSL certificate error",
+        496 => b"No required SSL certificate was sent",
+        _ => b"",
+    };
+    if !detail.is_empty() {
+        let body_len = b"<html>\r\n<head><title>400 </title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<center></center>\r\n<hr><center>proxelo</center>\r\n</body>\r\n</html>\r\n".len()
+            + 2 * detail.len();
+        out.extend_from_slice(b"Content-Type: text/html\r\nContent-Length: ");
+        push_u64(out, body_len as u64);
+        out.extend_from_slice(b"\r\n");
+        connection(out, keep_alive, extra);
+        out.extend_from_slice(b"\r\n");
+        if !head {
+            out.extend_from_slice(b"<html>\r\n<head><title>400 ");
+            out.extend_from_slice(detail);
+            out.extend_from_slice(b"</title></head>\r\n<body>\r\n<center><h1>400 Bad Request</h1></center>\r\n<center>");
+            out.extend_from_slice(detail);
+            out.extend_from_slice(
+                b"</center>\r\n<hr><center>proxelo</center>\r\n</body>\r\n</html>\r\n",
+            );
+        }
+        return;
+    }
     const PRE: &[u8] = b"<html>\r\n<head><title>";
     const MID: &[u8] = b"</title></head>\r\n<body>\r\n<center><h1>";
     const POST: &[u8] = b"</h1></center>\r\n<hr><center>proxelo</center>\r\n</body>\r\n</html>\r\n";

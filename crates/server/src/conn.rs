@@ -62,7 +62,7 @@ pub(crate) fn upstream_fail(e: io::Error) -> Fail {
 /// Where [`Conn::pump_body`] puts the request body.
 pub(crate) enum Sink<'a> {
     Drop,
-    Upstream(&'a mut tokio::net::TcpStream, Duration),
+    Upstream(&'a mut crate::upstream::UpStream, Duration),
     /// The body without framing, at most [`MAX_BODY`] bytes.
     Collect(&'a mut Vec<u8>),
 }
@@ -269,6 +269,12 @@ impl Conn {
         let Some(listener) = active.rt.listener(self.listener) else {
             return false;
         };
+        // ssl_verify_client: a missing or bad certificate answers 400,
+        // which error pages see as 496 or 495.
+        if let Some(code) = self.x.tls.as_ref().and_then(|t| t.client_error()) {
+            self.x.req.keep_alive = false;
+            return self.page(code).await;
+        }
         let site_index = match listener.site(self.x.host()) {
             Ok(Some(site)) => site,
             Ok(None) => return self.page(404).await,
@@ -522,13 +528,19 @@ impl Conn {
     pub async fn page(&mut self, status: u16) -> KeepAlive {
         let keep = self.x.req.keep_alive && keeps_alive(status);
         self.out.clear();
-        reply::start(&mut self.out, status, b"");
+        // 495 and 496 are nginx's internal codes; the client sees 400.
+        let wire = if matches!(status, 495 | 496) {
+            400
+        } else {
+            status
+        };
+        reply::start(&mut self.out, wire, b"");
         if status == 401 {
             self.out.extend_from_slice(&self.x.auth_header);
         }
         let head = self.x.req.method == Method::Head;
         reply::page(&mut self.out, status, keep, head, &self.x.resp_extra);
         let body = body_len(&self.out);
-        self.send(keep, status, body).await
+        self.send(keep, wire, body).await
     }
 }
