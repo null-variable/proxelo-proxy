@@ -17,7 +17,9 @@ use proxelo_api::snapshot::v1::{
 };
 
 use crate::access::{self, Access, Bandwidth, ConnZone, RateZone, RealIp};
+use crate::compression::{self, Compression};
 use crate::cond::{Cond, Facts};
+use crate::lookup::{self, Lookup};
 use crate::template::Template;
 
 type Map<V> = HashMap<Box<[u8]>, V, FixedState>;
@@ -33,6 +35,10 @@ pub struct Runtime {
     pub access_logs: Box<[AccessLog]>,
     pub rate_zones: Box<[RateZone]>,
     pub conn_zones: Box<[ConnZone]>,
+    /// Variables of map, geo and split_clients, by `Part::Lookup` index.
+    pub lookups: Arc<[Lookup]>,
+    /// Compression settings of routes and sites, by their index.
+    pub compressions: Arc<[Compression]>,
 }
 
 /// A parsed certificate chain and its private key.
@@ -271,6 +277,8 @@ pub struct Site {
     pub response_headers: HeaderOps,
     pub access_log: Option<u32>,
     pub real_ip: Option<RealIp>,
+    /// Index into `Runtime::compressions` for responses without a route.
+    pub compression: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -285,6 +293,8 @@ pub struct Route {
     pub access_log: Option<u32>,
     pub access: Access,
     pub bandwidth: Option<Bandwidth>,
+    /// Index into `Runtime::compressions`.
+    pub compression: Option<u32>,
     children: Option<Level>,
 }
 
@@ -622,7 +632,7 @@ fn health_check(h: &ir::HealthCheck, at: &str) -> Result<HealthCheck, BuildError
     })
 }
 
-fn sticky(s: &ir::Sticky, at: &str) -> Result<Sticky, BuildError> {
+fn sticky(s: &ir::Sticky, at: &str, names: &[Box<str>]) -> Result<Sticky, BuildError> {
     use std::fmt::Write as _;
     if s.kind() == ir::sticky::Kind::Route {
         let route = s
@@ -630,7 +640,7 @@ fn sticky(s: &ir::Sticky, at: &str) -> Result<Sticky, BuildError> {
             .iter()
             .enumerate()
             .map(|(i, r)| {
-                Template::parse(r).map_err(|error| BuildError::Field {
+                Template::parse_in(r, names).map_err(|error| BuildError::Field {
                     field: format!("{at}.route[{i}]"),
                     error,
                 })
@@ -705,6 +715,9 @@ impl Runtime {
     /// from `resolved`. A `resolve` target missing there is resolved now; one
     /// that does not resolve has no addresses until it does, as in nginx.
     pub fn build_with(snap: &ir::Snapshot, resolved: &Resolved) -> Result<Self, BuildError> {
+        let (lookups, names) = lookup::build(&snap.lookups)
+            .map_err(|(field, error)| BuildError::Field { field, error })?;
+        let mut compressions = Vec::new();
         let mut listeners = Vec::with_capacity(snap.listeners.len());
         for (i, l) in snap.listeners.iter().enumerate() {
             let addrs = resolve(&l.address)
@@ -763,6 +776,8 @@ impl Runtime {
                 rate_zones: snap.rate_zones.len(),
                 conn_zones: snap.conn_zones.len(),
                 upstreams: snap.upstreams.len(),
+                names: &names,
+                compressions: &mut compressions,
             };
             let top = b.level(&site.routes, "routes")?;
             for (n, route) in site.named_routes.iter().enumerate() {
@@ -790,6 +805,7 @@ impl Runtime {
                     .map(access::real_ip)
                     .transpose()
                     .map_err(|(f, e)| b.err(format!("real_ip.{f}"), e))?,
+                compression: b.compression(site.compression.as_ref(), "compression")?,
                 routes: b.routes.into(),
             });
         }
@@ -834,7 +850,7 @@ impl Runtime {
             let sticky = up
                 .sticky
                 .as_ref()
-                .map(|s| sticky(s, &format!("{at}.sticky")))
+                .map(|s| sticky(s, &format!("{at}.sticky"), &names))
                 .transpose()?;
             upstreams.push(Upstream {
                 id: up.id.as_str().into(),
@@ -850,9 +866,11 @@ impl Runtime {
                         Balancing::RoundRobin
                     }
                 },
-                hash_key: Template::parse(&up.hash_key).map_err(|error| BuildError::Field {
-                    field: format!("{at}.hash_key"),
-                    error,
+                hash_key: Template::parse_in(&up.hash_key, &names).map_err(|error| {
+                    BuildError::Field {
+                        field: format!("{at}.hash_key"),
+                        error,
+                    }
                 })?,
                 health_check,
                 sticky,
@@ -899,9 +917,11 @@ impl Runtime {
                 }
                 Ok(AccessLog {
                     path: l.path.as_str().into(),
-                    format: Template::parse(&l.format).map_err(|error| BuildError::Field {
-                        field: format!("{at}.format"),
-                        error,
+                    format: Template::parse_in(&l.format, &names).map_err(|error| {
+                        BuildError::Field {
+                            field: format!("{at}.format"),
+                            error,
+                        }
                     })?,
                     escape_json: l.escape_json,
                 })
@@ -912,7 +932,7 @@ impl Runtime {
             .iter()
             .enumerate()
             .map(|(i, z)| {
-                access::rate_zone(z).map_err(|(f, error)| BuildError::Field {
+                access::rate_zone(z, &names).map_err(|(f, error)| BuildError::Field {
                     field: format!("rate_zones[{i}].{f}"),
                     error,
                 })
@@ -923,7 +943,7 @@ impl Runtime {
             .iter()
             .enumerate()
             .map(|(i, z)| {
-                access::conn_zone(z).map_err(|(f, error)| BuildError::Field {
+                access::conn_zone(z, &names).map_err(|(f, error)| BuildError::Field {
                     field: format!("conn_zones[{i}].{f}"),
                     error,
                 })
@@ -939,6 +959,8 @@ impl Runtime {
             access_logs,
             rate_zones,
             conn_zones,
+            lookups: lookups.into(),
+            compressions: compressions.into(),
         })
     }
 }
@@ -957,7 +979,7 @@ fn tree_len(routes: &[ir::Route]) -> usize {
 
 /// Builds the routes of one site. Route numbers are assigned in pre-order,
 /// with named routes after the tree.
-struct SiteBuilder {
+struct SiteBuilder<'a> {
     site: usize,
     routes: Vec<Route>,
     /// Route number of named route 0.
@@ -965,9 +987,13 @@ struct SiteBuilder {
     rate_zones: usize,
     conn_zones: usize,
     upstreams: usize,
+    /// Lookup variable names templates may use.
+    names: &'a [Box<str>],
+    /// Compression settings built so far, shared across sites.
+    compressions: &'a mut Vec<Compression>,
 }
 
-impl SiteBuilder {
+impl SiteBuilder<'_> {
     fn err(&self, field: impl Into<String>, error: impl Into<String>) -> BuildError {
         BuildError::Site {
             site: self.site,
@@ -977,7 +1003,19 @@ impl SiteBuilder {
     }
 
     fn template(&self, s: &str, field: &str) -> Result<Template, BuildError> {
-        Template::parse(s).map_err(|e| self.err(field, e))
+        Template::parse_in(s, self.names).map_err(|e| self.err(field, e))
+    }
+
+    /// Builds `c` into `compressions`; each setting is one entry.
+    fn compression(
+        &mut self,
+        c: Option<&ir::Compression>,
+        at: &str,
+    ) -> Result<Option<u32>, BuildError> {
+        let Some(c) = c else { return Ok(None) };
+        let built = compression::build(c).map_err(|(f, e)| self.err(format!("{at}.{f}"), e))?;
+        self.compressions.push(built);
+        Ok(Some(self.compressions.len() as u32 - 1))
     }
 
     fn level(&mut self, routes: &[ir::Route], field: &str) -> Result<Level, BuildError> {
@@ -1049,7 +1087,7 @@ impl SiteBuilder {
     }
 
     /// Builds one route without its children.
-    fn route(&self, route: &ir::Route, at: &str) -> Result<Route, BuildError> {
+    fn route(&mut self, route: &ir::Route, at: &str) -> Result<Route, BuildError> {
         let action = match route.action.as_ref().and_then(|a| a.kind.as_ref()) {
             Some(action::Kind::Static(st)) => {
                 if !st.root.starts_with('/') {
@@ -1097,11 +1135,19 @@ impl SiteBuilder {
             )?,
             access_log: route.access_log,
             access: match &route.access {
-                Some(a) => access::access(a, self.rate_zones, self.conn_zones, self.upstreams)
-                    .map_err(|(f, e)| self.err(format!("{at}.access.{f}"), e))?,
+                Some(a) => access::access(
+                    a,
+                    self.rate_zones,
+                    self.conn_zones,
+                    self.upstreams,
+                    self.names,
+                )
+                .map_err(|(f, e)| self.err(format!("{at}.access.{f}"), e))?,
                 None => Access::default(),
             },
             bandwidth: route.bandwidth.as_ref().and_then(access::bandwidth),
+            compression: self
+                .compression(route.compression.as_ref(), &format!("{at}.compression"))?,
             children: None,
         })
     }
@@ -1223,6 +1269,8 @@ impl Runtime {
             access_logs: Box::default(),
             rate_zones: Box::default(),
             conn_zones: Box::default(),
+            lookups: Arc::from([]),
+            compressions: Arc::from([]),
         }
     }
 

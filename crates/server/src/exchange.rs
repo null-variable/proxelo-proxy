@@ -87,6 +87,20 @@ pub(crate) struct Exchange {
     pub bandwidth: Option<proxelo_snapshot::Bandwidth>,
     /// Bytes written to the client so far, for the bandwidth limit.
     pub paced: u64,
+    /// The snapshot's lookup variables, set when the request starts.
+    pub lookups: std::sync::Arc<[proxelo_snapshot::Lookup]>,
+    /// Lookup values computed in this request: spans into `lookup_buf`,
+    /// `None` until first used (nginx caches variables per request).
+    pub lookup_vals: Vec<Option<(u32, u32)>>,
+    pub lookup_buf: Vec<u8>,
+    /// Scratch for computing a lookup.
+    pub lookup_src: Vec<u8>,
+    /// The snapshot's compression settings, set with `lookups`.
+    pub compressions: std::sync::Arc<[proxelo_snapshot::Compression]>,
+    /// Index into `compressions` for the route (or site) now answering.
+    pub compression: Option<u32>,
+    /// Vary: Accept-Encoding goes out with the response.
+    pub vary: bool,
 }
 
 /// Lowercases `raw` into `out` without the port and a trailing dot.
@@ -138,6 +152,13 @@ impl Exchange {
             auth_resp: Vec::new(),
             bandwidth: None,
             paced: 0,
+            lookups: std::sync::Arc::from([]),
+            lookup_vals: Vec::new(),
+            lookup_buf: Vec::new(),
+            lookup_src: Vec::new(),
+            compressions: std::sync::Arc::from([]),
+            compression: None,
+            vary: false,
         }
     }
 
@@ -176,6 +197,11 @@ impl Exchange {
         self.auth_resp.clear();
         self.bandwidth = None;
         self.paced = 0;
+        self.lookup_vals.clear();
+        self.lookup_vals.resize(self.lookups.len(), None);
+        self.lookup_buf.clear();
+        self.compression = None;
+        self.vary = false;
         self.uri_changed = false;
         self.error_paged = false;
         self.err_status = 0;

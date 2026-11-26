@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use proxelo_http1::{Version, push_u64};
-use proxelo_snapshot::{Part, Template, Var};
+use proxelo_snapshot::{Part, Table, Template, Var, murmur2};
 
 use crate::exchange::Exchange;
 
@@ -81,6 +81,10 @@ pub(crate) fn expand_into(x: &mut Exchange, t: &Template, out: &mut Vec<u8>, log
                     out.extend_from_slice(v);
                 }
             }
+            Part::Lookup(i) => {
+                let (s, e) = lookup(x, *i);
+                out.extend_from_slice(&x.lookup_buf[s as usize..e as usize]);
+            }
             Part::Arg(name) => {
                 if let Some(v) = x.args.split(|&c| c == b'&').find_map(|kv| {
                     let (k, v) = kv.split_at(kv.iter().position(|&c| c == b'=')?);
@@ -98,6 +102,67 @@ pub(crate) fn expand_into(x: &mut Exchange, t: &Template, out: &mut Vec<u8>, log
             }
         }
     }
+}
+
+/// The value of lookup `i` in this request: a span of `lookup_buf`,
+/// computed on first use. A lookup's templates use only earlier lookups, so
+/// the recursion is bounded. A map regex leaves its captures as the
+/// request's, as nginx does.
+fn lookup(x: &mut Exchange, i: u32) -> (u32, u32) {
+    if let Some(span) = x.lookup_vals.get(i as usize).copied().flatten() {
+        return span;
+    }
+    let lookups = std::sync::Arc::clone(&x.lookups);
+    let Some(l) = lookups.get(i as usize) else {
+        return (0, 0);
+    };
+    // A nested lookup finds the scratch taken and uses a new one.
+    let mut src = std::mem::take(&mut x.lookup_src);
+    src.clear();
+    expand_into(x, &l.source, &mut src, None);
+    match &l.table {
+        Table::Map(t) => {
+            let n = src.len();
+            src.extend_from_within(..n);
+            src[n..].make_ascii_lowercase();
+            let mut caps = std::mem::take(&mut x.caps);
+            let found = t.find(&src[..n], &src[n..], &mut caps);
+            x.caps = caps;
+            src.clear();
+            // A regex that fails to run leaves the variable empty.
+            if let Ok(v) = found {
+                expand_into(x, v, &mut src, None);
+            }
+        }
+        Table::Geo(t) => {
+            let v = if l.source.parts().is_empty() {
+                t.find(x.peer.ip())
+            } else {
+                match std::str::from_utf8(&src)
+                    .ok()
+                    .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+                {
+                    Some(ip) => t.find(ip),
+                    None => t.find_none(),
+                }
+            };
+            src.clear();
+            src.extend_from_slice(v);
+        }
+        Table::Split(t) => {
+            let v = t.find(murmur2(&src));
+            src.clear();
+            src.extend_from_slice(v);
+        }
+    }
+    let start = x.lookup_buf.len() as u32;
+    x.lookup_buf.extend_from_slice(&src);
+    x.lookup_src = src;
+    let span = (start, x.lookup_buf.len() as u32);
+    if let Some(slot) = x.lookup_vals.get_mut(i as usize) {
+        *slot = Some(span);
+    }
+    span
 }
 
 fn secs(out: &mut Vec<u8>, s: f64) {

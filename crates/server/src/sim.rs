@@ -46,6 +46,8 @@ pub fn simulate(rt: &Runtime, r: &HttpRequest) -> SimResult {
         }
     };
     let mut x = Exchange::new(local, SocketAddr::new(ip, 0));
+    x.lookups = std::sync::Arc::clone(&rt.lookups);
+    x.compressions = std::sync::Arc::clone(&rt.compressions);
     if r.tls {
         x.tls = Some(TlsInfo::default());
     }

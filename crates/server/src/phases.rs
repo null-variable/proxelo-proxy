@@ -35,8 +35,9 @@ pub(crate) enum Outcome {
     Redirect(u16),
     /// The built-in page for the status.
     Page(u16),
-    /// A static file; its file system path is in `scratch`.
-    File(File, Metadata),
+    /// A static file; its file system path is in `scratch`. `true` when it
+    /// is the `.gz` of the requested file (gzip_static).
+    File(File, Metadata, bool),
     /// A directory without a trailing slash: 301 to the path with one.
     Directory,
     /// Proxy to this upstream with these settings.
@@ -181,6 +182,7 @@ impl<'s> Phases<'s> {
         let site = self.site;
         self.pages = &site.error_pages;
         self.route = None;
+        x.compression = site.compression;
         match self.rewrite(x, &site.rewrites) {
             Ok(Rw::Continue | Rw::Changed) => match &site.ret {
                 Some(r) => self.ret(x, r),
@@ -197,6 +199,7 @@ impl<'s> Phases<'s> {
         let route = &self.site.routes[r as usize];
         self.route = Some(r);
         self.pages = &route.error_pages;
+        x.compression = route.compression;
         self.note(|| {
             let kind = if named { "named route" } else { "route" };
             format!("{kind} {}", route.id)
@@ -252,7 +255,14 @@ impl<'s> Phases<'s> {
                         self.note(|| format!("index {}", String::from_utf8_lossy(&x.path)));
                         Err(Next::Server)
                     }
-                    Static::File(f, m) => Ok(Outcome::File(f, m)),
+                    Static::File(f, m) => {
+                        // gzip_static: file.gz, if it exists, for a client
+                        // that takes it.
+                        if let Some(gz) = gzip_static(x) {
+                            return Ok(Outcome::File(gz.0, gz.1, true));
+                        }
+                        Ok(Outcome::File(f, m, false))
+                    }
                     Static::Directory => Ok(Outcome::Directory),
                     Static::Status(s) => Err(Next::Error(s)),
                 }
@@ -393,6 +403,34 @@ fn set_uri(x: &mut Exchange, add_args: bool) {
         None => {}
     }
     std::mem::swap(&mut x.path, &mut x.tmpl);
+}
+
+/// nginx gzip_static: opens `scratch` + ".gz" when the compression settings
+/// allow it and the client accepts gzip. Sets `vary` either way for `on`.
+fn gzip_static(x: &mut Exchange) -> Option<(File, Metadata)> {
+    let comps = std::sync::Arc::clone(&x.compressions);
+    let c = comps.get(x.compression? as usize)?;
+    if c.static_gz == proxelo_snapshot::StaticGz::Off {
+        return None;
+    }
+    let mut vary = false;
+    let ok = crate::compress::static_ok(x, c, &mut vary);
+    let n = x.scratch.len();
+    x.scratch.extend_from_slice(b".gz");
+    let opened = File::open(OsStr::from_bytes(&x.scratch))
+        .ok()
+        .and_then(|f| Some((f.metadata().ok().filter(|m| m.is_file())?, f)));
+    if opened.is_some() {
+        // nginx sets Vary for gzip_static on when the file exists.
+        x.vary |= vary;
+    }
+    match opened {
+        Some((m, f)) if ok => Some((f, m)),
+        _ => {
+            x.scratch.truncate(n);
+            None
+        }
+    }
 }
 
 pub(crate) enum Static {

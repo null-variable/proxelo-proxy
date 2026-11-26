@@ -73,6 +73,9 @@ pub enum Part {
     /// `$auth_resp_<name>`: a header of the forward auth response, with the
     /// lowercase name using `-`.
     AuthResp(Box<[u8]>),
+    /// A lookup variable (map, geo, split_clients), by index into
+    /// `Runtime::lookups`.
+    Lookup(u32),
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -88,7 +91,14 @@ impl fmt::Debug for Template {
 }
 
 impl Template {
+    /// Parses a template that may use only the built-in variables.
     pub fn parse(s: &str) -> Result<Self, String> {
+        Self::parse_in(s, &[])
+    }
+
+    /// Parses a template that may also use the lookup variables `lookups`,
+    /// by name, as `Part::Lookup` with the index into it.
+    pub fn parse_in(s: &str, lookups: &[Box<str>]) -> Result<Self, String> {
         let b = s.as_bytes();
         let mut parts = Vec::new();
         let mut lit = Vec::new();
@@ -123,7 +133,12 @@ impl Template {
                     }
                     i += 1;
                 }
-                var(name).ok_or_else(|| format!("{s:?}: unknown variable ${name}"))?
+                var(name)
+                    .or_else(|| {
+                        let i = lookups.iter().position(|l| &**l == name)?;
+                        Some(Part::Lookup(i as u32))
+                    })
+                    .ok_or_else(|| format!("{s:?}: unknown variable ${name}"))?
             };
             if !lit.is_empty() {
                 parts.push(Part::Lit(std::mem::take(&mut lit).into()));
@@ -152,6 +167,11 @@ impl Template {
             .iter()
             .any(|p| matches!(p, Part::Var(Var::Capture(_))))
     }
+}
+
+/// Whether `name` is a built-in variable, which a lookup cannot redefine.
+pub(crate) fn is_builtin(name: &str) -> bool {
+    var(name).is_some()
 }
 
 fn var(name: &str) -> Option<Part> {
@@ -244,6 +264,22 @@ mod tests {
         );
         assert!(t.uses_captures());
         assert!(!Template::parse("$uri/").unwrap().uses_captures());
+    }
+
+    #[test]
+    fn lookups_by_name() {
+        let names: Vec<Box<str>> = vec!["a".into(), "bucket".into()];
+        let t = Template::parse_in("$bucket-$a$uri", &names).unwrap();
+        assert_eq!(
+            t.parts(),
+            &[
+                Part::Lookup(1),
+                Part::Lit((*b"-").into()),
+                Part::Lookup(0),
+                Part::Var(Var::Uri),
+            ]
+        );
+        assert!(Template::parse("$bucket").is_err());
     }
 
     #[test]

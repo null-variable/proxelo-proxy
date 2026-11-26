@@ -76,6 +76,9 @@ pub(crate) struct Conn {
     pub x: Exchange,
     /// Connection zone counts the request holds until it ends.
     pub holds: Vec<crate::limits::Hold>,
+    /// Compression input and output buffers.
+    pub zin: Vec<u8>,
+    pub zout: Vec<u8>,
 }
 
 /// Bytes after the head in a response built in one buffer.
@@ -113,6 +116,8 @@ impl Conn {
             out: Vec::new(),
             x,
             holds: Vec::new(),
+            zin: Vec::new(),
+            zout: Vec::new(),
         }
     }
 
@@ -229,6 +234,12 @@ impl Conn {
         {
             return self.page(413).await;
         }
+        if !std::sync::Arc::ptr_eq(&self.x.lookups, &active.rt.lookups) {
+            self.x.lookups = std::sync::Arc::clone(&active.rt.lookups);
+        }
+        if !std::sync::Arc::ptr_eq(&self.x.compressions, &active.rt.compressions) {
+            self.x.compressions = std::sync::Arc::clone(&active.rt.compressions);
+        }
         if let Err(status) = self.x.begin() {
             return self.page(status).await;
         }
@@ -295,7 +306,7 @@ impl Conn {
                     self.extra(ops, status);
                     self.page(status).await
                 }
-                Outcome::File(f, m) => self.send_file(f, &m, ops).await,
+                Outcome::File(f, m, gz) => self.send_file(f, &m, gz, ops).await,
                 Outcome::Directory => {
                     self.extra(ops, 301);
                     self.redirect_dir().await
@@ -322,11 +333,16 @@ impl Conn {
         }
     }
 
-    /// Writes `out` and records what was sent.
+    /// Writes `out` and records what was sent, encoded when the response
+    /// is to be compressed.
     async fn send(&mut self, keep: KeepAlive, status: u16, body: usize) -> KeepAlive {
+        let head = self.out.len() - body;
+        // Encode first: `&&` would skip it for responses that close anyway.
+        let close = self.encode_buffered(status, body);
+        let keep = keep && !close;
         self.x.sent.status = status;
         self.x.sent.bytes = self.out.len() as u64;
-        self.x.sent.body_bytes = body as u64;
+        self.x.sent.body_bytes = (self.out.len() - head.min(self.out.len())) as u64;
         self.respond(keep).await
     }
 

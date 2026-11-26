@@ -12,7 +12,7 @@ use tokio::time::timeout;
 use crate::conn::{BodyLeft, Conn, Fail, KeepAlive, SEND_TIMEOUT as CLIENT_SEND, upstream_fail};
 use crate::io::write_timeout;
 use crate::upstream::{Choice, Conn as UpConn, Pool, State};
-use crate::{Active, headers, reply};
+use crate::{Active, compress, headers, reply};
 
 /// `proxy_buffer_size`: the upstream response head must fit.
 const HEAD_BUF: usize = 16 * 1024;
@@ -56,6 +56,29 @@ async fn read(
 
 /// An attempt that got a response head the route wants to retry on.
 struct Retry;
+
+/// A coder chosen before the head is written, built when the body starts.
+enum PendingCoder {
+    /// The encoding and the index of its settings in `x.compressions`.
+    Encode(proxelo_snapshot::Encoding, u32),
+    Gunzip,
+}
+
+impl PendingCoder {
+    fn token(&self) -> &'static [u8] {
+        match self {
+            Self::Encode(e, _) => e.token(),
+            Self::Gunzip => b"",
+        }
+    }
+
+    fn into_coder(self, all: &[proxelo_snapshot::Compression]) -> std::io::Result<compress::Coder> {
+        match self {
+            Self::Encode(e, i) => compress::Coder::new(e, &all[i as usize]),
+            Self::Gunzip => Ok(compress::Coder::gunzip()),
+        }
+    }
+}
 
 impl Conn {
     /// Proxies the request. `Err` carries the 502 or 504 to answer, which an
@@ -435,6 +458,21 @@ impl Conn {
         } else {
             headers::response(&mut self.x, ops, status);
         }
+        // Compression or gunzip of the body changes its framing: it goes
+        // out chunked to HTTP/1.1 clients and ends with the connection for
+        // HTTP/1.0 ones.
+        let (mut coder, vary) = self.response_coder(status, mode);
+        let coded = coder.as_ref().map(|(_, gunzip)| *gunzip);
+        let mode = match (coded, mode) {
+            (None, m) => m,
+            (Some(_), Mode::None) => Mode::None,
+            (Some(_), m) => {
+                if !compress::chunked_for(&self.x) {
+                    keep = false;
+                }
+                m
+            }
+        };
         let out = &mut self.out;
         out.clear();
         if self.x.err_status != 0 {
@@ -455,12 +493,49 @@ impl Conn {
             {
                 continue;
             }
+            let value = h.value.get(&self.ubuf.data);
+            if let Some(gunzip) = coded {
+                if h.kind == HeaderKind::ContentLength
+                    || name.eq_ignore_ascii_case(b"accept-ranges")
+                    || (gunzip && name.eq_ignore_ascii_case(b"content-encoding"))
+                {
+                    continue;
+                }
+                if name.eq_ignore_ascii_case(b"etag") {
+                    // nginx ngx_http_weak_etag.
+                    let v = value.trim_ascii();
+                    if v.starts_with(b"\"") {
+                        out.extend_from_slice(name);
+                        out.extend_from_slice(b": W/");
+                        out.extend_from_slice(v);
+                        out.extend_from_slice(b"\r\n");
+                    } else if v.starts_with(b"W/") {
+                        out.extend_from_slice(name);
+                        out.extend_from_slice(b": ");
+                        out.extend_from_slice(value);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                    continue;
+                }
+            }
             out.extend_from_slice(name);
             out.extend_from_slice(b": ");
-            out.extend_from_slice(h.value.get(&self.ubuf.data));
+            out.extend_from_slice(value);
             out.extend_from_slice(b"\r\n");
         }
-        if matches!(mode, Mode::Chunked | Mode::Encode) {
+        if vary {
+            out.extend_from_slice(b"Vary: Accept-Encoding\r\n");
+        }
+        if let Some((k, false)) = &coder {
+            out.extend_from_slice(b"Content-Encoding: ");
+            out.extend_from_slice(k.token());
+            out.extend_from_slice(b"\r\n");
+        }
+        let client_chunked = match coded {
+            Some(_) => mode != Mode::None && compress::chunked_for(&self.x),
+            None => matches!(mode, Mode::Chunked | Mode::Encode),
+        };
+        if client_chunked {
             out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
         }
         out.extend_from_slice(&self.x.sticky_cookie);
@@ -472,7 +547,14 @@ impl Conn {
         self.x.sent.bytes = 0;
         let head_bytes = out.len() as u64;
 
-        let complete = self.body_out(&mut up.stream, mode, read_timeout).await;
+        let complete = match coder.take() {
+            Some((k, _)) if mode != Mode::None => {
+                let k = k.into_coder(&std::sync::Arc::clone(&self.x.compressions));
+                self.body_coded(&mut up.stream, mode, read_timeout, k, client_chunked)
+                    .await
+            }
+            _ => self.body_out(&mut up.stream, mode, read_timeout).await,
+        };
         self.x.sent.body_bytes = self.x.sent.bytes.saturating_sub(head_bytes);
         let Ok(complete) = complete else {
             return false;
@@ -481,6 +563,149 @@ impl Conn {
             pool.put(up);
         }
         keep
+    }
+
+    /// The encoder for the upstream response, `(coder, gunzip)`, and whether
+    /// Vary: Accept-Encoding is added, as nginx's gzip and gunzip header
+    /// filters decide.
+    fn response_coder(&self, status: u16, mode: Mode) -> (Option<(PendingCoder, bool)>, bool) {
+        let Some(c) = self
+            .x
+            .compression
+            .and_then(|i| self.x.compressions.get(i as usize))
+        else {
+            return (None, false);
+        };
+        let data = &self.ubuf.data;
+        let get = |want: &[u8]| {
+            self.resp
+                .headers
+                .iter()
+                .find(|h| h.name.get(data).eq_ignore_ascii_case(want))
+                .map(|h| h.value.get(data))
+        };
+        let encoding = get(b"content-encoding").unwrap_or_default();
+        let mut vary = false;
+        if !encoding.is_empty() {
+            if compress::must_gunzip(&self.x, c, encoding) && mode != Mode::None {
+                return (Some((PendingCoder::Gunzip, true)), c.vary);
+            }
+            // gunzip sets gzip_vary for any gzip response it looks at.
+            return (
+                None,
+                c.gunzip && encoding.eq_ignore_ascii_case(b"gzip") && c.vary,
+            );
+        }
+        let length = match mode {
+            Mode::Length(n) => Some(n),
+            Mode::None => Some(0),
+            _ => None,
+        };
+        let facts = compress::RespFacts {
+            status,
+            content_type: get(b"content-type").unwrap_or_default(),
+            length,
+            encoded: false,
+            expires: get(b"expires"),
+            cache_control: get(b"cache-control"),
+            last_modified: get(b"last-modified").is_some(),
+            etag: get(b"etag").is_some(),
+        };
+        let enc = compress::choose(&self.x, c, &facts, &mut vary);
+        // HEAD responses and empty bodies carry the encoding headers too.
+        let i = self.x.compression.unwrap_or(0);
+        (enc.map(|e| (PendingCoder::Encode(e, i), false)), vary)
+    }
+
+    /// Streams the response body through an encoder or decoder. The
+    /// upstream framing is removed first; the result goes out chunked when
+    /// `chunked`, raw otherwise (the connection then ends with it).
+    async fn body_coded(
+        &mut self,
+        up: &mut TcpStream,
+        mode: Mode,
+        t: Duration,
+        coder: std::io::Result<compress::Coder>,
+        chunked: bool,
+    ) -> Result<bool, ()> {
+        let mut coder = coder.map_err(|_| ())?;
+        let mut left = match mode {
+            Mode::Length(n) => n,
+            _ => 0,
+        };
+        let mut dec = ChunkedDecoder::new();
+        let mut plain = std::mem::take(&mut self.zin);
+        let mut coded = std::mem::take(&mut self.zout);
+        let result = loop {
+            plain.clear();
+            let done = match mode {
+                Mode::None => true,
+                Mode::Length(_) => {
+                    let take = left.min(self.ubuf.end as u64) as usize;
+                    plain.extend_from_slice(&self.ubuf.data[..take]);
+                    self.ubuf.consume(take);
+                    left -= take as u64;
+                    left == 0
+                }
+                Mode::Chunked | Mode::Dechunk => {
+                    let data = &self.ubuf.data[..self.ubuf.end];
+                    let Ok(take) = dec.advance_with(data, |r| plain.extend_from_slice(&data[r]))
+                    else {
+                        break Err(());
+                    };
+                    self.ubuf.consume(take);
+                    dec.is_done()
+                }
+                Mode::Encode | Mode::Raw => {
+                    plain.extend_from_slice(self.ubuf.filled());
+                    self.ubuf.end = 0;
+                    false
+                }
+            };
+            coded.clear();
+            if coder.write(&plain, &mut coded).is_err() {
+                break Err(());
+            }
+            if chunked {
+                compress::push_chunk(&mut self.out, &coded);
+            } else {
+                self.out.extend_from_slice(&coded);
+            }
+            if done {
+                break Ok(true);
+            }
+            if self.out.len() >= BODY_BUF && self.flush().await.is_err() {
+                break Err(());
+            }
+            match read(up, &mut self.ubuf, BODY_BUF, t).await {
+                Ok(0) if matches!(mode, Mode::Encode | Mode::Raw) => break Ok(false),
+                Ok(0) | Err(_) => {
+                    let _ = self.flush().await;
+                    break Err(());
+                }
+                Ok(_) => {}
+            }
+        };
+        let result = match result {
+            Ok(complete) => {
+                coded.clear();
+                if coder.finish(&mut coded).is_err() {
+                    Err(())
+                } else {
+                    if chunked {
+                        compress::push_chunk(&mut self.out, &coded);
+                        self.out.extend_from_slice(b"0\r\n\r\n");
+                    } else {
+                        self.out.extend_from_slice(&coded);
+                    }
+                    self.flush().await.map(|()| complete)
+                }
+            }
+            Err(()) => Err(()),
+        };
+        self.zin = plain;
+        self.zout = coded;
+        result
     }
 
     /// Writes `out` to the client and counts it.

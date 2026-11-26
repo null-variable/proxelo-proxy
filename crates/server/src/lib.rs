@@ -9,6 +9,7 @@
 mod access;
 mod acme;
 mod buf;
+mod compress;
 mod conn;
 mod exchange;
 mod h2;

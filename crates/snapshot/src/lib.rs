@@ -5,7 +5,9 @@
 //! at an existing object and every match and action is fully specified.
 
 mod access;
+mod compression;
 mod cond;
+mod lookup;
 mod runtime;
 mod template;
 
@@ -15,7 +17,9 @@ pub use access::{
     Access, AccessRule, Bandwidth, BasicAuth, BasicUser, Cidr, ConnZone, ForwardAuth, RateZone,
     RealIp,
 };
+pub use compression::{Compression, Encoding, Proxied, StaticGz};
 pub use cond::{Cond, Facts};
+pub use lookup::{GeoTable, Lookup, MapTable, SplitTable, Table, murmur2};
 pub use runtime::{
     AccessLog, Action, Balancing, BuildError, Captures, Certificate, CheckKind, ErrorPage,
     ErrorTarget, Fallback, HeaderOps, HeaderValue, HealthCheck, Listener, ListenerTls, MatchError,

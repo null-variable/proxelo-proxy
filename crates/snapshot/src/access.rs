@@ -37,6 +37,14 @@ impl Cidr {
         Ok(Self { addr, bits })
     }
 
+    pub fn addr(&self) -> IpAddr {
+        self.addr
+    }
+
+    pub fn bits(&self) -> u8 {
+        self.bits
+    }
+
     /// Whether `ip` is in the block. An IPv4-mapped IPv6 address matches as
     /// IPv4, as nginx does.
     pub fn contains(&self, ip: IpAddr) -> bool {
@@ -181,13 +189,13 @@ fn max_keys(n: u32) -> usize {
 /// `(field, error)` for the caller to place.
 type Invalid = (String, String);
 
-pub(crate) fn rate_zone(z: &ir::RateZone) -> Result<RateZone, Invalid> {
+pub(crate) fn rate_zone(z: &ir::RateZone, names: &[Box<str>]) -> Result<RateZone, Invalid> {
     if z.rate_milli == 0 {
         return Err(("rate_milli".into(), "must be positive".into()));
     }
     Ok(RateZone {
         id: z.id.as_str().into(),
-        key: Template::parse(&z.key).map_err(|e| ("key".to_string(), e))?,
+        key: Template::parse_in(&z.key, names).map_err(|e| ("key".to_string(), e))?,
         rate: z.rate_milli,
         burst: u64::from(z.burst) * 1000,
         delay: u64::from(z.delay) * 1000,
@@ -197,13 +205,13 @@ pub(crate) fn rate_zone(z: &ir::RateZone) -> Result<RateZone, Invalid> {
     })
 }
 
-pub(crate) fn conn_zone(z: &ir::ConnZone) -> Result<ConnZone, Invalid> {
+pub(crate) fn conn_zone(z: &ir::ConnZone, names: &[Box<str>]) -> Result<ConnZone, Invalid> {
     if z.max == 0 {
         return Err(("max".into(), "must be positive".into()));
     }
     Ok(ConnZone {
         id: z.id.as_str().into(),
-        key: Template::parse(&z.key).map_err(|e| ("key".to_string(), e))?,
+        key: Template::parse_in(&z.key, names).map_err(|e| ("key".to_string(), e))?,
         max: z.max,
         status: status(z.status).map_err(|e| ("status".to_string(), e))?,
         dry_run: z.dry_run,
@@ -235,6 +243,7 @@ pub(crate) fn access(
     rate_zones: usize,
     conn_zones: usize,
     upstreams: usize,
+    names: &[Box<str>],
 ) -> Result<Access, Invalid> {
     if let Some(i) = a.rate_limits.iter().position(|&z| z as usize >= rate_zones) {
         return Err((format!("rate_limits[{i}]"), "no such rate zone".into()));
@@ -289,7 +298,8 @@ pub(crate) fn access(
             }
             Some(ForwardAuth {
                 upstream: f.upstream,
-                uri: Template::parse(&f.uri).map_err(|e| ("forward_auth.uri".to_string(), e))?,
+                uri: Template::parse_in(&f.uri, names)
+                    .map_err(|e| ("forward_auth.uri".to_string(), e))?,
                 timeout: Duration::from_millis(if f.timeout_ms == 0 {
                     60_000
                 } else {
@@ -365,6 +375,7 @@ mod tests {
             0,
             0,
             0,
+            &[],
         )
         .unwrap();
         assert!(!a.allows("192.168.1.1".parse().unwrap()));

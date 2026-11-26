@@ -8,6 +8,7 @@ use std::time::{Instant, UNIX_EPOCH};
 use proxelo_http1::{Method, http_date, push_hex, push_u64};
 use proxelo_snapshot::{Bandwidth, HeaderOps};
 
+use crate::compress;
 use crate::conn::{Conn, KeepAlive, SEND_TIMEOUT, body_len};
 use crate::io::write_timeout;
 use crate::range::{self, Answer, Ranges, Span};
@@ -41,6 +42,7 @@ impl Conn {
         &mut self,
         mut file: File,
         meta: &Metadata,
+        gz: bool,
         ops: &HeaderOps,
     ) -> KeepAlive {
         let len = meta.len();
@@ -69,6 +71,38 @@ impl Conn {
             }
             _ => Ranges::WHOLE,
         };
+        let mime = reply::mime(&self.x.path);
+        // Dynamic compression runs before the range filter, so an encoded
+        // response ignores Range (nginx clears Accept-Ranges).
+        let mut vary = self.x.vary;
+        let encoding = if gz || not_modified {
+            None
+        } else {
+            self.x
+                .compression
+                .and_then(|i| self.x.compressions.get(i as usize))
+                .and_then(|c| {
+                    let facts = compress::RespFacts {
+                        status: if self.x.err_status != 0 {
+                            self.x.err_status
+                        } else {
+                            200
+                        },
+                        content_type: mime,
+                        length: Some(len),
+                        last_modified: true,
+                        etag: true,
+                        ..Default::default()
+                    };
+                    compress::choose(&self.x, c, &facts, &mut vary).map(|e| (e, c))
+                })
+                .and_then(|(e, c)| compress::Coder::new(e, c).ok().map(|k| (e, k)))
+        };
+        let ranges = if encoding.is_some() {
+            Ranges::WHOLE
+        } else {
+            ranges
+        };
         let status = match (ranges.answer, not_modified) {
             (_, true) => 304,
             (Answer::Unsatisfiable, _) => 416,
@@ -80,7 +114,11 @@ impl Conn {
         if status == 416 {
             return self.unsatisfiable(len, keep).await;
         }
-        let mime = reply::mime(&self.x.path);
+        if let Some((e, coder)) = encoding {
+            return self
+                .send_encoded(file, e, coder, &modified, vary, status)
+                .await;
+        }
         let parts = ranges.parts();
         let boundary = if parts.len() > 1 {
             BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1
@@ -113,6 +151,12 @@ impl Conn {
         out.extend_from_slice(b"\r\nETag: ");
         out.extend_from_slice(&self.x.scratch);
         out.extend_from_slice(b"\r\n");
+        if gz {
+            out.extend_from_slice(b"Content-Encoding: gzip\r\n");
+        }
+        if vary {
+            out.extend_from_slice(b"Vary: Accept-Encoding\r\n");
+        }
         if let [one] = parts {
             out.extend_from_slice(b"Content-Range: bytes ");
             range::push_span(out, *one, len);
@@ -154,6 +198,110 @@ impl Conn {
                 && keep;
         }
         keep
+    }
+
+    /// Sends the whole file encoded: chunked to HTTP/1.1 clients, closed at
+    /// the end for HTTP/1.0 ones, with a weak ETag and no Content-Length.
+    async fn send_encoded(
+        &mut self,
+        mut file: File,
+        e: proxelo_snapshot::Encoding,
+        coder: compress::Coder,
+        modified: &[u8],
+        vary: bool,
+        status: u16,
+    ) -> KeepAlive {
+        let head_only = self.x.req.method == Method::Head;
+        let chunked = compress::chunked_for(&self.x);
+        let keep = self.x.req.keep_alive && (chunked || head_only);
+        let mime = reply::mime(&self.x.path);
+        let out = &mut self.out;
+        out.clear();
+        reply::start(out, status, b"");
+        out.extend_from_slice(b"Content-Type: ");
+        out.extend_from_slice(mime);
+        out.extend_from_slice(b"\r\nLast-Modified: ");
+        out.extend_from_slice(modified);
+        out.extend_from_slice(b"\r\nETag: W/");
+        out.extend_from_slice(&self.x.scratch);
+        out.extend_from_slice(b"\r\n");
+        if vary {
+            out.extend_from_slice(b"Vary: Accept-Encoding\r\n");
+        }
+        out.extend_from_slice(b"Content-Encoding: ");
+        out.extend_from_slice(e.token());
+        out.extend_from_slice(b"\r\n");
+        if chunked && !head_only {
+            out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+        }
+        reply::connection(out, keep, &self.x.resp_extra);
+        out.extend_from_slice(b"\r\n");
+        self.x.sent.status = status;
+        let head_len = self.out.len() as u64;
+        if head_only {
+            self.x.sent.bytes = head_len;
+            return self.respond(keep).await;
+        }
+        // Flushes count what they write, the head included.
+        self.x.sent.bytes = 0;
+        if keep && self.pump_body(None).await.is_err() {
+            return false;
+        }
+        let mut plain = std::mem::take(&mut self.zin);
+        let mut coded = std::mem::take(&mut self.zout);
+        let mut ok = true;
+        let mut coder = Some(coder);
+        loop {
+            plain.resize(FILE_CHUNK, 0);
+            let n = match file.read(&mut plain) {
+                Ok(n) => n,
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            };
+            coded.clear();
+            let last = n == 0;
+            let r = match (last, coder.as_mut()) {
+                (false, Some(k)) => k.write(&plain[..n], &mut coded),
+                _ => coder.take().map_or(Ok(()), |k| k.finish(&mut coded)),
+            };
+            if r.is_err() {
+                ok = false;
+                break;
+            }
+            if chunked {
+                compress::push_chunk(&mut self.out, &coded);
+                if last {
+                    self.out.extend_from_slice(b"0\r\n\r\n");
+                }
+            } else {
+                self.out.extend_from_slice(&coded);
+            }
+            if (last || self.out.len() >= FILE_CHUNK) && !self.out.is_empty() {
+                self.x.sent.bytes += self.out.len() as u64;
+                if write_timeout(&mut self.client, &self.out, SEND_TIMEOUT)
+                    .await
+                    .is_err()
+                {
+                    ok = false;
+                    break;
+                }
+                if let Some(b) = self.x.bandwidth {
+                    let before = self.x.paced;
+                    self.x.paced += self.out.len() as u64;
+                    throttle(b, before, self.x.paced, self.x.started).await;
+                }
+                self.out.clear();
+            }
+            if last {
+                break;
+            }
+        }
+        self.x.sent.body_bytes = self.x.sent.bytes.saturating_sub(head_len);
+        self.zin = plain;
+        self.zout = coded;
+        ok && keep
     }
 
     /// Writes `out` followed by `span` of the file, leaving `out` empty.
