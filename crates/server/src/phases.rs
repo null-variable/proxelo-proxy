@@ -43,6 +43,9 @@ pub(crate) enum Outcome {
     Proxy(proxelo_snapshot::Proxy),
     /// Close without a response (444).
     Close,
+    /// The route's access phase must run; continue with
+    /// [`Phases::accessed`].
+    Access(u32),
 }
 
 enum Next {
@@ -52,6 +55,8 @@ enum Next {
     Find,
     /// Run a route without searching for it. `true` for a named route.
     Route(u32, bool),
+    /// The route's access phase passed: run its content.
+    Content(u32),
     /// The status is answered with the error pages in effect.
     Error(u16),
 }
@@ -111,6 +116,18 @@ impl<'s> Phases<'s> {
         self.next = Next::Error(status);
     }
 
+    /// Continues after the access phase of route `r`: its content, or the
+    /// error pages for the status it was refused with.
+    pub fn accessed(&mut self, r: u32, result: Result<(), u16>) {
+        self.next = match result {
+            Ok(()) => Next::Content(r),
+            Err(status) => {
+                self.note(|| format!("access denied: {status}"));
+                Next::Error(status)
+            }
+        };
+    }
+
     /// Counts a URI change; past the limit the request ends with 500.
     fn too_many_changes(&mut self) -> bool {
         self.changes += 1;
@@ -143,6 +160,11 @@ impl<'s> Phases<'s> {
                     }
                 }
                 Next::Route(r, named) => self.route(x, r, named),
+                Next::Content(r) => {
+                    let route = &site.routes[r as usize];
+                    x.bandwidth = route.bandwidth;
+                    self.content(x, &route.action)
+                }
                 Next::Error(status) => self.error_page(x, status),
             };
             match step {
@@ -188,7 +210,8 @@ impl<'s> Phases<'s> {
                 Err(Next::Find)
             }
             Ok(Rw::Redirect(s)) => Ok(Outcome::Redirect(s)),
-            Ok(_) => self.content(x, &route.action),
+            Ok(_) if route.access.is_empty() => Err(Next::Content(r)),
+            Ok(_) => Ok(Outcome::Access(r)),
             Err(MatchError) => Err(Next::Error(500)),
         }
     }

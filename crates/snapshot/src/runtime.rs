@@ -16,6 +16,7 @@ use proxelo_api::snapshot::v1::{
     try_files, upstream,
 };
 
+use crate::access::{self, Access, Bandwidth, ConnZone, RateZone, RealIp};
 use crate::cond::{Cond, Facts};
 use crate::template::Template;
 
@@ -30,6 +31,8 @@ pub struct Runtime {
     pub upstreams: Box<[Upstream]>,
     pub certificates: Box<[Certificate]>,
     pub access_logs: Box<[AccessLog]>,
+    pub rate_zones: Box<[RateZone]>,
+    pub conn_zones: Box<[ConnZone]>,
 }
 
 /// A parsed certificate chain and its private key.
@@ -267,6 +270,7 @@ pub struct Site {
     pub redirect_https: bool,
     pub response_headers: HeaderOps,
     pub access_log: Option<u32>,
+    pub real_ip: Option<RealIp>,
 }
 
 #[derive(Debug)]
@@ -279,6 +283,8 @@ pub struct Route {
     pub response_headers: HeaderOps,
     pub request_headers: HeaderOps,
     pub access_log: Option<u32>,
+    pub access: Access,
+    pub bandwidth: Option<Bandwidth>,
     children: Option<Level>,
 }
 
@@ -754,6 +760,9 @@ impl Runtime {
                 site: s,
                 routes: Vec::new(),
                 named_base: tree_len(&site.routes) as u32,
+                rate_zones: snap.rate_zones.len(),
+                conn_zones: snap.conn_zones.len(),
+                upstreams: snap.upstreams.len(),
             };
             let top = b.level(&site.routes, "routes")?;
             for (n, route) in site.named_routes.iter().enumerate() {
@@ -775,6 +784,12 @@ impl Runtime {
                 response_headers: b
                     .header_ops(site.response_headers.as_ref(), "response_headers")?,
                 access_log: site.access_log,
+                real_ip: site
+                    .real_ip
+                    .as_ref()
+                    .map(access::real_ip)
+                    .transpose()
+                    .map_err(|(f, e)| b.err(format!("real_ip.{f}"), e))?,
                 routes: b.routes.into(),
             });
         }
@@ -892,6 +907,28 @@ impl Runtime {
                 })
             })
             .collect::<Result<_, _>>()?;
+        let rate_zones = snap
+            .rate_zones
+            .iter()
+            .enumerate()
+            .map(|(i, z)| {
+                access::rate_zone(z).map_err(|(f, error)| BuildError::Field {
+                    field: format!("rate_zones[{i}].{f}"),
+                    error,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let conn_zones = snap
+            .conn_zones
+            .iter()
+            .enumerate()
+            .map(|(i, z)| {
+                access::conn_zone(z).map_err(|(f, error)| BuildError::Field {
+                    field: format!("conn_zones[{i}].{f}"),
+                    error,
+                })
+            })
+            .collect::<Result<_, _>>()?;
 
         Ok(Self {
             revision: snap.revision,
@@ -900,6 +937,8 @@ impl Runtime {
             upstreams: upstreams.into(),
             certificates,
             access_logs,
+            rate_zones,
+            conn_zones,
         })
     }
 }
@@ -923,6 +962,9 @@ struct SiteBuilder {
     routes: Vec<Route>,
     /// Route number of named route 0.
     named_base: u32,
+    rate_zones: usize,
+    conn_zones: usize,
+    upstreams: usize,
 }
 
 impl SiteBuilder {
@@ -1054,6 +1096,12 @@ impl SiteBuilder {
                 &format!("{at}.request_headers"),
             )?,
             access_log: route.access_log,
+            access: match &route.access {
+                Some(a) => access::access(a, self.rate_zones, self.conn_zones, self.upstreams)
+                    .map_err(|(f, e)| self.err(format!("{at}.access.{f}"), e))?,
+                None => Access::default(),
+            },
+            bandwidth: route.bandwidth.as_ref().and_then(access::bandwidth),
             children: None,
         })
     }
@@ -1173,6 +1221,8 @@ impl Runtime {
             upstreams: Box::default(),
             certificates: Box::default(),
             access_logs: Box::default(),
+            rate_zones: Box::default(),
+            conn_zones: Box::default(),
         }
     }
 

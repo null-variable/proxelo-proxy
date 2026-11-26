@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+mod access;
 mod acme;
 mod buf;
 mod conn;
@@ -14,9 +15,11 @@ mod h2;
 mod headers;
 mod health;
 mod io;
+mod limits;
 mod listeners;
 mod log;
 pub mod metrics;
+mod passwd;
 mod phases;
 mod proxy;
 mod range;
@@ -55,6 +58,7 @@ pub struct Active {
     tls: Box<[Option<tls::Acceptor>]>,
     metrics: metrics::Table,
     logs: log::Logs,
+    zones: limits::Zones,
 }
 
 pub struct Server {
@@ -68,7 +72,7 @@ pub struct Server {
 impl Server {
     pub fn new(rt: Runtime, workers: usize) -> Arc<Self> {
         let shards = workers.max(1);
-        let active = build(rt, shards, &upstream::Reuse::default()).expect("empty runtime");
+        let active = build(rt, shards, &upstream::Reuse::default(), None).expect("empty runtime");
         Arc::new(Self {
             active: ArcSwap::from_pointee(active),
             shards,
@@ -105,7 +109,7 @@ impl Server {
                     .or_insert_with(|| peer.clone());
             }
         }
-        build(rt, self.shards, &reuse)
+        build(rt, self.shards, &reuse, Some(&old))
     }
 
     /// Makes `next` active. Requests in progress finish on the old snapshot,
@@ -222,8 +226,14 @@ fn scopeguard(f: fn()) -> impl Drop {
     Guard(f)
 }
 
-fn build(rt: Runtime, shards: usize, reuse: &upstream::Reuse) -> Result<Active, String> {
+fn build(
+    rt: Runtime,
+    shards: usize,
+    reuse: &upstream::Reuse,
+    old: Option<&Active>,
+) -> Result<Active, String> {
     let rt = Arc::new(rt);
+    let zones = limits::Zones::new(&rt, old.map(|o| (&*o.rt, &o.zones)));
     let tls = tls::build(&rt)?;
     let upstreams = rt
         .upstreams
@@ -233,6 +243,7 @@ fn build(rt: Runtime, shards: usize, reuse: &upstream::Reuse) -> Result<Active, 
     Ok(Active {
         metrics: metrics::Table::new(&rt),
         logs: log::Logs::new(&rt.access_logs),
+        zones,
         upstreams,
         tls,
         rt,

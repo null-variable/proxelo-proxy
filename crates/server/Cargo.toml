@@ -20,6 +20,9 @@ proxelo-snapshot.workspace = true
 socket2.workspace = true
 tokio.workspace = true
 jiff = { version = "1.0.3", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+bcrypt = { version = "0.19", default-features = false, features = ["std"] }
+sha-crypt = { version = "0.6", default-features = false, features = ["password-hash"] }
+foldhash.workspace = true
 
 [dev-dependencies]
 stats_alloc.workspace = true

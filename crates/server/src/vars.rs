@@ -76,6 +76,11 @@ pub(crate) fn expand_into(x: &mut Exchange, t: &Template, out: &mut Vec<u8>, log
                     out.extend_from_slice(v);
                 }
             }
+            Part::AuthResp(name) => {
+                if let Some(v) = x.auth_resp(name) {
+                    out.extend_from_slice(v);
+                }
+            }
             Part::Arg(name) => {
                 if let Some(v) = x.args.split(|&c| c == b'&').find_map(|kv| {
                     let (k, v) = kv.split_at(kv.iter().position(|&c| c == b'=')?);
@@ -126,6 +131,10 @@ fn var(x: &mut Exchange, v: Var, out: &mut Vec<u8>) {
         }
         Var::ServerPort => push_u64(out, u64::from(x.local.port())),
         Var::RemoteAddr => _ = write!(out, "{}", x.peer.ip()),
+        Var::BinaryRemoteAddr => match x.peer.ip() {
+            std::net::IpAddr::V4(a) => out.extend_from_slice(&a.octets()),
+            std::net::IpAddr::V6(a) => out.extend_from_slice(&a.octets()),
+        },
         Var::RemotePort => push_u64(out, u64::from(x.peer.port())),
         Var::ServerAddr => _ = write!(out, "{}", x.local.ip()),
         Var::ServerName => out.extend_from_slice(&x.host),
@@ -210,7 +219,16 @@ fn var(x: &mut Exchange, v: Var, out: &mut Vec<u8>) {
             }
         }
         // Set by authentication policies, which do not exist yet.
-        Var::RemoteUser => {}
+        Var::RemoteUser => {
+            let mut creds = std::mem::take(&mut x.scratch);
+            if let Some(colon) = crate::access::basic_credentials(x, &mut creds) {
+                out.extend_from_slice(&creds[..colon]);
+            }
+            creds.clear();
+            x.scratch = creds;
+        }
+        Var::RealipRemoteAddr => _ = write!(out, "{}", x.conn_peer.ip()),
+        Var::RealipRemotePort => push_u64(out, u64::from(x.conn_peer.port())),
         Var::Capture(i) => {
             if let Some(c) = x.caps.get(usize::from(i)) {
                 out.extend_from_slice(c);

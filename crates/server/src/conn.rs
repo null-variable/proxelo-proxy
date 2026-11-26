@@ -74,6 +74,8 @@ pub(crate) struct Conn {
     pub out: Vec<u8>,
     /// The request being handled.
     pub x: Exchange,
+    /// Connection zone counts the request holds until it ends.
+    pub holds: Vec<crate::limits::Hold>,
 }
 
 /// Bytes after the head in a response built in one buffer.
@@ -110,6 +112,7 @@ impl Conn {
             body: BodyLeft::None,
             out: Vec::new(),
             x,
+            holds: Vec::new(),
         }
     }
 
@@ -183,6 +186,7 @@ impl Conn {
             route: None,
         };
         let keep = self.handle_in(active, &mut done).await;
+        self.holds.clear();
         self.finish(active, &done);
         keep
     }
@@ -251,6 +255,9 @@ impl Conn {
         if site.redirect_https && !self.x.https() {
             return self.redirect_https().await;
         }
+        if let Some(ri) = &site.real_ip {
+            crate::access::real_ip(&mut self.x, ri);
+        }
         let mut phases = Phases::new(site, false);
         loop {
             let outcome = phases.run(&mut self.x);
@@ -296,6 +303,11 @@ impl Conn {
                 Outcome::Close => {
                     self.x.sent.status = 444;
                     false
+                }
+                Outcome::Access(r) => {
+                    let result = self.access(active, site_index, r).await;
+                    phases.accessed(r, result);
+                    continue;
                 }
             };
         }
@@ -455,6 +467,9 @@ impl Conn {
         let keep = self.x.req.keep_alive && keeps_alive(status);
         self.out.clear();
         reply::start(&mut self.out, status, b"");
+        if status == 401 {
+            self.out.extend_from_slice(&self.x.auth_header);
+        }
         let head = self.x.req.method == Method::Head;
         reply::page(&mut self.out, status, keep, head, &self.x.resp_extra);
         let body = body_len(&self.out);

@@ -3,10 +3,10 @@
 use std::fs::{File, Metadata};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::UNIX_EPOCH;
+use std::time::{Instant, UNIX_EPOCH};
 
 use proxelo_http1::{Method, http_date, push_hex, push_u64};
-use proxelo_snapshot::HeaderOps;
+use proxelo_snapshot::{Bandwidth, HeaderOps};
 
 use crate::conn::{Conn, KeepAlive, SEND_TIMEOUT, body_len};
 use crate::io::write_timeout;
@@ -18,6 +18,21 @@ const FILE_CHUNK: usize = 64 * 1024;
 
 /// Multipart boundaries, a process-wide counter as in nginx.
 static BOUNDARIES: AtomicU64 = AtomicU64::new(0);
+
+/// nginx limit_rate: after a write took the bytes sent from `before` to
+/// `sent`, waits until they are within `rate` per second since the request
+/// started (plus one second and the `after` allowance, as nginx counts).
+pub(crate) async fn throttle(b: Bandwidth, before: u64, sent: u64, started: Instant) {
+    if sent <= b.after || sent == before {
+        return;
+    }
+    let allowed = (started.elapsed().as_secs() + 1).saturating_mul(b.rate);
+    let over = sent - b.after;
+    if over > allowed {
+        let ms = (over - allowed).saturating_mul(1000) / b.rate + 1;
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
+}
 
 impl Conn {
     /// Sends a static file, or the parts a Range header asks for (nginx's
@@ -149,7 +164,13 @@ impl Conn {
         let mut left = span.end - span.start;
         while left > 0 {
             let start = self.out.len();
-            let want = left.min(FILE_CHUNK as u64) as usize;
+            // Throttled writes are at most a second's worth, so the pace is
+            // even rather than one chunk then a long pause.
+            let chunk = match self.x.bandwidth {
+                Some(b) if self.x.paced >= b.after => b.rate.clamp(1, FILE_CHUNK as u64),
+                _ => FILE_CHUNK as u64,
+            };
+            let want = left.min(chunk) as usize;
             self.out.resize(start + want, 0);
             let n = match file.read(&mut self.out[start..]) {
                 Ok(n) if n > 0 => n,
@@ -163,6 +184,11 @@ impl Conn {
                 .is_err()
             {
                 return false;
+            }
+            if let Some(b) = self.x.bandwidth {
+                let before = self.x.paced;
+                self.x.paced += self.out.len() as u64;
+                throttle(b, before, self.x.paced, self.x.started).await;
             }
             self.out.clear();
         }

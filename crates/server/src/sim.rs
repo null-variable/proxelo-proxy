@@ -111,8 +111,33 @@ pub fn simulate(rt: &Runtime, r: &HttpRequest) -> SimResult {
         out.trace.push("redirect to https".into());
         return out;
     }
+    if let Some(ri) = &site.real_ip {
+        crate::access::real_ip(&mut x, ri);
+        if x.peer != x.conn_peer {
+            out.trace.push(format!("real_ip {}", x.peer.ip()));
+        }
+    }
     let mut phases = Phases::new(site, true);
-    let outcome = phases.run(&mut x);
+    // The access phase runs what needs no network; limits and forward auth
+    // are noted and assumed to pass.
+    let outcome = loop {
+        match phases.run(&mut x) {
+            Outcome::Access(r) => {
+                let a = &site.routes[r as usize].access;
+                if let Some(t) = &mut phases.trace {
+                    if !a.rate_limits.is_empty() || !a.conn_limits.is_empty() {
+                        t.push("limits not simulated".into());
+                    }
+                    if a.forward_auth.is_some() {
+                        t.push("forward auth not simulated".into());
+                    }
+                }
+                let result = crate::access::check(&mut x, a);
+                phases.accessed(r, result);
+            }
+            o => break o,
+        }
+    };
     let location = |x: &Exchange| {
         if x.tmpl.starts_with(b"/") {
             let mut l = Vec::new();
@@ -162,6 +187,7 @@ pub fn simulate(rt: &Runtime, r: &HttpRequest) -> SimResult {
             out.targets = up.targets.iter().map(|t| t.addr.to_string()).collect();
         }
         Outcome::Close => out.kind = Kind::Close as i32,
+        Outcome::Access(_) => unreachable!("resolved above"),
     }
     let route = phases.route.map(|r| &site.routes[r as usize]);
     if let Some(r) = route {
@@ -200,7 +226,7 @@ pub fn simulate(rt: &Runtime, r: &HttpRequest) -> SimResult {
         out.uri.push('?');
         out.uri.push_str(&text(&x.args));
     }
-    out.trace = phases.trace.unwrap_or_default();
+    out.trace.extend(phases.trace.unwrap_or_default());
     out
 }
 

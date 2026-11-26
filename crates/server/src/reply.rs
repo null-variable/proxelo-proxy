@@ -39,7 +39,11 @@ pub(crate) fn page(out: &mut Vec<u8>, status: u16, keep_alive: bool, head: bool,
     const PRE: &[u8] = b"<html>\r\n<head><title>";
     const MID: &[u8] = b"</title></head>\r\n<body>\r\n<center><h1>";
     const POST: &[u8] = b"</h1></center>\r\n<hr><center>proxelo</center>\r\n</body>\r\n</html>\r\n";
-    let reason = reason(status).as_bytes();
+    // nginx's page titles follow the status line except for 401.
+    let reason = match status {
+        401 => b"Authorization Required",
+        _ => reason(status).as_bytes(),
+    };
     // "404 Not Found": three digits, a space and the reason, twice.
     let title = 4 + reason.len();
     let len = PRE.len() + MID.len() + POST.len() + 2 * title;

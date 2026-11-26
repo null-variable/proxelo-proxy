@@ -4,12 +4,17 @@
 //! checks what the proxy depends on to serve traffic safely: every index points
 //! at an existing object and every match and action is fully specified.
 
+mod access;
 mod cond;
 mod runtime;
 mod template;
 
 use std::fmt;
 
+pub use access::{
+    Access, AccessRule, Bandwidth, BasicAuth, BasicUser, Cidr, ConnZone, ForwardAuth, RateZone,
+    RealIp,
+};
 pub use cond::{Cond, Facts};
 pub use runtime::{
     AccessLog, Action, Balancing, BuildError, Captures, Certificate, CheckKind, ErrorPage,

@@ -38,10 +38,21 @@ Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
   and phases; proxying reports the upstream instead of connecting).
 - Static files (`root`, `index`) with byte ranges (single, multipart,
   `If-Range`, 416 as nginx) and reverse proxying with smooth weighted
-  round robin or least_conn, backup targets, passive health (`max_fails`,
-  `fail_timeout`), `proxy_next_upstream` retries on errors, timeouts and
-  listed statuses, per-route timeouts and keepalive upstream connections
-  with an idle timeout and a request limit.
+  round robin, least_conn, ip_hash, hash and hash consistent (the same
+  targets as nginx), random and random two; backup and down targets,
+  `max_conns` with a request queue, slow start, sticky sessions by cookie or
+  route, targets re-resolved through DNS; passive health (`max_fails`,
+  `fail_timeout`) and active HTTP or TCP health checks; `proxy_next_upstream`
+  retries on errors, timeouts and listed statuses, per-route timeouts and
+  keepalive upstream connections with an idle timeout, a request limit and
+  a maximum age.
+- Access phase per route in nginx order: request rate limits (leaky bucket
+  with burst, delay and nodelay, as `limit_req`) and requests in progress
+  per key (`limit_conn`), zones kept across swaps; allow/deny by address;
+  basic auth with htpasswd hashes (bcrypt, `$apr1$`, `$1$`, `$5$`, `$6$`,
+  `{SHA}`, `{SSHA}`); forward auth to an upstream as `auth_request`.
+  `real_ip` per site from trusted proxies, and `limit_rate` with
+  `limit_rate_after` on responses.
 - TLS with OpenSSL 3: minimum version and cipher list per listener, one
   certificate per site chosen by SNI with the same lookup as `Host`, a
   default certificate for handshakes without a matching name. Certificates

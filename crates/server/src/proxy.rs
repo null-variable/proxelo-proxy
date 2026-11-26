@@ -233,7 +233,7 @@ impl Conn {
 
     /// Leaves the balancing key in `tmpl`: the client network for ip_hash,
     /// the expanded hash key for the hash methods, nothing otherwise.
-    fn balancing_key(&mut self, active: &Active, upstream: u32) {
+    pub(crate) fn balancing_key(&mut self, active: &Active, upstream: u32) {
         let up = &active.rt.upstreams[upstream as usize];
         self.x.tmpl.clear();
         match up.balancing {
@@ -324,6 +324,7 @@ impl Conn {
         if !ops.is_empty() {
             headers::request(&mut self.x, ops, &mut out);
         }
+        out.extend_from_slice(&self.x.auth_resp);
         if self.x.req.body == Body::Chunked && !self.x.as_get {
             out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
         }
@@ -488,6 +489,11 @@ impl Conn {
         let r = write_timeout(&mut self.client, &self.out, CLIENT_SEND)
             .await
             .map_err(|_| ());
+        if let Some(b) = self.x.bandwidth {
+            let before = self.x.paced;
+            self.x.paced += self.out.len() as u64;
+            crate::static_file::throttle(b, before, self.x.paced, self.x.started).await;
+        }
         self.out.clear();
         r
     }
@@ -549,7 +555,14 @@ impl Conn {
             if done {
                 return Ok(true);
             }
-            match read(up, &mut self.ubuf, BODY_BUF, t).await {
+            // Throttled responses read at most a second's worth at a time.
+            let max = match self.x.bandwidth {
+                Some(b) if self.x.paced >= b.after => {
+                    (b.rate as usize).clamp(HEAD_BUF.min(BODY_BUF), BODY_BUF)
+                }
+                _ => BODY_BUF,
+            };
+            match read(up, &mut self.ubuf, max, t).await {
                 Ok(0) if matches!(mode, Mode::Encode | Mode::Raw) => {
                     if mode == Mode::Encode {
                         self.out.extend_from_slice(b"0\r\n\r\n");

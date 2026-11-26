@@ -27,7 +27,11 @@ pub(crate) struct Sent {
 
 pub(crate) struct Exchange {
     pub local: SocketAddr,
+    /// The client address: the connection's, or what real_ip set for this
+    /// request.
     pub peer: SocketAddr,
+    /// The connection's client address.
+    pub conn_peer: SocketAddr,
     /// The current request head, copied out of the read buffer so pipelined
     /// bytes can move up while the request is handled.
     pub head: Vec<u8>,
@@ -70,6 +74,19 @@ pub(crate) struct Exchange {
     pub resp_extra: Vec<u8>,
     /// A Set-Cookie line for a sticky session, added to a proxied response.
     pub sticky_cookie: Vec<u8>,
+    /// The request and connection limits ran for this request.
+    pub limited: bool,
+    /// Rate limit nodes held between lookup and accounting.
+    pub rate_held: Vec<(u32, u32)>,
+    /// A WWW-Authenticate line for a 401 from the access phase.
+    pub auth_header: Vec<u8>,
+    /// Response header lines of the forward auth that the request sent
+    /// upstream carries.
+    pub auth_resp: Vec<u8>,
+    /// Response throttling of the route that serves the request.
+    pub bandwidth: Option<proxelo_snapshot::Bandwidth>,
+    /// Bytes written to the client so far, for the bandwidth limit.
+    pub paced: u64,
 }
 
 /// Lowercases `raw` into `out` without the port and a trailing dot.
@@ -92,6 +109,7 @@ impl Exchange {
         Self {
             local,
             peer,
+            conn_peer: peer,
             head: Vec::new(),
             req: Request::default(),
             host: Vec::new(),
@@ -114,6 +132,12 @@ impl Exchange {
             sent: Sent::default(),
             resp_extra: Vec::new(),
             sticky_cookie: Vec::new(),
+            limited: false,
+            rate_held: Vec::new(),
+            auth_header: Vec::new(),
+            auth_resp: Vec::new(),
+            bandwidth: None,
+            paced: 0,
         }
     }
 
@@ -146,6 +170,12 @@ impl Exchange {
         self.sent = Sent::default();
         self.resp_extra.clear();
         self.sticky_cookie.clear();
+        self.peer = self.conn_peer;
+        self.limited = false;
+        self.auth_header.clear();
+        self.auth_resp.clear();
+        self.bandwidth = None;
+        self.paced = 0;
         self.uri_changed = false;
         self.error_paged = false;
         self.err_status = 0;
@@ -191,6 +221,18 @@ impl Exchange {
                 let eq = pair.iter().position(|&c| c == b'=')?;
                 (&pair[..eq] == name).then(|| pair[eq + 1..].trim_ascii_end())
             })
+    }
+
+    /// The value of `name` in the forward auth response ($auth_resp_<name>).
+    pub fn auth_resp(&self, name: &[u8]) -> Option<&[u8]> {
+        self.auth_resp
+            .split(|&c| c == b'\n')
+            .filter_map(|l| {
+                let colon = l.iter().position(|&c| c == b':')?;
+                Some((&l[..colon], l[colon + 1..].trim_ascii()))
+            })
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
     }
 
     pub fn request_header(&self, name: &[u8]) -> Option<&[u8]> {

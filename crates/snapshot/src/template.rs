@@ -51,6 +51,11 @@ pub enum Var {
     UpstreamConnectTime,
     UpstreamHeaderTime,
     RemoteUser,
+    /// The client address as 4 or 16 bytes.
+    BinaryRemoteAddr,
+    /// The connection's address before real_ip.
+    RealipRemoteAddr,
+    RealipRemotePort,
     /// `$0`..`$9`: groups of the last regex that matched.
     Capture(u8),
 }
@@ -65,6 +70,9 @@ pub enum Part {
     Arg(Box<[u8]>),
     /// `$cookie_<name>`.
     Cookie(Box<[u8]>),
+    /// `$auth_resp_<name>`: a header of the forward auth response, with the
+    /// lowercase name using `-`.
+    AuthResp(Box<[u8]>),
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -157,6 +165,7 @@ fn var(name: &str) -> Option<Part> {
         "request_method" => Var::RequestMethod,
         "server_port" => Var::ServerPort,
         "remote_addr" => Var::RemoteAddr,
+        "binary_remote_addr" => Var::BinaryRemoteAddr,
         "remote_port" => Var::RemotePort,
         "server_addr" => Var::ServerAddr,
         "server_name" => Var::ServerName,
@@ -183,16 +192,22 @@ fn var(name: &str) -> Option<Part> {
         "upstream_connect_time" => Var::UpstreamConnectTime,
         "upstream_header_time" => Var::UpstreamHeaderTime,
         "remote_user" => Var::RemoteUser,
+        "realip_remote_addr" => Var::RealipRemoteAddr,
+        "realip_remote_port" => Var::RealipRemotePort,
         _ => {
-            if let Some(h) = name.strip_prefix("http_").filter(|h| !h.is_empty()) {
-                let h: Vec<u8> = h
-                    .bytes()
+            let header = |h: &str| -> Box<[u8]> {
+                h.bytes()
                     .map(|c| match c {
                         b'_' => b'-',
                         c => c.to_ascii_lowercase(),
                     })
-                    .collect();
-                return Some(Part::Header(h.into()));
+                    .collect()
+            };
+            if let Some(h) = name.strip_prefix("http_").filter(|h| !h.is_empty()) {
+                return Some(Part::Header(header(h)));
+            }
+            if let Some(h) = name.strip_prefix("auth_resp_").filter(|h| !h.is_empty()) {
+                return Some(Part::AuthResp(header(h)));
             }
             if let Some(a) = name.strip_prefix("arg_").filter(|a| !a.is_empty()) {
                 return Some(Part::Arg(a.as_bytes().into()));

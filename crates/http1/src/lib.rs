@@ -202,7 +202,7 @@ impl Default for Headers {
 }
 
 impl Headers {
-    pub fn iter(&self) -> impl Iterator<Item = &Header> {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Header> {
         self.list[..self.len].iter()
     }
 
@@ -666,6 +666,7 @@ pub fn reason(status: u16) -> &'static str {
         302 => "Moved Temporarily",
         304 => "Not Modified",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Not Allowed",
@@ -673,6 +674,7 @@ pub fn reason(status: u16) -> &'static str {
         413 => "Request Entity Too Large",
         414 => "Request-URI Too Large",
         416 => "Requested Range Not Satisfiable",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         501 => "Not Implemented",
         502 => "Bad Gateway",
