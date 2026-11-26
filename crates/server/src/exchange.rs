@@ -58,6 +58,8 @@ pub(crate) struct Exchange {
     pub as_get: bool,
     /// Over TLS, with what the handshake chose.
     pub tls: Option<TlsInfo>,
+    /// An L4 session, for the stream variables.
+    pub session: Option<crate::stream::Session>,
     /// Served through HTTP/2.
     pub h2: bool,
     pub started: Instant,
@@ -146,6 +148,7 @@ impl Exchange {
             err_status: 0,
             as_get: false,
             tls: None,
+            session: None,
             h2: false,
             started: Instant::now(),
             requests: 0,

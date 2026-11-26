@@ -159,10 +159,7 @@ impl Access {
 
     /// nginx allow/deny: the first rule that matches decides.
     pub fn allows(&self, ip: IpAddr) -> bool {
-        self.rules
-            .iter()
-            .find(|r| r.cidr.is_none_or(|c| c.contains(ip)))
-            .is_none_or(|r| r.allow)
+        allowed(&self.rules, ip)
     }
 }
 
@@ -238,6 +235,33 @@ pub(crate) fn real_ip(r: &ir::RealIp) -> Result<RealIp, Invalid> {
     })
 }
 
+/// nginx allow and deny rules, in order.
+pub(crate) fn rules(rules: &[ir::AccessRule]) -> Result<Box<[AccessRule]>, Invalid> {
+    rules
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let cidr = if r.cidr.is_empty() {
+                None
+            } else {
+                Some(Cidr::parse(&r.cidr).map_err(|e| (format!("rules[{i}].cidr"), e))?)
+            };
+            Ok(AccessRule {
+                allow: r.allow,
+                cidr,
+            })
+        })
+        .collect()
+}
+
+/// nginx allow/deny over `rules`: the first rule that matches decides.
+pub fn allowed(rules: &[AccessRule], ip: IpAddr) -> bool {
+    rules
+        .iter()
+        .find(|r| r.cidr.is_none_or(|c| c.contains(ip)))
+        .is_none_or(|r| r.allow)
+}
+
 pub(crate) fn access(
     a: &ir::Access,
     rate_zones: usize,
@@ -254,22 +278,7 @@ pub(crate) fn access(
             "no such connection zone".into(),
         ));
     }
-    let rules = a
-        .rules
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let cidr = if r.cidr.is_empty() {
-                None
-            } else {
-                Some(Cidr::parse(&r.cidr).map_err(|e| (format!("rules[{i}].cidr"), e))?)
-            };
-            Ok(AccessRule {
-                allow: r.allow,
-                cidr,
-            })
-        })
-        .collect::<Result<_, Invalid>>()?;
+    let rules = rules(&a.rules)?;
     let basic_auth = a.basic_auth.as_ref().map(|b| {
         let mut challenge = b"Basic realm=\"".to_vec();
         challenge.extend(

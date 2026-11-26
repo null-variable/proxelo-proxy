@@ -1,9 +1,10 @@
 //! Listening sockets that follow the active snapshot.
 //!
-//! Sockets are keyed by address. Applying a snapshot binds the addresses it
-//! adds before anything changes, swaps the snapshot in, starts accepting on the
-//! new sockets and closes the ones it no longer lists. Sockets for addresses
-//! present in both snapshots stay open, so a swap never drops a listen queue.
+//! Sockets are keyed by address and kind (HTTP listener, TCP stream, UDP
+//! stream). Applying a snapshot binds the sockets it adds before anything
+//! changes, swaps the snapshot in, starts serving the new sockets and closes
+//! the ones it no longer lists. Sockets present in both snapshots stay open,
+//! so a swap never drops a listen queue.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -15,7 +16,7 @@ use proxelo_snapshot::Runtime;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-use crate::{Server, bind};
+use crate::{Server, bind, bind_udp};
 
 pub struct Listeners {
     /// Runtimes accept loops run on.
@@ -23,14 +24,28 @@ pub struct Listeners {
     /// One SO_REUSEPORT socket per address and worker instead of one socket
     /// per address.
     per_worker: bool,
-    open: HashMap<SocketAddr, Vec<JoinHandle<()>>>,
+    open: HashMap<(SocketAddr, Kind), Vec<JoinHandle<()>>>,
+}
+
+/// What a socket serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Kind {
+    Http,
+    Tcp,
+    Udp,
+}
+
+enum Socket {
+    Tcp(std::net::TcpListener),
+    Udp(std::net::UdpSocket),
 }
 
 /// Why a snapshot could not be applied; nothing changed.
 #[derive(Debug)]
 pub enum BindError {
     Bind {
-        listener: usize,
+        /// "listeners[0]" or "streams[0]".
+        at: String,
         addr: SocketAddr,
         error: io::Error,
     },
@@ -41,11 +56,7 @@ pub enum BindError {
 impl fmt::Display for BindError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Bind {
-                listener,
-                addr,
-                error,
-            } => write!(f, "listeners[{listener}]: bind {addr}: {error}"),
+            Self::Bind { at, addr, error } => write!(f, "{at}: bind {addr}: {error}"),
             Self::Tls(e) => f.write_str(e),
         }
     }
@@ -79,18 +90,40 @@ impl Listeners {
     /// kept until its address is removed; changing them on a live socket
     /// would drop its queued connections.
     pub fn apply(&mut self, server: &Arc<Server>, rt: Runtime) -> Result<(), BindError> {
-        let mut want: Vec<SocketAddr> = Vec::new();
-        let mut fresh: Vec<(SocketAddr, Vec<std::net::TcpListener>)> = Vec::new();
-        for (i, l) in rt.listeners.iter().enumerate() {
-            for &addr in &l.addrs {
-                if want.contains(&addr) {
+        let mut want: Vec<(SocketAddr, Kind)> = Vec::new();
+        let mut fresh: Vec<((SocketAddr, Kind), Vec<Socket>)> = Vec::new();
+        let listeners = rt.listeners.iter().enumerate().map(|(i, l)| {
+            (
+                format!("listeners[{i}]"),
+                &l.addrs,
+                Kind::Http,
+                l.reuse_port,
+                l.backlog,
+            )
+        });
+        let streams = rt.streams.iter().enumerate().map(|(i, s)| {
+            let kind = if s.udp { Kind::Udp } else { Kind::Tcp };
+            (
+                format!("streams[{i}]"),
+                &s.addrs,
+                kind,
+                s.reuse_port,
+                s.backlog,
+            )
+        });
+        for (at, addrs, kind, reuse_port, backlog) in listeners.chain(streams) {
+            for &addr in addrs.iter() {
+                let key = (addr, kind);
+                if want.contains(&key) {
                     continue;
                 }
-                want.push(addr);
-                if self.open.contains_key(&addr) {
+                want.push(key);
+                if self.open.contains_key(&key) {
                     continue;
                 }
-                let n = if self.per_worker {
+                // One UDP socket per address: sessions are kept by client
+                // address, and SO_REUSEPORT would spread them over sockets.
+                let n = if self.per_worker && kind != Kind::Udp {
                     self.workers.len()
                 } else {
                     1
@@ -98,39 +131,46 @@ impl Listeners {
                 let mut sockets = Vec::with_capacity(n);
                 for _ in 0..n {
                     // Sockets bound so far close when `fresh` drops.
-                    let s = bind(addr, l.reuse_port || self.per_worker, l.backlog).map_err(
-                        |error| BindError::Bind {
-                            listener: i,
-                            addr,
-                            error,
-                        },
-                    )?;
+                    let s = match kind {
+                        Kind::Udp => bind_udp(addr, reuse_port).map(Socket::Udp),
+                        _ => bind(addr, reuse_port || self.per_worker, backlog).map(Socket::Tcp),
+                    }
+                    .map_err(|error| BindError::Bind {
+                        at: at.clone(),
+                        addr,
+                        error,
+                    })?;
                     sockets.push(s);
                 }
-                fresh.push((addr, sockets));
+                fresh.push((key, sockets));
             }
         }
 
         let next = server.prepare(rt).map_err(BindError::Tls)?;
         server.install(next);
 
-        for (addr, sockets) in fresh {
+        for (key, sockets) in fresh {
+            let (addr, kind) = key;
             let tasks = sockets
                 .into_iter()
                 .zip(&self.workers)
                 .map(|(s, worker)| {
                     let server = server.clone();
                     worker.spawn(async move {
-                        let _ = server.accept(addr, s).await;
+                        let _ = match (kind, s) {
+                            (Kind::Http, Socket::Tcp(s)) => server.accept(addr, s).await,
+                            (_, Socket::Tcp(s)) => server.accept_stream(addr, s).await,
+                            (_, Socket::Udp(s)) => server.serve_udp(addr, s).await,
+                        };
                     })
                 })
                 .collect();
-            self.open.insert(addr, tasks);
+            self.open.insert(key, tasks);
         }
         // Aborting an accept loop drops its socket. Connections already
         // accepted keep running; see conn::serve for how they end.
-        self.open.retain(|addr, tasks| {
-            let keep = want.contains(addr);
+        self.open.retain(|key, tasks| {
+            let keep = want.contains(key);
             if !keep {
                 tasks.iter().for_each(JoinHandle::abort);
             }
@@ -141,8 +181,9 @@ impl Listeners {
 
     /// Addresses currently open, sorted.
     pub fn addrs(&self) -> Vec<SocketAddr> {
-        let mut v: Vec<_> = self.open.keys().copied().collect();
+        let mut v: Vec<_> = self.open.keys().map(|&(a, _)| a).collect();
         v.sort();
+        v.dedup();
         v
     }
 }

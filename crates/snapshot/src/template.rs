@@ -57,6 +57,19 @@ pub enum Var {
     RealipRemoteAddr,
     RealipRemotePort,
     SslSessionReused,
+    /// Stream: `$protocol` (TCP or UDP).
+    Protocol,
+    /// Stream: `$bytes_received` from the client.
+    BytesReceived,
+    /// Stream: `$session_time`, seconds with milliseconds.
+    SessionTime,
+    /// Stream: `$upstream_bytes_sent` and `$upstream_bytes_received`.
+    UpstreamBytesSent,
+    UpstreamBytesReceived,
+    /// Stream: what the ClientHello said, from ssl_preread.
+    SslPrereadServerName,
+    SslPrereadAlpnProtocols,
+    SslPrereadProtocol,
     /// `$ssl_client_verify`: NONE, SUCCESS or FAILED:<reason>.
     SslClientVerify,
     SslClientSDn,
@@ -233,6 +246,14 @@ fn var(name: &str) -> Option<Part> {
         "realip_remote_addr" => Var::RealipRemoteAddr,
         "realip_remote_port" => Var::RealipRemotePort,
         "ssl_session_reused" => Var::SslSessionReused,
+        "protocol" => Var::Protocol,
+        "bytes_received" => Var::BytesReceived,
+        "session_time" => Var::SessionTime,
+        "upstream_bytes_sent" => Var::UpstreamBytesSent,
+        "upstream_bytes_received" => Var::UpstreamBytesReceived,
+        "ssl_preread_server_name" => Var::SslPrereadServerName,
+        "ssl_preread_alpn_protocols" => Var::SslPrereadAlpnProtocols,
+        "ssl_preread_protocol" => Var::SslPrereadProtocol,
         "ssl_client_verify" => Var::SslClientVerify,
         "ssl_client_s_dn" => Var::SslClientSDn,
         "ssl_client_i_dn" => Var::SslClientIDn,

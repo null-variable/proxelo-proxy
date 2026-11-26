@@ -295,6 +295,42 @@ fn var(x: &mut Exchange, v: Var, out: &mut Vec<u8>) {
         }
         Var::RealipRemoteAddr => _ = write!(out, "{}", x.conn_peer.ip()),
         Var::RealipRemotePort => push_u64(out, u64::from(x.conn_peer.port())),
+        Var::Protocol => {
+            if let Some(s) = &x.session {
+                out.extend_from_slice(if s.udp { b"UDP" } else { b"TCP" });
+            }
+        }
+        Var::BytesReceived => {
+            if let Some(s) = &x.session {
+                push_u64(out, s.received);
+            }
+        }
+        Var::SessionTime => secs(out, x.started.elapsed().as_secs_f64()),
+        Var::UpstreamBytesSent => {
+            if let Some(s) = &x.session {
+                push_u64(out, s.upstream_sent);
+            }
+        }
+        Var::UpstreamBytesReceived => {
+            if let Some(s) = &x.session {
+                push_u64(out, s.upstream_received);
+            }
+        }
+        Var::SslPrereadServerName => {
+            if let Some(s) = &x.session {
+                out.extend_from_slice(&s.preread_server_name);
+            }
+        }
+        Var::SslPrereadAlpnProtocols => {
+            if let Some(s) = &x.session {
+                out.extend_from_slice(&s.preread_alpn);
+            }
+        }
+        Var::SslPrereadProtocol => {
+            if let Some(s) = &x.session {
+                out.extend_from_slice(s.preread_protocol.as_bytes());
+            }
+        }
         Var::SslSessionReused => {
             if let Some(t) = &x.tls {
                 out.extend_from_slice(if t.session_reused { b"r" } else { b"." });

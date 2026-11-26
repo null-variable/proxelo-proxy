@@ -35,6 +35,7 @@ pub struct Runtime {
     pub access_logs: Box<[AccessLog]>,
     pub rate_zones: Box<[RateZone]>,
     pub conn_zones: Box<[ConnZone]>,
+    pub streams: Box<[Stream]>,
     /// Variables of map, geo and split_clients, by `Part::Lookup` index.
     pub lookups: Arc<[Lookup]>,
     /// Compression settings of routes and sites, by their index.
@@ -825,6 +826,133 @@ fn resolve(addr: &str) -> Result<Box<[SocketAddr]>, String> {
     Ok(addrs.into())
 }
 
+fn listener_tls(t: &ir::ListenerTls) -> ListenerTls {
+    ListenerTls {
+        min_version: tls_version(t.min_version(), 0x0303),
+        max_version: tls_version(t.max_version(), 0x0304),
+        ciphers: if t.ciphers.is_empty() {
+            "HIGH:!aNULL:!MD5".into()
+        } else {
+            t.ciphers.as_str().into()
+        },
+        ciphersuites: t.ciphersuites.as_str().into(),
+        prefer_server_ciphers: t.prefer_server_ciphers,
+        groups: t.groups.as_str().into(),
+        session_tickets: !t.no_session_tickets,
+        session_cache_size: t.session_cache_size,
+        dh_params: t.dh_params.as_str().into(),
+        client_auth: t.client_auth.as_ref().and_then(|c| {
+            use ir::client_auth::Mode;
+            let mode = match c.mode() {
+                Mode::Require => ClientAuthMode::Require,
+                Mode::Optional => ClientAuthMode::Optional,
+                Mode::OptionalNoCa => ClientAuthMode::OptionalNoCa,
+                Mode::Unspecified => return None,
+            };
+            Some(ClientAuth {
+                mode,
+                ca: c.ca.as_str().into(),
+                depth: c.depth.max(1),
+            })
+        }),
+        default_certificate: t.default_certificate,
+    }
+}
+
+/// An L4 proxy (nginx stream server).
+#[derive(Debug)]
+pub struct Stream {
+    pub id: Box<str>,
+    pub addrs: Box<[SocketAddr]>,
+    pub udp: bool,
+    pub reuse_port: bool,
+    pub backlog: u32,
+    pub tls: Option<ListenerTls>,
+    pub ssl_preread: bool,
+    pub routes: Box<[StreamRoute]>,
+    pub rules: Box<[crate::AccessRule]>,
+    pub conn_limits: Box<[u32]>,
+    pub access_log: Option<u32>,
+    pub proxy_protocol: bool,
+    pub connect_timeout: Duration,
+    pub timeout: Duration,
+    pub responses: Option<u32>,
+    pub next_upstream: bool,
+    /// 0: every target.
+    pub tries: u32,
+}
+
+#[derive(Debug)]
+pub struct StreamRoute {
+    names: Hosts,
+    /// No names: matches every session.
+    any: bool,
+    pub upstream: u32,
+}
+
+impl Stream {
+    /// The upstream of the first route matching the lowercase SNI name.
+    pub fn upstream(&self, name: Option<&[u8]>) -> Result<Option<u32>, MatchError> {
+        for r in &self.routes {
+            if r.any {
+                return Ok(Some(r.upstream));
+            }
+            if let Some(n) = name
+                && r.names.find(n)?.is_some()
+            {
+                return Ok(Some(r.upstream));
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn stream(s: &ir::Stream, at: &str) -> Result<Stream, BuildError> {
+    let err = |field: String, error: String| BuildError::Field { field, error };
+    let addrs = resolve(&s.address).map_err(|e| err(format!("{at}.address"), e))?;
+    let routes = s
+        .routes
+        .iter()
+        .enumerate()
+        .map(|(r, route)| {
+            let mut regex = Vec::new();
+            for (h, host) in route.server_names.iter().enumerate() {
+                if host.kind() == host_match::Kind::Regex {
+                    let p = Pattern::new(&host.value, true)
+                        .map_err(|e| err(format!("{at}.routes[{r}].server_names[{h}]"), e))?;
+                    regex.push(Arc::new(p));
+                }
+            }
+            let mut names = Hosts::default();
+            names.add(&route.server_names, &regex, 0);
+            Ok(StreamRoute {
+                names,
+                any: route.server_names.is_empty(),
+                upstream: route.upstream,
+            })
+        })
+        .collect::<Result<_, BuildError>>()?;
+    Ok(Stream {
+        id: s.id.as_str().into(),
+        addrs,
+        udp: s.udp,
+        reuse_port: s.reuse_port,
+        backlog: s.backlog,
+        tls: s.tls.as_ref().map(listener_tls),
+        ssl_preread: s.ssl_preread,
+        routes,
+        rules: access::rules(&s.rules).map_err(|(f, e)| err(format!("{at}.{f}"), e))?,
+        conn_limits: s.conn_limits.clone().into(),
+        access_log: s.access_log,
+        proxy_protocol: s.proxy_protocol,
+        connect_timeout: ms(s.connect_timeout_ms, DEFAULT_TIMEOUT),
+        timeout: ms(s.timeout_ms, Duration::from_secs(600)),
+        responses: s.responses,
+        next_upstream: !s.no_next_upstream,
+        tries: s.tries,
+    })
+}
+
 impl Runtime {
     /// Builds the runtime form of a snapshot that passed [`crate::validate`].
     ///
@@ -845,36 +973,7 @@ impl Runtime {
         for (i, l) in snap.listeners.iter().enumerate() {
             let addrs = resolve(&l.address)
                 .map_err(|error| BuildError::ListenerAddress { listener: i, error })?;
-            let tls = l.tls.as_ref().map(|t| ListenerTls {
-                min_version: tls_version(t.min_version(), 0x0303),
-                max_version: tls_version(t.max_version(), 0x0304),
-                ciphers: if t.ciphers.is_empty() {
-                    "HIGH:!aNULL:!MD5".into()
-                } else {
-                    t.ciphers.as_str().into()
-                },
-                ciphersuites: t.ciphersuites.as_str().into(),
-                prefer_server_ciphers: t.prefer_server_ciphers,
-                groups: t.groups.as_str().into(),
-                session_tickets: !t.no_session_tickets,
-                session_cache_size: t.session_cache_size,
-                dh_params: t.dh_params.as_str().into(),
-                client_auth: t.client_auth.as_ref().and_then(|c| {
-                    use ir::client_auth::Mode;
-                    let mode = match c.mode() {
-                        Mode::Require => ClientAuthMode::Require,
-                        Mode::Optional => ClientAuthMode::Optional,
-                        Mode::OptionalNoCa => ClientAuthMode::OptionalNoCa,
-                        Mode::Unspecified => return None,
-                    };
-                    Some(ClientAuth {
-                        mode,
-                        ca: c.ca.as_str().into(),
-                        depth: c.depth.max(1),
-                    })
-                }),
-                default_certificate: t.default_certificate,
-            });
+            let tls = l.tls.as_ref().map(listener_tls);
             listeners.push(Listener {
                 id: l.id.as_str().into(),
                 addrs,
@@ -1090,8 +1189,15 @@ impl Runtime {
             })
             .collect::<Result<_, _>>()?;
 
+        let streams = snap
+            .streams
+            .iter()
+            .enumerate()
+            .map(|(i, s)| stream(s, &format!("streams[{i}]")))
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             revision: snap.revision,
+            streams,
             listeners: listeners.into(),
             sites: sites.into(),
             upstreams: upstreams.into(),
@@ -1457,6 +1563,7 @@ impl Runtime {
             access_logs: Box::default(),
             rate_zones: Box::default(),
             conn_zones: Box::default(),
+            streams: Box::default(),
             lookups: Arc::from([]),
             compressions: Arc::from([]),
         }

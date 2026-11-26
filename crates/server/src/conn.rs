@@ -106,6 +106,11 @@ pub(crate) fn keeps_alive(status: u16) -> bool {
 
 static CONN_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The next $connection serial number.
+pub(crate) fn next_id() -> u64 {
+    CONN_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 /// What the phases decided, for logging and metrics after the response.
 struct Done {
     site: Option<u32>,
@@ -115,7 +120,7 @@ struct Done {
 impl Conn {
     pub fn new(client: Stream, listener: SocketAddr, local: SocketAddr, peer: SocketAddr) -> Self {
         let mut x = Exchange::new(local, peer);
-        x.conn_id = CONN_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        x.conn_id = next_id();
         Self {
             client,
             listener,

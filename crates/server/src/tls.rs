@@ -245,6 +245,24 @@ pub(crate) fn build(rt: &Arc<Runtime>) -> Result<Box<[Option<Acceptor>]>, String
         .collect()
 }
 
+/// Builds the contexts of streams that terminate TLS, indexed like
+/// `rt.streams`. They offer no ALPN protocol.
+pub(crate) fn build_streams(rt: &Runtime) -> Result<Box<[Option<SslContext>]>, String> {
+    rt.streams
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let Some(t) = &s.tls else {
+                return Ok(None);
+            };
+            let cert = t.default_certificate.map(|c| &rt.certificates[c as usize]);
+            let mut b = context(t, false, cert).map_err(|e| format!("streams[{i}].tls: {e}"))?;
+            b.set_alpn_select_callback(|_, _| Err(AlpnError::NOACK));
+            Ok(Some(b.build()))
+        })
+        .collect()
+}
+
 /// Builds the contexts `build` would, without the SNI wiring, so OpenSSL's
 /// verdict on settings and certificates is known without serving.
 pub(crate) fn check(rt: &Runtime) -> Result<(), String> {
@@ -269,7 +287,7 @@ pub(crate) fn check(rt: &Runtime) -> Result<(), String> {
             }
         }
     }
-    Ok(())
+    build_streams(rt).map(drop)
 }
 
 /// The client certificate check of a connection ($ssl_client_verify).

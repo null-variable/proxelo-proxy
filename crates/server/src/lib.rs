@@ -29,6 +29,7 @@ mod range;
 mod reply;
 mod sim;
 mod static_file;
+mod stream;
 mod tls;
 mod upstream;
 mod vars;
@@ -59,6 +60,8 @@ pub struct Active {
     upstreams: Box<[upstream::State]>,
     /// Indexed like `rt.listeners`.
     tls: Box<[Option<tls::Acceptor>]>,
+    /// TLS of streams that terminate it, indexed like `rt.streams`.
+    stream_tls: Box<[Option<openssl::ssl::SslContext>]>,
     metrics: metrics::Table,
     logs: log::Logs,
     zones: limits::Zones,
@@ -223,7 +226,7 @@ impl Server {
 }
 
 /// Runs `f` when dropped.
-fn scopeguard(f: fn()) -> impl Drop {
+pub(crate) fn scopeguard(f: fn()) -> impl Drop {
     struct Guard(fn());
     impl Drop for Guard {
         fn drop(&mut self) {
@@ -242,6 +245,7 @@ fn build(
     let rt = Arc::new(rt);
     let zones = limits::Zones::new(&rt, old.map(|o| (&*o.rt, &o.zones)));
     let tls = tls::build(&rt)?;
+    let stream_tls = tls::build_streams(&rt)?;
     let upstreams = rt
         .upstreams
         .iter()
@@ -257,6 +261,7 @@ fn build(
         zones,
         upstreams,
         tls,
+        stream_tls,
         rt,
     })
 }
@@ -265,6 +270,21 @@ fn build(
 /// dry-load helper.
 pub fn check_tls(rt: &Runtime) -> Result<(), String> {
     tls::check(rt)
+}
+
+/// Opens a non-blocking UDP socket for a stream.
+pub fn bind_udp(addr: SocketAddr, reuse_port: bool) -> std::io::Result<std::net::UdpSocket> {
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    if reuse_port {
+        socket.set_reuse_port(true)?;
+    }
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
 }
 
 /// Opens a non-blocking listening socket. `backlog` 0 means 511, the nginx

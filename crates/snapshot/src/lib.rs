@@ -15,7 +15,7 @@ use std::fmt;
 
 pub use access::{
     Access, AccessRule, Bandwidth, BasicAuth, BasicUser, Cidr, ConnZone, ForwardAuth, RateZone,
-    RealIp,
+    RealIp, allowed,
 };
 pub use compression::{Compression, Encoding, Proxied, StaticGz};
 pub use cond::{Cond, Facts};
@@ -25,7 +25,7 @@ pub use runtime::{
     ClientAuthMode, ErrorPage, ErrorTarget, Fallback, Gateway, GatewayParam, GatewayProtocol,
     HeaderOps, HeaderValue, HealthCheck, Listener, ListenerTls, MatchError, Memcached, NextOn,
     Pattern, Proxy, Resolved, Return, Rewrite, RewriteFlag, Route, Runtime, Site, Sticky,
-    StickyCookie, Target, TryFiles, Upstream, UpstreamTls,
+    StickyCookie, Stream, StreamRoute, Target, TryFiles, Upstream, UpstreamTls,
 };
 pub use template::{Part, Template, Var};
 
@@ -300,6 +300,52 @@ pub fn validate(snap: &Snapshot) -> Result<(), LoadError> {
         {
             return field(
                 format!("upstreams[{i}].tls.certificate"),
+                "no such certificate",
+            );
+        }
+    }
+
+    for (i, st) in snap.streams.iter().enumerate() {
+        let at = format!("streams[{i}]");
+        if st.routes.is_empty() {
+            return field(format!("{at}.routes"), "at least one route is required");
+        }
+        for (r, route) in st.routes.iter().enumerate() {
+            if route.upstream as usize >= upstreams {
+                return field(format!("{at}.routes[{r}].upstream"), "no such upstream");
+            }
+            if route
+                .server_names
+                .iter()
+                .any(|h| h.kind() == host_match::Kind::Unspecified)
+            {
+                return field(format!("{at}.routes[{r}].server_names"), "unspecified kind");
+            }
+        }
+        if st
+            .conn_limits
+            .iter()
+            .any(|&z| z as usize >= snap.conn_zones.len())
+        {
+            return field(format!("{at}.conn_limits"), "no such connection zone");
+        }
+        if st.access_log.is_some_and(|l| l as usize >= logs) {
+            return field(format!("{at}.access_log"), "no such access log");
+        }
+        if st.udp && (st.tls.is_some() || st.ssl_preread || st.proxy_protocol) {
+            return field(
+                format!("{at}.udp"),
+                "tls, ssl_preread and proxy_protocol need TCP",
+            );
+        }
+        if st.tls.is_some() && st.ssl_preread {
+            return field(format!("{at}.ssl_preread"), "conflicts with tls");
+        }
+        if let Some(t) = &st.tls
+            && t.default_certificate.is_none_or(|c| c as usize >= certs)
+        {
+            return field(
+                format!("{at}.tls.default_certificate"),
                 "no such certificate",
             );
         }

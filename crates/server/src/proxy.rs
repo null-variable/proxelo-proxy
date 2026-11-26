@@ -10,6 +10,7 @@ use tokio::io::AsyncRead;
 use tokio::time::timeout;
 
 use crate::conn::{BodyLeft, Conn, Fail, KeepAlive, SEND_TIMEOUT as CLIENT_SEND, upstream_fail};
+use crate::exchange::Exchange;
 use crate::io::write_timeout;
 use crate::upstream::{Choice, Conn as UpConn, ConnectError, State, UpStream};
 use crate::{Active, compress, headers, reply};
@@ -77,6 +78,19 @@ impl PendingCoder {
             Self::Encode(e, i) => compress::Coder::new(e, &all[i as usize]),
             Self::Gunzip => Ok(compress::Coder::gunzip()),
         }
+    }
+}
+
+/// Puts the key of `up`'s hash methods in `x.tmpl`; empty for the others.
+pub(crate) fn balancing_key(x: &mut Exchange, up: &proxelo_snapshot::Upstream) {
+    x.tmpl.clear();
+    match up.balancing {
+        Balancing::IpHash => match x.peer.ip() {
+            std::net::IpAddr::V4(a) => x.tmpl.extend_from_slice(&a.octets()[..3]),
+            std::net::IpAddr::V6(a) => x.tmpl.extend_from_slice(&a.octets()),
+        },
+        Balancing::Hash | Balancing::HashConsistent => crate::vars::expand(x, &up.hash_key),
+        _ => {}
     }
 }
 
@@ -257,18 +271,7 @@ impl Conn {
     /// Leaves the balancing key in `tmpl`: the client network for ip_hash,
     /// the expanded hash key for the hash methods, nothing otherwise.
     pub(crate) fn balancing_key(&mut self, active: &Active, upstream: u32) {
-        let up = &active.rt.upstreams[upstream as usize];
-        self.x.tmpl.clear();
-        match up.balancing {
-            Balancing::IpHash => match self.x.peer.ip() {
-                std::net::IpAddr::V4(a) => self.x.tmpl.extend_from_slice(&a.octets()[..3]),
-                std::net::IpAddr::V6(a) => self.x.tmpl.extend_from_slice(&a.octets()),
-            },
-            Balancing::Hash | Balancing::HashConsistent => {
-                crate::vars::expand(&mut self.x, &up.hash_key);
-            }
-            _ => {}
-        }
+        balancing_key(&mut self.x, &active.rt.upstreams[upstream as usize]);
     }
 
     /// Sets the sticky cookie naming target `i` unless the request already

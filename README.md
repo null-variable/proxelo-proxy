@@ -53,11 +53,17 @@ Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
   `{SHA}`, `{SSHA}`); forward auth to an upstream as `auth_request`.
   `real_ip` per site from trusted proxies, and `limit_rate` with
   `limit_rate_after` on responses.
-- TLS with OpenSSL 3: minimum version and cipher list per listener, one
+- TLS with OpenSSL 3: protocol versions, ciphers, groups, session cache and
+  tickets, DH parameters and client certificates per listener, one
   certificate per site chosen by SNI with the same lookup as `Host`, a
   default certificate for handshakes without a matching name. Certificates
   and keys are checked when a snapshot is loaded, and the TLS contexts are
   built before a swap, so a snapshot OpenSSL rejects is refused whole.
+- TLS to upstreams: verification against a CA bundle, SNI, a client
+  certificate, versions and ciphers (nginx `proxy_ssl_*`).
+- L4 streams (nginx `stream`): TCP and UDP relays, TLS termination,
+  ClientHello preread for SNI routing, PROXY protocol v1 to upstreams,
+  allow/deny, connection limits and session logs.
 - HTTP/2 through ALPN (the `h2` crate) on TLS listeners. Each stream runs
   through the same phases, proxying, logs and metrics as HTTP/1.1.
 - Response and upstream request headers set, added or removed per route
