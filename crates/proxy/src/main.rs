@@ -427,6 +427,14 @@ impl Apply for Node {
         &self.hash
     }
 
+    fn tap(&mut self, f: proxelo_sync::TapFilter) {
+        proxelo_server::set_tap_filter(f);
+    }
+
+    fn tap_events(&mut self) -> Option<proxelo_sync::TapEvents> {
+        proxelo_server::take_tap_events()
+    }
+
     fn challenges(&mut self, c: proxelo_sync::Challenges) {
         proxelo_server::set_http_challenges(
             &c.http01

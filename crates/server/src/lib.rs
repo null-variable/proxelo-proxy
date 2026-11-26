@@ -30,6 +30,7 @@ mod reply;
 mod sim;
 mod static_file;
 mod stream;
+mod tap;
 mod tls;
 mod upstream;
 mod vars;
@@ -48,6 +49,7 @@ pub use health::{resolve_all, resolve_names};
 pub use listeners::{BindError, Listeners};
 pub use log::reopen as reopen_logs;
 pub use sim::simulate;
+pub use tap::{set_filter as set_tap_filter, take as take_tap_events};
 pub use tls::set_tls_challenges;
 pub use worker::set_id as set_worker_id;
 

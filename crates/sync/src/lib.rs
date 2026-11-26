@@ -16,7 +16,9 @@ use proxelo_api::distrib::v1::{
     Ack, Hello, SyncRequest, distribution_service_client::DistributionServiceClient, sync_request,
     sync_response,
 };
-pub use proxelo_api::distrib::v1::{Challenges, RouteStats, SiteStats, Stats, TargetStats};
+pub use proxelo_api::distrib::v1::{
+    Challenges, RouteStats, SiteStats, Stats, TapEvents, TapFilter, TargetStats,
+};
 use proxelo_api::snapshot::v1::Snapshot;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -41,6 +43,13 @@ pub trait Apply {
     fn challenges(&mut self, c: Challenges);
     /// Traffic counters since start, sent every [`STATS_INTERVAL`].
     fn stats(&self) -> Stats;
+    /// Replaces the Live Tap filter.
+    fn tap(&mut self, _f: TapFilter) {}
+    /// Tapped requests collected since the last call, polled every
+    /// [`TAP_INTERVAL`].
+    fn tap_events(&mut self) -> Option<TapEvents> {
+        None
+    }
     /// Periodic work, every [`TICK_INTERVAL`], also while the control plane
     /// is unreachable.
     fn tick(&mut self) -> impl std::future::Future<Output = ()> + Send {
@@ -53,6 +62,9 @@ pub const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often [`Apply::stats`] is reported.
 pub const STATS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often tapped requests are sent.
+pub const TAP_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct Client {
     pub socket: PathBuf,
@@ -129,6 +141,11 @@ impl Client {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut tick = tokio::time::interval(TICK_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut tap = tokio::time::interval(TAP_INTERVAL);
+        tap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // A tap does not survive a reconnect: the control plane sends the
+        // filter again if it is still wanted.
+        target.tap(TapFilter::default());
         loop {
             let msg = tokio::select! {
                 _ = tick.tick() => {
@@ -140,6 +157,15 @@ impl Client {
                     Ok(None) => return Ok(()),
                     Err(e) => return Err(Session::after(e)),
                 },
+                _ = tap.tick() => {
+                    if let Some(ev) = target.tap_events() {
+                        let req = SyncRequest {
+                            kind: Some(sync_request::Kind::TapEvents(ev)),
+                        };
+                        tx.send(req).await.map_err(Session::after)?;
+                    }
+                    continue;
+                }
                 _ = ticker.tick() => {
                     let req = SyncRequest {
                         kind: Some(sync_request::Kind::Stats(target.stats())),
@@ -152,6 +178,10 @@ impl Client {
                 Some(sync_response::Kind::SnapshotData(b)) => b,
                 Some(sync_response::Kind::Challenges(c)) => {
                     target.challenges(c);
+                    continue;
+                }
+                Some(sync_response::Kind::Tap(f)) => {
+                    target.tap(f);
                     continue;
                 }
                 // The deprecated embedded form cannot be verified.

@@ -78,6 +78,10 @@ Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
   requests and latency per site and route, upstream responses, failures,
   latency and health per target, connections, TLS handshake errors and
   snapshot swaps. Counters survive swaps.
+- Live Tap: while the control plane asks, finished requests matching its
+  filter (sites, routes, client CIDRs, sampling) are sent in batches with
+  status, timing, upstream and the requested headers, at most 100 a second;
+  without a filter the cost is one atomic load per request.
 
 Snapshots arrive as bytes and are checked against their SHA-256 hash
 before they are applied or written as the last-known-good snapshot. A

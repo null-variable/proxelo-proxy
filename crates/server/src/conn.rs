@@ -234,6 +234,11 @@ impl Conn {
             self.x.sent.status,
             self.x.started.elapsed(),
         );
+        crate::tap::record(
+            &self.x,
+            &s.id,
+            done.route.map(|r| &*s.routes[r as usize].id),
+        );
     }
 
     async fn handle_in(&mut self, active: &Active, done: &mut Done) -> KeepAlive {
