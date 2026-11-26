@@ -6,6 +6,8 @@ pushed from the control plane ([`proxelo`](https://github.com/null-variable/prox
 
 The wire format between the two lives in
 [`proxelo-api`](https://github.com/null-variable/proxelo-api).
+How the control plane, the snapshot and the proxy fit together is described
+in [proxelo's architecture overview](https://github.com/null-variable/proxelo/blob/main/docs/architecture.md).
 
 ## Status
 
