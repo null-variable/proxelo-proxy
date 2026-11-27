@@ -58,6 +58,12 @@ Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
 - OpenID Connect sign-in (authorization code flow with PKCE, provider
   discovery, ID token verification) with a signed session cookie, logout,
   and the `$oidc_sub` and `$oidc_email` variables.
+- proxy-wasm (ABI 0.2) filters on wasmtime, such as the Coraza WAF:
+  request headers and buffered body, response headers, local responses
+  and properties. Modules are sent by hash, checked and stored under the
+  data directory with their compiled code; started instances are pooled
+  and carried across snapshots. Memory and per-callback time limits, no
+  file system or network, and fail open or closed per filter.
   `real_ip` per site from trusted proxies, and `limit_rate` with
   `limit_rate_after` on responses.
 - TLS with OpenSSL 3: protocol versions, ciphers, groups, session cache and
