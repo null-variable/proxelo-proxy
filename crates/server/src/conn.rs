@@ -294,6 +294,13 @@ impl Conn {
         let Some(listener) = active.rt.listener(self.listener) else {
             return false;
         };
+        // nginx add_header Alt-Svc 'h3=":port"' for listen ... quic.
+        if listener.http3 && self.x.tls.is_some() && !self.x.h3 && self.x.alt_svc.is_empty() {
+            self.x.alt_svc.extend_from_slice(b"Alt-Svc: h3=\":");
+            proxelo_http1::push_u64(&mut self.x.alt_svc, self.x.local.port().into());
+            self.x.alt_svc.extend_from_slice(b"\"; ma=86400\r\n");
+            self.x.reset_extra();
+        }
         // ssl_verify_client: a missing or bad certificate answers 400,
         // which error pages see as 496 or 495.
         if let Some(code) = self.x.tls.as_ref().and_then(|t| t.client_error()) {
@@ -391,7 +398,7 @@ impl Conn {
     /// Expands the configured response headers for `status`.
     pub(crate) fn extra(&mut self, ops: &HeaderOps, status: u16) {
         if ops.is_empty() {
-            self.x.resp_extra.clear();
+            self.x.reset_extra();
         } else {
             headers::response(&mut self.x, ops, status);
         }

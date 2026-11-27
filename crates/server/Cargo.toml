@@ -11,6 +11,10 @@ publish.workspace = true
 arc-swap.workspace = true
 bytes.workspace = true
 h2.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+quinn.workspace = true
+rustls.workspace = true
 http.workspace = true
 openssl.workspace = true
 tokio-openssl.workspace = true
@@ -29,6 +33,7 @@ brotli = { version = "9", default-features = false, features = ["std"] }
 zstd = { version = "0.14", default-features = false }
 
 [dev-dependencies]
+http.workspace = true
 stats_alloc.workspace = true
 tokio-openssl.workspace = true
 

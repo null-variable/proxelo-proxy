@@ -296,6 +296,9 @@ pub fn validate(snap: &Snapshot) -> Result<(), LoadError> {
         if l.http2 && l.tls.is_none() {
             return field(format!("listeners[{i}].http2"), "requires tls");
         }
+        if l.http3 && l.tls.is_none() {
+            return field(format!("listeners[{i}].http3"), "requires tls");
+        }
     }
     for (i, u) in snap.upstreams.iter().enumerate() {
         if u.tls

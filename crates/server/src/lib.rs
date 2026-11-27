@@ -18,6 +18,7 @@ mod exchange;
 mod gateway;
 mod grpc;
 mod h2;
+mod h3;
 mod handoff;
 mod headers;
 mod health;
@@ -78,6 +79,8 @@ pub struct Active {
     zones: limits::Zones,
     /// Indexed like `rt.cache_zones`.
     caches: Box<[std::sync::Arc<cache::Zone>]>,
+    /// QUIC settings of HTTP/3 listeners, indexed like `rt.listeners`.
+    quic: Box<[Option<quinn::ServerConfig>]>,
 }
 
 pub struct Server {
@@ -269,6 +272,12 @@ fn build(
     let caches = cache::zones(&rt, old.map(|o| (&*o.rt, &*o.caches)));
     let tls = tls::build(&rt)?;
     let stream_tls = tls::build_streams(&rt)?;
+    let quic = rt
+        .listeners
+        .iter()
+        .enumerate()
+        .map(|(i, l)| l.http3.then(|| h3::config(&rt, i)).transpose())
+        .collect::<Result<_, _>>()?;
     let upstreams = rt
         .upstreams
         .iter()
@@ -286,6 +295,7 @@ fn build(
         upstreams,
         tls,
         stream_tls,
+        quic,
         rt,
     })
 }

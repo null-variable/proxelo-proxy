@@ -62,6 +62,8 @@ pub(crate) struct Exchange {
     pub session: Option<crate::stream::Session>,
     /// Served through HTTP/2.
     pub h2: bool,
+    /// The request came over HTTP/3.
+    pub h3: bool,
     pub started: Instant,
     /// Requests served on this connection, this one included.
     pub requests: u64,
@@ -122,6 +124,9 @@ pub(crate) struct Exchange {
     pub cache_cond: Vec<u8>,
     /// The upstream request goes out as GET (a cached HEAD).
     pub as_get_upstream: bool,
+    /// The Alt-Svc line every response of this connection carries; empty
+    /// unless the listener serves HTTP/3.
+    pub alt_svc: Vec<u8>,
 }
 
 /// Lowercases `raw` into `out` without the port and a trailing dot.
@@ -160,6 +165,7 @@ impl Exchange {
             tls: None,
             session: None,
             h2: false,
+            h3: false,
             started: Instant::now(),
             requests: 0,
             conn_id: 0,
@@ -191,6 +197,7 @@ impl Exchange {
             slice_range: Vec::new(),
             cache_cond: Vec::new(),
             as_get_upstream: false,
+            alt_svc: Vec::new(),
         }
     }
 
@@ -217,11 +224,17 @@ impl Exchange {
     /// Starts the request parsed into `req` from `head`: host, path and
     /// arguments. `Err` is the status to answer, 400 for a path that leaves
     /// the root.
+    /// Empties the extra response header lines down to the connection's.
+    pub fn reset_extra(&mut self) {
+        self.resp_extra.clear();
+        self.resp_extra.extend_from_slice(&self.alt_svc);
+    }
+
     pub fn begin(&mut self) -> Result<(), u16> {
         self.caps.clear();
         self.request_id_set = false;
         self.sent = Sent::default();
-        self.resp_extra.clear();
+        self.reset_extra();
         self.sticky_cookie.clear();
         self.peer = self.conn_peer;
         self.limited = false;

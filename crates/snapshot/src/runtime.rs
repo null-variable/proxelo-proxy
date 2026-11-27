@@ -201,6 +201,8 @@ pub struct Listener {
     pub backlog: u32,
     pub tls: Option<ListenerTls>,
     pub http2: bool,
+    /// HTTP/3 over QUIC on the same addresses (UDP).
+    pub http3: bool,
     hosts: Hosts,
     /// The site answering requests whose host matches no site. nginx uses the
     /// first server of a listen socket when none is marked default.
@@ -984,6 +986,7 @@ impl Runtime {
                 backlog: l.backlog,
                 tls,
                 http2: l.http2,
+                http3: l.http3,
                 hosts: Hosts::default(),
                 default_site: l.default_site,
             });

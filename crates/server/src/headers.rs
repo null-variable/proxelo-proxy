@@ -33,6 +33,7 @@ fn push(x: &mut Exchange, out: &mut Vec<u8>, h: &HeaderValue) {
 pub(crate) fn response(x: &mut Exchange, ops: &HeaderOps, status: u16) {
     let mut out = std::mem::take(&mut x.resp_extra);
     out.clear();
+    out.extend_from_slice(&x.alt_svc);
     let any = add_header_status(status);
     for h in ops.set.iter().chain(ops.add.iter()) {
         if any || h.always {

@@ -489,7 +489,7 @@ impl Conn {
         };
         let ops = &route.response_headers;
         if ops.is_empty() {
-            self.x.resp_extra.clear();
+            self.x.reset_extra();
         } else {
             headers::response(&mut self.x, ops, status);
         }

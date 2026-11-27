@@ -40,6 +40,8 @@ pub(crate) enum Kind {
     Http,
     Tcp,
     Udp,
+    /// HTTP/3 on a listener's address.
+    Quic,
 }
 
 impl Kind {
@@ -48,6 +50,7 @@ impl Kind {
             Self::Http => "http",
             Self::Tcp => "tcp",
             Self::Udp => "udp",
+            Self::Quic => "quic",
         }
     }
 
@@ -56,6 +59,7 @@ impl Kind {
             "http" => Some(Self::Http),
             "tcp" => Some(Self::Tcp),
             "udp" => Some(Self::Udp),
+            "quic" => Some(Self::Quic),
             _ => None,
         }
     }
@@ -168,6 +172,20 @@ impl Listeners {
                 l.backlog,
             )
         });
+        let quic = rt
+            .listeners
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.http3)
+            .map(|(i, l)| {
+                (
+                    format!("listeners[{i}].http3"),
+                    &l.addrs,
+                    Kind::Quic,
+                    l.reuse_port,
+                    l.backlog,
+                )
+            });
         let streams = rt.streams.iter().enumerate().map(|(i, s)| {
             let kind = if s.udp { Kind::Udp } else { Kind::Tcp };
             (
@@ -178,7 +196,7 @@ impl Listeners {
                 s.backlog,
             )
         });
-        for (at, addrs, kind, reuse_port, backlog) in listeners.chain(streams) {
+        for (at, addrs, kind, reuse_port, backlog) in listeners.chain(quic).chain(streams) {
             for &addr in addrs.iter() {
                 let key = (addr, kind);
                 if want.contains(&key) {
@@ -194,7 +212,7 @@ impl Listeners {
                 }
                 // One UDP socket per address: sessions are kept by client
                 // address, and SO_REUSEPORT would spread them over sockets.
-                let n = if self.per_worker && kind != Kind::Udp {
+                let n = if self.per_worker && !matches!(kind, Kind::Udp | Kind::Quic) {
                     self.workers.len()
                 } else {
                     1
@@ -203,7 +221,7 @@ impl Listeners {
                 for _ in 0..n {
                     // Sockets bound so far close when `fresh` drops.
                     let s = match kind {
-                        Kind::Udp => bind_udp(addr, reuse_port).map(Socket::Udp),
+                        Kind::Udp | Kind::Quic => bind_udp(addr, reuse_port).map(Socket::Udp),
                         _ => bind(addr, reuse_port || self.per_worker, backlog).map(Socket::Tcp),
                     };
                     match s {
@@ -254,6 +272,7 @@ impl Listeners {
                         let _ = match (kind, s) {
                             (Kind::Http, Socket::Tcp(s)) => server.accept(addr, s).await,
                             (_, Socket::Tcp(s)) => server.accept_stream(addr, s).await,
+                            (Kind::Quic, Socket::Udp(s)) => server.serve_quic(addr, s).await,
                             (_, Socket::Udp(s)) => server.serve_udp(addr, s).await,
                         };
                     })

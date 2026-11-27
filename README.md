@@ -74,6 +74,10 @@ Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
   (nginx slice: ranges of a fixed size fetched and stored apart), Range and
   conditional requests on hits, and `$upstream_cache_status`. The control
   plane purges by key, key prefix, Cache-Tag or a whole zone.
+- HTTP/3 over QUIC (`quinn` and `h3`) on TLS listeners that enable it, on
+  the same UDP address, with TLS 1.3 and the sites' certificates chosen by
+  SNI. TLS responses advertise it with Alt-Svc. Requests run through the
+  same phases as HTTP/1.1 and HTTP/2.
 - HTTP/2 through ALPN (the `h2` crate) on TLS listeners. Each stream runs
   through the same phases, proxying, logs and metrics as HTTP/1.1.
 - Response and upstream request headers set, added or removed per route

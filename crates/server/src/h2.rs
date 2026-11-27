@@ -315,7 +315,7 @@ async fn relay<R: tokio::io::AsyncRead + Unpin>(
 }
 
 /// The fields of a chunked trailer section.
-fn trailer_map(raw: &[u8]) -> http::HeaderMap {
+pub(crate) fn trailer_map(raw: &[u8]) -> http::HeaderMap {
     let mut map = http::HeaderMap::new();
     for line in raw.split(|&c| c == b'\n') {
         let line = line.strip_suffix(b"\r").unwrap_or(line);

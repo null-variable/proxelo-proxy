@@ -255,7 +255,7 @@ fn receive_sockets(s: &UnixStream) -> io::Result<Inherited> {
         let addr: SocketAddr = addr.parse().map_err(|_| bad())?;
         fcntl_setfd(&fd, FdFlags::CLOEXEC)?;
         let socket = match kind {
-            Kind::Udp => Socket::Udp(std::net::UdpSocket::from(fd)),
+            Kind::Udp | Kind::Quic => Socket::Udp(std::net::UdpSocket::from(fd)),
             Kind::Http | Kind::Tcp => Socket::Tcp(std::net::TcpListener::from(fd)),
         };
         socket.set_nonblocking()?;
