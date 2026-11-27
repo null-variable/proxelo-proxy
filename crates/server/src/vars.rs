@@ -82,6 +82,16 @@ pub(crate) fn expand_into(x: &mut Exchange, t: &Template, out: &mut Vec<u8>, log
                     out.extend_from_slice(v);
                 }
             }
+            Part::JwtClaim(name) => {
+                if let Some(j) = &x.jwt {
+                    crate::jwt::field(&j.claims, name, out);
+                }
+            }
+            Part::JwtHeader(name) => {
+                if let Some(j) = &x.jwt {
+                    crate::jwt::field(&j.header, name, out);
+                }
+            }
             Part::Lookup(i) => {
                 let (s, e) = lookup(x, *i);
                 out.extend_from_slice(&x.lookup_buf[s as usize..e as usize]);
@@ -405,6 +415,8 @@ fn var(x: &mut Exchange, v: Var, out: &mut Vec<u8>) {
         Var::ProxyHost => out.extend_from_slice(&x.proxy_host),
         Var::SliceRange => out.extend_from_slice(&x.slice_range),
         Var::UpstreamCacheStatus => out.extend_from_slice(x.cache_status),
+        Var::OidcSub => out.extend_from_slice(&x.oidc_sub),
+        Var::OidcEmail => out.extend_from_slice(&x.oidc_email),
         Var::Capture(i) => {
             if let Some(c) = x.caps.get(usize::from(i)) {
                 out.extend_from_slice(c);

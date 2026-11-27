@@ -1236,8 +1236,8 @@ dependencies = [
 
 [[package]]
 name = "proxelo-api"
-version = "0.16.0"
-source = "git+https://github.com/null-variable/proxelo-api?tag=v0.16.0#b998c78c8cd7711b079b911a4270c5a49f1363c8"
+version = "0.17.0"
+source = "git+https://github.com/null-variable/proxelo-api?tag=v0.17.0#310c7f3f7e9a57cdd9104a7e7c389578c7867f68"
 dependencies = [
  "prost",
  "protox",
@@ -1272,6 +1272,7 @@ name = "proxelo-server"
 version = "0.0.1"
 dependencies = [
  "arc-swap",
+ "base64 0.22.1",
  "bcrypt",
  "brotli",
  "bytes",
@@ -1289,6 +1290,7 @@ dependencies = [
  "quinn",
  "rustix",
  "rustls",
+ "serde_json",
  "sha-crypt",
  "socket2",
  "stats_alloc",
@@ -1301,12 +1303,14 @@ dependencies = [
 name = "proxelo-snapshot"
 version = "0.0.1"
 dependencies = [
+ "base64 0.22.1",
  "cel",
  "foldhash 0.2.0",
  "openssl",
  "pcre2",
  "prost",
  "proxelo-api",
+ "serde_json",
 ]
 
 [[package]]
@@ -1587,6 +1591,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.154"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
 ]
 
 [[package]]
@@ -2207,6 +2224,12 @@ name = "zlib-rs"
 version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa76918995d776d9dd34d371030be228d021137449771493d56e29f77e4148ac"
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zstd"

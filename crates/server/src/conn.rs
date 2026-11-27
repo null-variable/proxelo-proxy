@@ -571,7 +571,9 @@ impl Conn {
             status
         };
         reply::start(&mut self.out, wire, b"");
-        if status == 401 {
+        // The access phase's challenge, or the cookies and Location of a
+        // sign-in redirect.
+        if matches!(status, 401 | 302) {
             self.out.extend_from_slice(&self.x.auth_header);
         }
         let head = self.x.req.method == Method::Head;

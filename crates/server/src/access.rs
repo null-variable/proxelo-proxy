@@ -1,5 +1,6 @@
-//! nginx post_read and access phases: realip, allow/deny, auth_basic and
-//! auth_request (forward auth). Limits are in `limits`.
+//! nginx post_read and access phases: realip, allow/deny, auth_basic,
+//! auth_jwt, OpenID Connect and auth_request (forward auth). Limits are in
+//! `limits`.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -201,6 +202,12 @@ impl Conn {
             )?;
         }
         check(&mut self.x, a)?;
+        if let Some(j) = &a.jwt {
+            crate::jwt::check(&mut self.x, j).await?;
+        }
+        if let Some(o) = &a.oidc {
+            crate::oidc::check(&mut self.x, o).await?;
+        }
         if let Some(f) = &a.forward_auth {
             self.forward_auth(active, f).await?;
         }

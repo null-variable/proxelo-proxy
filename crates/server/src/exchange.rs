@@ -87,6 +87,11 @@ pub(crate) struct Exchange {
     /// Response header lines of the forward auth that the request sent
     /// upstream carries.
     pub auth_resp: Vec<u8>,
+    /// The token a jwt policy verified.
+    pub jwt: Option<Box<crate::jwt::Verified>>,
+    /// The signed in user of an oidc policy.
+    pub oidc_sub: Vec<u8>,
+    pub oidc_email: Vec<u8>,
     /// Response throttling of the route that serves the request.
     pub bandwidth: Option<proxelo_snapshot::Bandwidth>,
     /// Bytes written to the client so far, for the bandwidth limit.
@@ -178,6 +183,9 @@ impl Exchange {
             rate_held: Vec::new(),
             auth_header: Vec::new(),
             auth_resp: Vec::new(),
+            jwt: None,
+            oidc_sub: Vec::new(),
+            oidc_email: Vec::new(),
             bandwidth: None,
             paced: 0,
             lookups: std::sync::Arc::from([]),
@@ -240,6 +248,9 @@ impl Exchange {
         self.limited = false;
         self.auth_header.clear();
         self.auth_resp.clear();
+        self.jwt = None;
+        self.oidc_sub.clear();
+        self.oidc_email.clear();
         self.bandwidth = None;
         self.paced = 0;
         self.lookup_vals.clear();

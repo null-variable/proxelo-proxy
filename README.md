@@ -51,6 +51,13 @@ Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
   per key (`limit_conn`), zones kept across swaps; allow/deny by address;
   basic auth with htpasswd hashes (bcrypt, `$apr1$`, `$1$`, `$5$`, `$6$`,
   `{SHA}`, `{SSHA}`); forward auth to an upstream as `auth_request`.
+- JWT as nginx `auth_jwt`: HMAC, RSA (PKCS#1 and PSS), ECDSA and EdDSA
+  signatures against inline or fetched JSON Web Key Sets (refetched on an
+  unknown `kid`), `exp`/`nbf` with leeway, issuer and audience, and the
+  `$jwt_claim_<name>` and `$jwt_header_<name>` variables.
+- OpenID Connect sign-in (authorization code flow with PKCE, provider
+  discovery, ID token verification) with a signed session cookie, logout,
+  and the `$oidc_sub` and `$oidc_email` variables.
   `real_ip` per site from trusted proxies, and `limit_rate` with
   `limit_rate_after` on responses.
 - TLS with OpenSSL 3: protocol versions, ciphers, groups, session cache and

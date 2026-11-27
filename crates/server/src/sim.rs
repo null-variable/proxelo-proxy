@@ -133,6 +133,9 @@ pub fn simulate(rt: &Runtime, r: &HttpRequest) -> SimResult {
                     if a.forward_auth.is_some() {
                         t.push("forward auth not simulated".into());
                     }
+                    if a.jwt.is_some() || a.oidc.is_some() {
+                        t.push("jwt and oidc not simulated".into());
+                    }
                 }
                 let result = crate::access::check(&mut x, a);
                 phases.accessed(r, result);

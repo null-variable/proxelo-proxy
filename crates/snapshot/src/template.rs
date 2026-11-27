@@ -94,6 +94,9 @@ pub enum Var {
     /// `$upstream_cache_status`: MISS, HIT, EXPIRED, STALE, UPDATING,
     /// REVALIDATED or BYPASS.
     UpstreamCacheStatus,
+    /// `$oidc_sub` and `$oidc_email` of the signed in user.
+    OidcSub,
+    OidcEmail,
     /// `$0`..`$9`: groups of the last regex that matched.
     Capture(u8),
 }
@@ -111,6 +114,9 @@ pub enum Part {
     /// `$auth_resp_<name>`: a header of the forward auth response, with the
     /// lowercase name using `-`.
     AuthResp(Box<[u8]>),
+    /// `$jwt_claim_<name>` and `$jwt_header_<name>` of the verified token.
+    JwtClaim(Box<[u8]>),
+    JwtHeader(Box<[u8]>),
     /// A lookup variable (map, geo, split_clients), by index into
     /// `Runtime::lookups`.
     Lookup(u32),
@@ -275,6 +281,8 @@ fn var(name: &str) -> Option<Part> {
         "proxy_host" => Var::ProxyHost,
         "slice_range" => Var::SliceRange,
         "upstream_cache_status" => Var::UpstreamCacheStatus,
+        "oidc_sub" => Var::OidcSub,
+        "oidc_email" => Var::OidcEmail,
         _ => {
             let header = |h: &str| -> Box<[u8]> {
                 h.bytes()
@@ -289,6 +297,12 @@ fn var(name: &str) -> Option<Part> {
             }
             if let Some(h) = name.strip_prefix("auth_resp_").filter(|h| !h.is_empty()) {
                 return Some(Part::AuthResp(header(h)));
+            }
+            if let Some(c) = name.strip_prefix("jwt_claim_").filter(|c| !c.is_empty()) {
+                return Some(Part::JwtClaim(c.as_bytes().into()));
+            }
+            if let Some(c) = name.strip_prefix("jwt_header_").filter(|c| !c.is_empty()) {
+                return Some(Part::JwtHeader(c.as_bytes().into()));
             }
             if let Some(a) = name.strip_prefix("arg_").filter(|a| !a.is_empty()) {
                 return Some(Part::Arg(a.as_bytes().into()));

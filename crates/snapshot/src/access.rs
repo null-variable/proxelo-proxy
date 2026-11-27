@@ -145,6 +145,8 @@ pub struct Access {
     pub conn_limits: Box<[u32]>,
     pub rules: Box<[AccessRule]>,
     pub basic_auth: Option<BasicAuth>,
+    pub jwt: Option<crate::auth::Jwt>,
+    pub oidc: Option<crate::auth::Oidc>,
     pub forward_auth: Option<ForwardAuth>,
 }
 
@@ -154,6 +156,8 @@ impl Access {
             && self.conn_limits.is_empty()
             && self.rules.is_empty()
             && self.basic_auth.is_none()
+            && self.jwt.is_none()
+            && self.oidc.is_none()
             && self.forward_auth.is_none()
     }
 
@@ -327,6 +331,12 @@ pub(crate) fn access(
         conn_limits: a.conn_limits.clone().into(),
         rules,
         basic_auth,
+        jwt: a
+            .jwt
+            .as_ref()
+            .map(|j| crate::auth::jwt(j, names))
+            .transpose()?,
+        oidc: a.oidc.as_ref().map(crate::auth::oidc).transpose()?,
         forward_auth,
     })
 }
