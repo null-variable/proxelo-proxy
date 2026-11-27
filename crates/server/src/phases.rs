@@ -192,6 +192,7 @@ impl<'s> Phases<'s> {
         self.pages = &site.error_pages;
         self.route = None;
         x.compression = site.compression;
+        x.filters.clone_from(&site.filters);
         match self.rewrite(x, &site.rewrites) {
             Ok(Rw::Continue | Rw::Changed) => match &site.ret {
                 Some(r) => self.ret(x, r),
@@ -209,10 +210,16 @@ impl<'s> Phases<'s> {
         self.route = Some(r);
         self.pages = &route.error_pages;
         x.compression = route.compression;
+        x.filters.clone_from(&route.filters);
         self.note(|| {
             let kind = if named { "named route" } else { "route" };
             format!("{kind} {}", route.id)
         });
+        // nginx `internal`: only internal redirects reach the route.
+        if route.internal && !x.uri_changed {
+            self.note(|| "internal route".into());
+            return Err(Next::Error(404));
+        }
         match self.rewrite(x, &route.rewrites) {
             // A named route is never searched for, so `last` cannot leave it.
             Ok(Rw::Last | Rw::Changed) if !named => {

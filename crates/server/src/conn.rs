@@ -338,6 +338,10 @@ impl Conn {
         loop {
             let outcome = phases.run(&mut self.x);
             done.route = phases.route;
+            crate::filter::userid_lines(&mut self.x);
+            if !self.x.uid_lines.is_empty() {
+                self.x.reset_extra();
+            }
             let ops = match phases.route {
                 Some(r) => &site.routes[r as usize].response_headers,
                 None => &site.response_headers,
@@ -443,10 +447,14 @@ impl Conn {
     /// Writes `out` and records what was sent, encoded when the response
     /// is to be compressed.
     pub(crate) async fn send(&mut self, keep: KeepAlive, status: u16, body: usize) -> KeepAlive {
+        let (body, frame, filter_close) = self.filter_buffered(status, body);
         let head = self.out.len() - body;
         // Encode first: `&&` would skip it for responses that close anyway.
-        let close = self.encode_buffered(status, body);
-        let keep = keep && !close;
+        let (close, encoded) = self.encode_buffered(status, body);
+        if frame && !encoded {
+            self.frame_buffered(body);
+        }
+        let keep = keep && !close && !filter_close;
         self.x.sent.status = status;
         self.x.sent.bytes = self.out.len() as u64;
         self.x.sent.body_bytes = (self.out.len() - head.min(self.out.len())) as u64;

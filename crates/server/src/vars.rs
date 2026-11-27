@@ -417,6 +417,8 @@ fn var(x: &mut Exchange, v: Var, out: &mut Vec<u8>) {
         Var::UpstreamCacheStatus => out.extend_from_slice(x.cache_status),
         Var::OidcSub => out.extend_from_slice(&x.oidc_sub),
         Var::OidcEmail => out.extend_from_slice(&x.oidc_email),
+        Var::UidGot => crate::filter::uid_var(x, false, out),
+        Var::UidSet => crate::filter::uid_var(x, true, out),
         Var::Capture(i) => {
             if let Some(c) = x.caps.get(usize::from(i)) {
                 out.extend_from_slice(c);

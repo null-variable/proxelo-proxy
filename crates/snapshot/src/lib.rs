@@ -9,6 +9,7 @@ mod auth;
 mod cache;
 mod compression;
 mod cond;
+mod filters;
 mod lookup;
 mod runtime;
 mod template;
@@ -24,14 +25,17 @@ pub use auth::{Jwt, Key, KeyKind, Oidc, SessionKey, Url, parse_jwks};
 pub use cache::{Cache, CacheZone, Ignore as CacheIgnore, Stale, Valid};
 pub use compression::{Compression, Encoding, Proxied, StaticGz};
 pub use cond::{Cond, Expr, Facts};
+pub use filters::{
+    Addition, Charset, Filters, Mirror, Recode, Ssi, SubFilter, Types, Userid, UseridMode,
+};
 pub use lookup::{GeoTable, Lookup, MapTable, SplitTable, Table, murmur2};
 pub use runtime::{
     AccessLog, Action, Autoindex, AutoindexFormat, Balancing, BuildError, Captures, Certificate,
     CheckKind, ClientAuth, ClientAuthMode, Dav, ErrorPage, ErrorTarget, Fallback, Gateway,
     GatewayParam, GatewayProtocol, HeaderOps, HeaderValue, HealthCheck, Listener, ListenerTls,
-    MatchError, Memcached, NextOn, Pattern, Proxy, Resolved, Return, Rewrite, RewriteFlag, Route,
-    Runtime, Site, StaticHandlers, Sticky, StickyCookie, Stream, StreamRoute, Target, TryFiles,
-    Upstream, UpstreamTls, discovered_key,
+    MatchError, Memcached, Mp4, NextOn, Pattern, Proxy, Resolved, Return, Rewrite, RewriteFlag,
+    Route, Runtime, Site, StaticHandlers, Sticky, StickyCookie, Stream, StreamRoute, Target,
+    TryFiles, Upstream, UpstreamTls, discovered_key,
 };
 pub use template::{Part, Template, Var};
 pub use wasm::{WasmFilter, WasmModule, hex};

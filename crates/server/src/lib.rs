@@ -18,6 +18,7 @@ mod dav;
 pub mod drain;
 mod exchange;
 mod fetch;
+mod filter;
 mod gateway;
 mod grpc;
 mod h2;

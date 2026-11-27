@@ -316,7 +316,7 @@ impl Coder {
 }
 
 /// Finds a header's value in a head built as complete lines.
-fn head_value<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+pub(crate) fn head_value<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     head.split(|&c| c == b'\n').skip(1).find_map(|line| {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         let colon = line.iter().position(|&c| c == b':')?;
@@ -324,49 +324,6 @@ fn head_value<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
             .eq_ignore_ascii_case(name)
             .then(|| line[colon + 1..].trim_ascii())
     })
-}
-
-/// Rewrites a complete head (ending with the empty line) for an encoded
-/// body: no Content-Length or Accept-Ranges, a weak ETag, and the given
-/// lines added. `close` turns Connection into close.
-pub(crate) fn rewrite_head(head: &[u8], add: &[&[u8]], close: bool, out: &mut Vec<u8>) {
-    let body = head.strip_suffix(b"\r\n").unwrap_or(head);
-    for line in body.split_inclusive(|&c| c == b'\n') {
-        let name_end = line.iter().position(|&c| c == b':').unwrap_or(0);
-        let name = &line[..name_end];
-        if name.eq_ignore_ascii_case(b"content-length")
-            || name.eq_ignore_ascii_case(b"accept-ranges")
-            || (close && name.eq_ignore_ascii_case(b"connection"))
-        {
-            continue;
-        }
-        if name.eq_ignore_ascii_case(b"etag") {
-            weak_etag(line, name_end, out);
-            continue;
-        }
-        out.extend_from_slice(line);
-    }
-    for a in add {
-        out.extend_from_slice(a);
-    }
-    if close {
-        out.extend_from_slice(b"Connection: close\r\n");
-    }
-    out.extend_from_slice(b"\r\n");
-}
-
-/// nginx ngx_http_weak_etag: a strong ETag becomes W/; anything that is
-/// not a quoted tag is dropped.
-fn weak_etag(line: &[u8], name_end: usize, out: &mut Vec<u8>) {
-    let v = line[name_end + 1..].trim_ascii();
-    if v.starts_with(b"W/") {
-        out.extend_from_slice(line);
-    } else if v.starts_with(b"\"") {
-        out.extend_from_slice(&line[..name_end]);
-        out.extend_from_slice(b": W/");
-        out.extend_from_slice(v);
-        out.extend_from_slice(b"\r\n");
-    }
 }
 
 /// Appends `data` as one chunk.
@@ -395,10 +352,11 @@ impl crate::conn::Conn {
 
     /// Encodes a complete response built in `out` (`body` bytes after the
     /// head) when the compression settings say so, and adds Vary. Returns
-    /// whether the connection must close afterwards.
-    pub(crate) fn encode_buffered(&mut self, status: u16, body: usize) -> bool {
+    /// whether the connection must close afterwards and whether the body
+    /// was encoded.
+    pub(crate) fn encode_buffered(&mut self, status: u16, body: usize) -> (bool, bool) {
         let Some(comps) = self.compression() else {
-            return false;
+            return (false, false);
         };
         let c = &comps[self.x.compression.unwrap_or(0) as usize];
         let head_end = self.out.len() - body;
@@ -418,7 +376,7 @@ impl crate::conn::Conn {
         let mut vary = false;
         let enc = choose(&self.x, c, &facts, &mut vary);
         if enc.is_none() && !vary {
-            return false;
+            return (false, false);
         }
         let head_only = self.x.req.method == proxelo_http1::Method::Head;
         let chunked = chunked_for(&self.x);
@@ -446,10 +404,17 @@ impl crate::conn::Conn {
                 } else {
                     b""
                 };
-                rewrite_head(
-                    &self.out[..head_end],
-                    &[vary_line, &ce, te],
+                let edit = crate::filter::Edit {
+                    ctype: None,
+                    reframe: true,
+                    etag: crate::filter::Etag::Weak,
+                    drop_modified: false,
                     close,
+                };
+                crate::filter::edit_head(
+                    &self.out[..head_end],
+                    &edit,
+                    &[vary_line, &ce, te],
                     &mut out,
                 );
                 if !head_only {
@@ -473,7 +438,7 @@ impl crate::conn::Conn {
         }
         std::mem::swap(&mut self.out, &mut out);
         self.zout = out;
-        close
+        (close, enc.is_some())
     }
 }
 

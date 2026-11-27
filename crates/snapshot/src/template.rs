@@ -97,6 +97,10 @@ pub enum Var {
     /// `$oidc_sub` and `$oidc_email` of the signed in user.
     OidcSub,
     OidcEmail,
+    /// `$uid_got` and `$uid_set`: the userid cookie the client sent and the
+    /// one the response sets, as the name, `=` and 32 hex digits.
+    UidGot,
+    UidSet,
     /// `$0`..`$9`: groups of the last regex that matched.
     Capture(u8),
 }
@@ -283,6 +287,8 @@ fn var(name: &str) -> Option<Part> {
         "upstream_cache_status" => Var::UpstreamCacheStatus,
         "oidc_sub" => Var::OidcSub,
         "oidc_email" => Var::OidcEmail,
+        "uid_got" => Var::UidGot,
+        "uid_set" => Var::UidSet,
         _ => {
             let header = |h: &str| -> Box<[u8]> {
                 h.bytes()

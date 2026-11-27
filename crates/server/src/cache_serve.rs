@@ -401,8 +401,25 @@ impl Conn {
             (Answer::Partial, _) if ranges.parts().len() == 1 => 206,
             _ => status,
         };
+        let mut plan = if status == 304 || status == 416 {
+            crate::filter::Plan::default()
+        } else {
+            let ct = e.header(b"content-type").unwrap_or_default().to_vec();
+            let enc = e.header(b"content-encoding").is_some_and(|v| !v.is_empty());
+            crate::filter::plan(&mut self.x, status, &ct, Some(len), enc)
+        };
+        // A body the filters change is sent whole.
+        let (status, ranges) = if plan.reframe && status == 206 {
+            (self.x.status(e.status), range::Ranges::WHOLE)
+        } else {
+            (status, ranges)
+        };
         let parts: &[Span] = if status == 206 { ranges.parts() } else { &[] };
-        let keep = self.x.req.keep_alive;
+        let chunked = plan.reframe && crate::compress::chunked_for(&self.x);
+        let head_only = self.x.req.method == Method::Head;
+        let keep = self.x.req.keep_alive && (!plan.reframe || chunked || head_only);
+        let etag_mode = plan.etag(false);
+        let ctype = plan.ctype.take();
         self.extra(ops, status);
         let ops_extra = std::mem::take(&mut self.x.resp_extra);
         let out = &mut self.out;
@@ -411,6 +428,26 @@ impl Conn {
         for line in e.head.split_inclusive(|&c| c == b'\n') {
             let name = line.split(|&c| c == b':').next().unwrap_or_default();
             if !ops.is_empty() && ops.drops(name) {
+                continue;
+            }
+            let is = |n: &[u8]| name.eq_ignore_ascii_case(n);
+            if (plan.reframe && is(b"accept-ranges"))
+                || (plan.drop_validators && is(b"last-modified"))
+            {
+                continue;
+            }
+            if is(b"etag") && etag_mode != crate::filter::Etag::Keep {
+                if etag_mode == crate::filter::Etag::Weak {
+                    crate::filter::weak_etag(line, name.len(), out);
+                }
+                continue;
+            }
+            if is(b"content-type")
+                && let Some(ct) = &ctype
+            {
+                out.extend_from_slice(b"Content-Type: ");
+                out.extend_from_slice(ct);
+                out.extend_from_slice(b"\r\n");
                 continue;
             }
             if status == 304 {
@@ -440,7 +477,11 @@ impl Conn {
             push_u64(out, len);
             out.extend_from_slice(b"\r\n");
         }
-        if status != 304 {
+        if plan.reframe {
+            if chunked && !head_only {
+                out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+            }
+        } else if status != 304 {
             out.extend_from_slice(b"Content-Length: ");
             push_u64(out, body);
             out.extend_from_slice(b"\r\n");
@@ -449,7 +490,7 @@ impl Conn {
             out.extend_from_slice(b"Content-Range: bytes ");
             range::push_span(out, *one, len);
             out.extend_from_slice(b"\r\n");
-        } else if status == 200 && e.header(b"accept-ranges").is_none() {
+        } else if status == 200 && !plan.reframe && e.header(b"accept-ranges").is_none() {
             out.extend_from_slice(b"Accept-Ranges: bytes\r\n");
         }
         reply::connection(out, keep, &ops_extra);
@@ -462,6 +503,17 @@ impl Conn {
         }
         if keep && self.pump_body(crate::conn::Sink::Drop).await.is_err() {
             return Some(false);
+        }
+        if plan.reframe {
+            self.x.sent.bytes = 0;
+            let span = Span {
+                start: e.body_offset,
+                end: e.body_offset + len,
+            };
+            let ok = self
+                .send_filtered(&mut file, span, plan.chain(None), chunked)
+                .await;
+            return Some(ok && keep);
         }
         self.x.sent.bytes += body;
         self.x.sent.body_bytes = body;

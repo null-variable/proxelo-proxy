@@ -134,6 +134,12 @@ pub(crate) struct Exchange {
     pub alt_svc: Vec<u8>,
     /// Rule IDs proxy-wasm filters logged as matching.
     pub waf_rules: Vec<u32>,
+    /// The response filters of the route (or site) now answering.
+    pub filters: Option<std::sync::Arc<proxelo_snapshot::Filters>>,
+    /// The userid cookie of this request.
+    pub uid: crate::filter::Uid,
+    /// Its Set-Cookie and P3P lines, in every response head.
+    pub uid_lines: Vec<u8>,
 }
 
 /// Lowercases `raw` into `out` without the port and a trailing dot.
@@ -209,6 +215,9 @@ impl Exchange {
             as_get_upstream: false,
             alt_svc: Vec::new(),
             waf_rules: Vec::new(),
+            filters: None,
+            uid: crate::filter::Uid::default(),
+            uid_lines: Vec::new(),
         }
     }
 
@@ -239,6 +248,7 @@ impl Exchange {
     pub fn reset_extra(&mut self) {
         self.resp_extra.clear();
         self.resp_extra.extend_from_slice(&self.alt_svc);
+        self.resp_extra.extend_from_slice(&self.uid_lines);
     }
 
     pub fn begin(&mut self) -> Result<(), u16> {
@@ -255,6 +265,9 @@ impl Exchange {
         self.oidc_sub.clear();
         self.oidc_email.clear();
         self.waf_rules.clear();
+        self.filters = None;
+        self.uid.reset();
+        self.uid_lines.clear();
         self.bandwidth = None;
         self.paced = 0;
         self.lookup_vals.clear();

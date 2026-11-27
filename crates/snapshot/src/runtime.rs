@@ -20,6 +20,7 @@ use crate::access::{self, Access, Bandwidth, ConnZone, RateZone, RealIp};
 use crate::cache::{self, Cache, CacheZone};
 use crate::compression::{self, Compression};
 use crate::cond::{Cond, Facts};
+use crate::filters::{self, Filters, Mirror};
 use crate::lookup::{self, Lookup};
 use crate::template::Template;
 
@@ -359,6 +360,7 @@ pub struct Site {
     pub real_ip: Option<RealIp>,
     /// Index into `Runtime::compressions` for responses without a route.
     pub compression: Option<u32>,
+    pub filters: Option<Arc<Filters>>,
 }
 
 #[derive(Debug)]
@@ -376,6 +378,10 @@ pub struct Route {
     /// Index into `Runtime::compressions`.
     pub compression: Option<u32>,
     pub cache: Option<Box<Cache>>,
+    pub filters: Option<Arc<Filters>>,
+    /// Reached only by internal redirects and subrequests.
+    pub internal: bool,
+    pub mirror: Option<Box<Mirror>>,
     children: Option<Level>,
 }
 
@@ -536,6 +542,15 @@ pub struct StaticHandlers {
     pub random_index: bool,
     pub dav: Option<Dav>,
     pub flv: bool,
+    pub mp4: Option<Mp4>,
+}
+
+/// nginx mp4 settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mp4 {
+    /// Largest moov atom read.
+    pub max_buffer: u64,
+    pub start_key_frame: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1099,6 +1114,7 @@ impl Runtime {
                     .transpose()
                     .map_err(|(f, e)| b.err(format!("real_ip.{f}"), e))?,
                 compression: b.compression(site.compression.as_ref(), "compression")?,
+                filters: b.filters(site.filters.as_ref(), "filters")?,
                 routes: b.routes.into(),
             });
         }
@@ -1359,6 +1375,17 @@ impl SiteBuilder<'_> {
         Ok(Some(self.compressions.len() as u32 - 1))
     }
 
+    fn filters(
+        &self,
+        f: Option<&ir::Filters>,
+        at: &str,
+    ) -> Result<Option<Arc<Filters>>, BuildError> {
+        let Some(f) = f else { return Ok(None) };
+        filters::build(f, self.names)
+            .map(|f| Some(Arc::new(f)))
+            .map_err(|(field, e)| self.err(format!("{at}.{field}"), e))
+    }
+
     fn level(&mut self, routes: &[ir::Route], field: &str) -> Result<Level, BuildError> {
         let mut exact: Map<Vec<u32>> = Map::default();
         let mut prefixes: Vec<(Prefix, Vec<u32>)> = Vec::new();
@@ -1472,6 +1499,14 @@ impl SiteBuilder<'_> {
                             access: if d.access == 0 { 0o600 } else { d.access },
                         }),
                         flv: st.flv,
+                        mp4: st.mp4.as_ref().map(|m| Mp4 {
+                            max_buffer: if m.max_buffer_size == 0 {
+                                10 << 20
+                            } else {
+                                m.max_buffer_size.into()
+                            },
+                            start_key_frame: m.start_key_frame,
+                        }),
                     }),
                 }
             }
@@ -1531,6 +1566,14 @@ impl SiteBuilder<'_> {
                 .map(|c| cache::build(c, self.cache_zones, self.names).map(Box::new))
                 .transpose()
                 .map_err(|(f, e)| self.err(format!("{at}.cache.{f}"), e))?,
+            filters: self.filters(route.filters.as_ref(), &format!("{at}.filters"))?,
+            internal: route.internal,
+            mirror: route
+                .mirror
+                .as_ref()
+                .map(|m| filters::mirror(m).map(Box::new))
+                .transpose()
+                .map_err(|(f, e)| self.err(format!("{at}.mirror.{f}"), e))?,
             children: None,
         })
     }

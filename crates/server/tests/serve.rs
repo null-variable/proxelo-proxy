@@ -697,3 +697,126 @@ fn apply_opens_and_closes_listeners() {
     let _ = held.read_to_end(&mut rest);
     assert!(rest.is_empty(), "{:?}", String::from_utf8_lossy(&rest));
 }
+
+/// Decodes a chunked body as the test reader returns it.
+fn dechunk(mut b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let line = b.windows(2).position(|w| w == b"\r\n").unwrap();
+        let n = usize::from_str_radix(std::str::from_utf8(&b[..line]).unwrap(), 16).unwrap();
+        b = &b[line + 2..];
+        if n == 0 {
+            return out;
+        }
+        out.extend_from_slice(&b[..n]);
+        b = &b[n + 2..];
+    }
+}
+
+#[test]
+fn response_filters() {
+    use path_match::Kind::Prefix;
+    let root = std::env::temp_dir().join(format!("proxelo-filters-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("page.html"), "<p>Hello hello WORLD</p>").unwrap();
+    std::fs::write(root.join("koi.txt"), "\u{416}x").unwrap();
+    let mut table = vec![0u32; 256];
+    table[0xf6] = 0x416;
+    let mut static_route = route(Prefix, "/", static_root(&root));
+    static_route.filters = Some(ir::Filters {
+        sub: Some(ir::SubFilter {
+            pairs: vec![ir::SubPair {
+                r#match: "hello".into(),
+                replacement: "bye $arg_n".into(),
+            }],
+            all: true,
+            ..Default::default()
+        }),
+        charset: Some(ir::Charset {
+            charset: "koi8-r".into(),
+            source: "utf-8".into(),
+            types: vec!["text/plain".into()],
+            recode: Some(ir::charset::Recode::FromUtf8(ir::CharsetCodes {
+                code_points: table,
+            })),
+            ..Default::default()
+        }),
+        userid: Some(ir::Userid {
+            mode: ir::userid::Mode::On.into(),
+            expires_max: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let mut internal = route(Prefix, "/hidden/", static_root(&root));
+    internal.internal = true;
+    let up = canned(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 11\r\nETag: \"x\"\r\n\r\nsay hello!\n");
+    let mut proxied = route(Prefix, "/up/", proxy(0));
+    proxied.filters = Some(ir::Filters {
+        sub: Some(ir::SubFilter {
+            pairs: vec![ir::SubPair {
+                r#match: "HELLO".into(),
+                replacement: "hi".into(),
+            }],
+            last_modified: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let (_, addr) = start(&snapshot(
+        vec![static_route, internal, proxied],
+        vec![upstream(&[up], 0)],
+    ));
+    let host = "Host: example.com\r\n";
+
+    let (h, b) = get(addr, &format!("GET /page.html?n=1 HTTP/1.1\r\n{host}\r\n"));
+    assert_eq!(status(&h), 200, "{h}");
+    assert!(h.contains("Transfer-Encoding: chunked\r\n"), "{h}");
+    assert!(
+        !h.contains("Content-Length") && !h.contains("ETag") && !h.contains("Last-Modified"),
+        "{h}"
+    );
+    assert!(!h.contains("Accept-Ranges"), "{h}");
+    assert_eq!(dechunk(&b), b"<p>bye 1 bye 1 WORLD</p>");
+    let cookie = h
+        .lines()
+        .find_map(|l| l.strip_prefix("Set-Cookie: uid="))
+        .expect("userid cookie");
+    assert!(
+        cookie.ends_with("; expires=Thu, 31-Dec-37 23:55:55 GMT; path=/"),
+        "{cookie}"
+    );
+    let value = &cookie[..cookie.find(';').unwrap()];
+    assert_eq!(value.len(), 24, "{value}");
+
+    // The client's cookie is kept, not set again.
+    let (h, _) = get(
+        addr,
+        &format!("GET /page.html HTTP/1.1\r\n{host}Cookie: uid={value}\r\n\r\n"),
+    );
+    assert!(!h.contains("Set-Cookie"), "{h}");
+
+    let (h, b) = get(addr, &format!("GET /koi.txt HTTP/1.1\r\n{host}\r\n"));
+    assert!(
+        h.contains("Content-Type: text/plain; charset=koi8-r\r\n"),
+        "{h}"
+    );
+    assert_eq!(dechunk(&b), b"\xf6x");
+
+    assert_eq!(
+        status(
+            &get(
+                addr,
+                &format!("GET /hidden/page.html HTTP/1.1\r\n{host}\r\n")
+            )
+            .0
+        ),
+        404
+    );
+
+    let (h, b) = get(addr, &format!("GET /up/ HTTP/1.1\r\n{host}\r\n"));
+    assert_eq!(status(&h), 200, "{h}");
+    assert!(h.contains("ETag: W/\"x\"\r\n"), "{h}");
+    assert!(!h.contains("Content-Length"), "{h}");
+    assert_eq!(dechunk(&b), b"say hi!\n");
+}

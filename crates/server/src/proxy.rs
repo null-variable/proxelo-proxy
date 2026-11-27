@@ -505,21 +505,18 @@ impl Conn {
         } else {
             headers::response(&mut self.x, ops, status);
         }
-        // Compression or gunzip of the body changes its framing: it goes
-        // out chunked to HTTP/1.1 clients and ends with the connection for
-        // HTTP/1.0 ones.
-        let (mut coder, vary) = self.response_coder(status, mode);
+        let mut plan = self.filter_plan(status, mode);
+        // Compression, gunzip or a filter that changes the body changes its
+        // framing: it goes out chunked to HTTP/1.1 clients and ends with the
+        // connection for HTTP/1.0 ones.
+        let (mut coder, vary) = self.response_coder(status, mode, plan.reframe);
         let coded = coder.as_ref().map(|(_, gunzip)| *gunzip);
-        let mode = match (coded, mode) {
-            (None, m) => m,
-            (Some(_), Mode::None) => Mode::None,
-            (Some(_), m) => {
-                if !compress::chunked_for(&self.x) {
-                    keep = false;
-                }
-                m
-            }
-        };
+        let reframe = coded.is_some() || plan.reframe;
+        if reframe && mode != Mode::None && !compress::chunked_for(&self.x) {
+            keep = false;
+        }
+        let etag = plan.etag(coded.is_some());
+        let ctype = plan.ctype.take();
         let out = &mut self.out;
         out.clear();
         if self.x.err_status != 0 {
@@ -544,14 +541,29 @@ impl Conn {
                 continue;
             }
             let value = h.value.get(&self.ubuf.data);
-            if let Some(gunzip) = coded {
-                if h.kind == HeaderKind::ContentLength
-                    || name.eq_ignore_ascii_case(b"accept-ranges")
-                    || (gunzip && name.eq_ignore_ascii_case(b"content-encoding"))
-                {
-                    continue;
-                }
-                if name.eq_ignore_ascii_case(b"etag") {
+            if reframe
+                && (h.kind == HeaderKind::ContentLength
+                    || name.eq_ignore_ascii_case(b"accept-ranges"))
+            {
+                continue;
+            }
+            if coded == Some(true) && name.eq_ignore_ascii_case(b"content-encoding") {
+                continue;
+            }
+            if plan.drop_validators && name.eq_ignore_ascii_case(b"last-modified") {
+                continue;
+            }
+            if let Some(ct) = &ctype
+                && name.eq_ignore_ascii_case(b"content-type")
+            {
+                out.extend_from_slice(name);
+                out.extend_from_slice(b": ");
+                out.extend_from_slice(ct);
+                out.extend_from_slice(b"\r\n");
+                continue;
+            }
+            if etag != crate::filter::Etag::Keep && name.eq_ignore_ascii_case(b"etag") {
+                if etag == crate::filter::Etag::Weak {
                     // nginx ngx_http_weak_etag.
                     let v = value.trim_ascii();
                     if v.starts_with(b"\"") {
@@ -565,8 +577,8 @@ impl Conn {
                         out.extend_from_slice(value);
                         out.extend_from_slice(b"\r\n");
                     }
-                    continue;
                 }
+                continue;
             }
             out.extend_from_slice(name);
             out.extend_from_slice(b": ");
@@ -581,9 +593,10 @@ impl Conn {
             out.extend_from_slice(k.token());
             out.extend_from_slice(b"\r\n");
         }
-        let client_chunked = match coded {
-            Some(_) => mode != Mode::None && compress::chunked_for(&self.x),
-            None => matches!(mode, Mode::Chunked | Mode::Encode),
+        let client_chunked = if reframe {
+            mode != Mode::None && compress::chunked_for(&self.x)
+        } else {
+            matches!(mode, Mode::Chunked | Mode::Encode)
         };
         if client_chunked {
             out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
@@ -608,9 +621,15 @@ impl Conn {
                 Ok(()) => self.store_body(up, mode, read_timeout).await,
                 Err(()) => Err(()),
             },
-            Some((k, _)) if mode != Mode::None => {
-                let k = k.into_coder(&std::sync::Arc::clone(&self.x.compressions));
-                self.body_coded(up, mode, read_timeout, k, client_chunked)
+            k if reframe && mode != Mode::None => {
+                let k = match k {
+                    Some((k, _)) => k
+                        .into_coder(&std::sync::Arc::clone(&self.x.compressions))
+                        .map(Some),
+                    None => Ok(None),
+                };
+                let chain = k.map(|k| plan.chain(k));
+                self.body_coded(up, mode, read_timeout, chain, client_chunked)
                     .await
             }
             _ => self.body_out(up, mode, read_timeout).await,
@@ -623,10 +642,37 @@ impl Conn {
         }
     }
 
+    /// The response filters for the upstream response.
+    fn filter_plan(&mut self, status: u16, mode: Mode) -> crate::filter::Plan {
+        if self.x.filters.is_none() {
+            return crate::filter::Plan::default();
+        }
+        let data = &self.ubuf.data;
+        let get = |want: &[u8]| {
+            self.resp
+                .headers
+                .iter()
+                .find(|h| h.name.get(data).eq_ignore_ascii_case(want))
+                .map(|h| h.value.get(data))
+        };
+        let ctype = get(b"content-type").unwrap_or_default().to_vec();
+        let encoded = get(b"content-encoding").is_some_and(|v| !v.is_empty());
+        let length = match mode {
+            Mode::Length(n) => Some(n),
+            _ => None,
+        };
+        crate::filter::plan(&mut self.x, status, &ctype, length, encoded)
+    }
+
     /// The encoder for the upstream response, `(coder, gunzip)`, and whether
     /// Vary: Accept-Encoding is added, as nginx's gzip and gunzip header
     /// filters decide.
-    fn response_coder(&self, status: u16, mode: Mode) -> (Option<(PendingCoder, bool)>, bool) {
+    fn response_coder(
+        &self,
+        status: u16,
+        mode: Mode,
+        filtered: bool,
+    ) -> (Option<(PendingCoder, bool)>, bool) {
         let Some(c) = self
             .x
             .compression
@@ -655,6 +701,7 @@ impl Conn {
             );
         }
         let length = match mode {
+            _ if filtered => None,
             Mode::Length(n) => Some(n),
             Mode::None => Some(0),
             _ => None,
@@ -683,7 +730,7 @@ impl Conn {
         up: &mut S,
         mode: Mode,
         t: Duration,
-        coder: std::io::Result<compress::Coder>,
+        coder: std::io::Result<crate::filter::Chain>,
         chunked: bool,
     ) -> Result<bool, ()> {
         let mut coder = coder.map_err(|_| ())?;
