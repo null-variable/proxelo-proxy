@@ -232,3 +232,78 @@ fn expired_entry_is_revalidated() {
     assert_eq!(hits.load(Ordering::SeqCst), 2);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// An upstream serving `body` with Range support, counting requests.
+fn ranged(body: &'static [u8]) -> (SocketAddr, Arc<AtomicUsize>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let n = hits.clone();
+    thread::spawn(move || {
+        for s in l.incoming() {
+            let mut s = s.unwrap();
+            let n = n.clone();
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut b = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut b) {
+                        Ok(k) if k > 0 => buf.extend_from_slice(&b[..k]),
+                        _ => return,
+                    }
+                }
+                n.fetch_add(1, Ordering::SeqCst);
+                let req = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+                let r = req
+                    .split("\r\n")
+                    .find_map(|l| l.strip_prefix("range: bytes="))
+                    .unwrap();
+                let (a, z) = r.split_once('-').unwrap();
+                let a: usize = a.parse().unwrap();
+                let z = z.parse::<usize>().unwrap().min(body.len() - 1);
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nETag: \"e\"\r\nContent-Range: bytes {a}-{z}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                    z + 1 - a
+                );
+                let _ = s.write_all(head.as_bytes());
+                let _ = s.write_all(&body[a..=z]);
+            });
+        }
+    });
+    (addr, hits)
+}
+
+#[test]
+fn slices_are_fetched_and_stored_apart() {
+    let body = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let (up, hits) = ranged(body);
+    let d = dir("slice");
+    let (addr, _s) = start(&snapshot(
+        &d,
+        up,
+        ir::Cache {
+            valid: vec![CacheValid {
+                seconds: 60,
+                statuses: vec![200, 206],
+                ..Default::default()
+            }],
+            slice: 10,
+            ..Default::default()
+        },
+    ));
+    let (h, b) = request(addr, "GET", "Range: bytes=12-14\r\n");
+    assert!(h.starts_with("HTTP/1.1 206"), "{h}");
+    assert!(h.contains("Content-Range: bytes 12-14/36"), "{h}");
+    assert_eq!(b, "cde");
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "one slice fetched");
+    let (h, b) = request(addr, "GET", "");
+    assert!(h.starts_with("HTTP/1.1 200"), "{h}");
+    assert!(h.contains("Content-Length: 36"), "{h}");
+    assert_eq!(b.as_bytes(), body);
+    assert_eq!(hits.load(Ordering::SeqCst), 4, "three more slices");
+    let (_, b) = request(addr, "GET", "Range: bytes=8-21\r\n");
+    assert_eq!(b, "89abcdefghijkl");
+    assert_eq!(hits.load(Ordering::SeqCst), 4, "all from the store");
+    let _ = std::fs::remove_dir_all(&d);
+}

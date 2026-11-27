@@ -70,7 +70,8 @@ Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
   Cache-Control and Expires before the route's valid times, Vary, min_uses,
   cache lock, stale answers on error, timeout, update and listed statuses
   (with stale-while-revalidate and stale-if-error), background update,
-  revalidation with conditional requests, HEAD fetched as GET, Range and
+  revalidation with conditional requests, HEAD fetched as GET, slices
+  (nginx slice: ranges of a fixed size fetched and stored apart), Range and
   conditional requests on hits, and `$upstream_cache_status`. The control
   plane purges by key, key prefix, Cache-Tag or a whole zone.
 - HTTP/2 through ALPN (the `h2` crate) on TLS listeners. Each stream runs

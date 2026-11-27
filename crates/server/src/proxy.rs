@@ -379,6 +379,11 @@ impl Conn {
         }
         out.extend_from_slice(&self.x.auth_resp);
         out.extend_from_slice(&self.x.cache_cond);
+        if self.fill.is_some() && !self.x.slice_range.is_empty() {
+            out.extend_from_slice(b"Range: ");
+            out.extend_from_slice(&self.x.slice_range);
+            out.extend_from_slice(b"\r\n");
+        }
         if self.x.req.body == Body::Chunked && !self.x.as_get {
             out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
         }

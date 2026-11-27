@@ -41,6 +41,8 @@ pub struct Cache {
     pub revalidate: bool,
     pub ignore: Ignore,
     pub keep_head: bool,
+    /// Bytes per slice (nginx slice); 0 for whole responses.
+    pub slice: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -157,7 +159,9 @@ pub(crate) fn build(
     if c.zone as usize >= zones {
         return Err(("zone", "no such cache zone".into()));
     }
-    let key = if c.key.is_empty() {
+    let key = if c.key.is_empty() && c.slice != 0 {
+        "$scheme$proxy_host$request_uri$slice_range"
+    } else if c.key.is_empty() {
         "$scheme$proxy_host$request_uri"
     } else {
         &c.key
@@ -203,8 +207,8 @@ pub(crate) fn build(
             I::Vary => ignore.vary = true,
         }
     }
-    if c.slice != 0 {
-        return Err(("slice", "slices are not supported".into()));
+    if c.slice != 0 && !key.contains("$slice_range") && !key.contains("${slice_range}") {
+        return Err(("key", "must use $slice_range with slice".into()));
     }
     if c.background_update && !stale.updating {
         return Err(("background_update", "needs use_stale updating".into()));
@@ -244,5 +248,6 @@ pub(crate) fn build(
         revalidate: c.revalidate,
         ignore,
         keep_head: c.keep_head,
+        slice: c.slice,
     })
 }

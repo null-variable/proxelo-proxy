@@ -106,6 +106,12 @@ impl Conn {
         if key.is_empty() || key.contains(&b'\n') || !c.caches_method(self.x.method()) {
             return self.proxy(active, p, route).await;
         }
+        let sliced = c.slice != 0
+            && (self.x.req.method == Method::Get
+                || (self.x.req.method == Method::Head && !c.keep_head));
+        if sliced && !c.bypass(&self.x) {
+            return self.proxy_sliced(active, p, route, c, &zone).await;
+        }
         let main = Zone::key_hash(&key);
         if c.bypass(&self.x) {
             self.x.cache_status = b"BYPASS";
@@ -248,6 +254,10 @@ impl Conn {
             took: Took::Relayed,
         }));
         let r = self.proxy(active, p, route).await;
+        if silent {
+            // The upstream request head; nothing of it is the client's.
+            self.out.clear();
+        }
         let fill = *self.fill.take().expect("set above");
         self.x.cache_cond.clear();
         self.x.as_get_upstream = false;
@@ -330,7 +340,13 @@ impl Conn {
         if !fill.store {
             return true;
         }
-        let Some(s) = storable(c, status, &headers, now) else {
+        // A slice is a 206; it is fresh as the whole 200 would be.
+        let as_status = if status == 206 && c.slice != 0 {
+            200
+        } else {
+            status
+        };
+        let Some(s) = storable(c, as_status, &headers, now) else {
             return true;
         };
         let data = &self.ubuf.data;
@@ -489,4 +505,231 @@ impl Conn {
             Some(v) => modified == Some(v),
         }
     }
+
+    /// nginx slice: the response is fetched and stored in ranges of
+    /// `c.slice` bytes, each its own entry keyed with $slice_range, and the
+    /// client's request is answered from the slices it covers.
+    async fn proxy_sliced(
+        &mut self,
+        active: &Active,
+        p: &Proxy,
+        route: &Route,
+        c: &Cache,
+        zone: &Arc<Zone>,
+    ) -> Result<KeepAlive, u16> {
+        let size = c.slice;
+        // The first slice the client wants; slice 0 when the start is
+        // relative to the unknown length.
+        let first = self
+            .x
+            .request_header(b"range")
+            .and_then(range_start)
+            .map_or(0, |s| s / size);
+        let (mut file, e) = self.slice(active, p, route, c, zone, first).await?;
+        let Some((at, total)) = e.header(b"content-range").and_then(content_range) else {
+            // The upstream ignored the Range: the entry is the whole response.
+            drop(file);
+            let h = zone.lookup(&self.slice_key(c), &self.x).0;
+            return self
+                .serve_entry(zone, h, &route.response_headers)
+                .await
+                .ok_or(502);
+        };
+        if e.status != 206 || at != first * size {
+            return Err(502);
+        }
+        let etag: Option<Box<[u8]>> = e.header(b"etag").map(Box::from);
+        let ranges = match self.x.request_header(b"range") {
+            Some(v) if self.cached_if_range(etag.as_deref(), e.header(b"last-modified")) => {
+                range::parse(v, total)
+            }
+            _ => range::Ranges::WHOLE,
+        };
+        let not_modified = etag
+            .as_deref()
+            .is_some_and(|t| self.x.request_header(b"if-none-match") == Some(t));
+        let (status, span) = match (ranges.answer, ranges.parts()) {
+            _ if not_modified => (304, Span::default()),
+            (Answer::Unsatisfiable, _) => (416, Span::default()),
+            (Answer::Partial, [one]) => (206, *one),
+            _ => (
+                200,
+                Span {
+                    start: 0,
+                    end: total,
+                },
+            ),
+        };
+        let ops = &route.response_headers;
+        let keep = self.x.req.keep_alive;
+        self.extra(ops, status);
+        let ops_extra = std::mem::take(&mut self.x.resp_extra);
+        let out = &mut self.out;
+        out.clear();
+        reply::start(out, status, b"");
+        for line in e.head.split_inclusive(|&c| c == b'\n') {
+            let name = line.split(|&c| c == b':').next().unwrap_or_default();
+            if name.eq_ignore_ascii_case(b"content-range") || (!ops.is_empty() && ops.drops(name)) {
+                continue;
+            }
+            out.extend_from_slice(line);
+        }
+        let body = span.end - span.start;
+        match status {
+            416 => {
+                out.extend_from_slice(b"Content-Range: bytes */");
+                push_u64(out, total);
+                out.extend_from_slice(b"\r\n");
+            }
+            206 => {
+                out.extend_from_slice(b"Content-Range: bytes ");
+                range::push_span(out, span, total);
+                out.extend_from_slice(b"\r\n");
+            }
+            _ => {}
+        }
+        if status != 304 {
+            out.extend_from_slice(b"Content-Length: ");
+            push_u64(out, body);
+            out.extend_from_slice(b"\r\n");
+        }
+        if status == 200 && e.header(b"accept-ranges").is_none() {
+            out.extend_from_slice(b"Accept-Ranges: bytes\r\n");
+        }
+        reply::connection(out, keep, &ops_extra);
+        out.extend_from_slice(b"\r\n");
+        self.x.resp_extra = ops_extra;
+        self.x.sent.status = status;
+        self.x.sent.bytes = self.out.len() as u64;
+        self.x.cache_status = b"HIT";
+        if self.x.req.method == Method::Head || body == 0 {
+            return Ok(self.respond(keep).await);
+        }
+        if keep && self.pump_body(crate::conn::Sink::Drop).await.is_err() {
+            return Ok(false);
+        }
+        self.x.sent.bytes += body;
+        self.x.sent.body_bytes = body;
+        let mut n = span.start / size;
+        let mut entry = Some((file, e));
+        while n * size < span.end {
+            let (f, e) = match entry.take() {
+                Some(fe) if n == first => fe,
+                _ => match self.slice(active, p, route, c, zone, n).await {
+                    Ok(fe) => fe,
+                    // The head is out: only closing tells the client.
+                    Err(_) => return Ok(false),
+                },
+            };
+            file = f;
+            // Every slice must be of the same response.
+            let same = e.header(b"content-range").and_then(content_range)
+                == Some((n * size, total))
+                && e.header(b"etag").map(Box::from) == etag;
+            if !same {
+                return Ok(false);
+            }
+            let from = span.start.max(n * size) - n * size;
+            let to = span.end.min((n + 1) * size).min(total) - n * size;
+            if to > e.body_len {
+                return Ok(false);
+            }
+            let part = Span {
+                start: e.body_offset + from,
+                end: e.body_offset + to,
+            };
+            if !self.send_span(&mut file, part).await {
+                return Ok(false);
+            }
+            n += 1;
+        }
+        if !self.out.is_empty()
+            && write_timeout(&mut self.client, &self.out, SEND_TIMEOUT)
+                .await
+                .is_err()
+        {
+            return Ok(false);
+        }
+        Ok(keep)
+    }
+
+    /// The cache key with the current $slice_range.
+    fn slice_key(&mut self, c: &Cache) -> Box<[u8]> {
+        crate::vars::expand(&mut self.x, &c.key);
+        self.x.tmpl.as_slice().into()
+    }
+
+    /// Slice `n` of the response: from the store, or fetched upstream with
+    /// a Range request and stored first.
+    async fn slice(
+        &mut self,
+        active: &Active,
+        p: &Proxy,
+        route: &Route,
+        c: &Cache,
+        zone: &Arc<Zone>,
+        n: u64,
+    ) -> Result<(std::fs::File, crate::cache::Entry), u16> {
+        let size = c.slice;
+        self.x.slice_range.clear();
+        self.x.slice_range.extend_from_slice(b"bytes=");
+        push_u64(&mut self.x.slice_range, n * size);
+        self.x.slice_range.push(b'-');
+        push_u64(&mut self.x.slice_range, (n + 1) * size - 1);
+        let key = self.slice_key(c);
+        let main = Zone::key_hash(&key);
+        for fetched in [false, true] {
+            let (h, found) = zone.lookup(&key, &self.x);
+            if found.is_some_and(|f| fetched || f.fresh(now()))
+                && let Ok(fe) = zone.open(h)
+            {
+                return Ok(fe);
+            }
+            if fetched {
+                break;
+            }
+            let guard = if c.lock {
+                match zone.lock(main, c.lock_timeout).await {
+                    Locked::Held(g) => Some(g),
+                    // Another request stored it meanwhile, or gave up.
+                    Locked::Released | Locked::TimedOut => None,
+                }
+            } else {
+                None
+            };
+            let (h, found) = zone.lookup(&key, &self.x);
+            if found.is_some_and(|f| f.fresh(now()))
+                && let Ok(fe) = zone.open(h)
+            {
+                return Ok(fe);
+            }
+            self.x.cache_status = b"MISS";
+            let store = !c.no_store(&self.x);
+            self.fetch(active, p, route, c, zone, key.clone(), None, store, true)
+                .await?;
+            drop(guard);
+        }
+        Err(502)
+    }
+}
+
+/// The first byte position of a single "bytes=N-" range; `None` for a
+/// suffix range or one that does not parse.
+fn range_start(v: &[u8]) -> Option<u64> {
+    let v = v.trim_ascii();
+    if v.len() < 6 || !v[..6].eq_ignore_ascii_case(b"bytes=") {
+        return None;
+    }
+    let rest = v[6..].trim_ascii_start();
+    let end = rest.iter().position(|c| !c.is_ascii_digit())?;
+    std::str::from_utf8(&rest[..end]).ok()?.parse().ok()
+}
+
+/// "bytes S-E/L" into (S, L).
+fn content_range(v: &[u8]) -> Option<(u64, u64)> {
+    let v = std::str::from_utf8(v).ok()?.trim();
+    let rest = v.strip_prefix("bytes ")?;
+    let (span, total) = rest.split_once('/')?;
+    let (start, _) = span.split_once('-')?;
+    Some((start.trim().parse().ok()?, total.trim().parse().ok()?))
 }
