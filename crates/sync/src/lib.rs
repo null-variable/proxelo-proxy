@@ -17,7 +17,8 @@ use proxelo_api::distrib::v1::{
     sync_response,
 };
 pub use proxelo_api::distrib::v1::{
-    Challenges, Purge, PurgeDone, RouteStats, SiteStats, Stats, TapEvents, TapFilter, TargetStats,
+    Challenges, DiscoveredTargets, Purge, PurgeDone, RouteStats, SiteStats, Stats, TapEvents,
+    TapFilter, TargetStats,
 };
 use proxelo_api::snapshot::v1::Snapshot;
 use tokio::net::UnixStream;
@@ -46,6 +47,8 @@ pub trait Apply {
     fn wasm_modules(&self) -> Vec<String> {
         Vec::new()
     }
+    /// Replaces the discovered targets of an upstream.
+    fn discovered(&mut self, _d: DiscoveredTargets) {}
     /// Stores a WebAssembly module received whole.
     fn store_wasm(&mut self, _sha256: &str, _bytes: &[u8]) -> Result<(), String> {
         Err("no wasm host".into())
@@ -204,6 +207,10 @@ impl Client {
                 }
                 Some(sync_response::Kind::Tap(f)) => {
                     target.tap(f);
+                    continue;
+                }
+                Some(sync_response::Kind::Discovered(d)) => {
+                    target.discovered(d);
                     continue;
                 }
                 Some(sync_response::Kind::WasmChunk(c)) => {

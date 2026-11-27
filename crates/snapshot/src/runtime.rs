@@ -654,8 +654,14 @@ pub struct StickyCookie {
 }
 
 /// Addresses of host names, from the DNS re-resolution of targets marked
-/// `resolve`, by name as configured.
+/// `resolve`, by name as configured, and the targets discovery providers
+/// found, under [`discovered_key`] of the upstream ID.
 pub type Resolved = HashMap<String, Box<[SocketAddr]>>;
+
+/// The [`Resolved`] key of an upstream's discovered targets.
+pub fn discovered_key(upstream_id: &str) -> String {
+    format!("discovered:{upstream_id}")
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum BuildError {
@@ -1086,6 +1092,20 @@ impl Runtime {
                     max_conns: target.max_conns,
                     slow_start: Duration::from_millis(target.slow_start_ms.into()),
                     route: target.route.as_str().into(),
+                }));
+            }
+            if up.discovered
+                && let Some(addrs) = resolved.get(&discovered_key(&up.id))
+            {
+                targets.extend(addrs.iter().map(|&addr| Target {
+                    addr,
+                    name: addr.to_string().into(),
+                    weight: 1,
+                    backup: false,
+                    down: false,
+                    max_conns: 0,
+                    slow_start: Duration::ZERO,
+                    route: "".into(),
                 }));
             }
             let at = format!("upstreams[{u}]");
@@ -2163,6 +2183,36 @@ mod tests {
             }]
         );
         assert_eq!(rt.upstreams[0].keepalive_idle, 4);
+    }
+
+    #[test]
+    fn discovered_targets_join_configured_ones() {
+        let mut snap = snapshot(vec![], None);
+        snap.upstreams[0].id = "up_a".into();
+        let mut resolved = Resolved::new();
+        resolved.insert(
+            discovered_key("up_a"),
+            vec!["10.0.0.9:8080".parse().unwrap()].into(),
+        );
+        // Not a discovered upstream: ignored.
+        let rt = Runtime::build_with(&snap, &resolved).unwrap();
+        assert_eq!(rt.upstreams[0].targets.len(), 1);
+        snap.upstreams[0].discovered = true;
+        let rt = Runtime::build_with(&snap, &resolved).unwrap();
+        let addrs: Vec<String> = rt.upstreams[0]
+            .targets
+            .iter()
+            .map(|t| t.addr.to_string())
+            .collect();
+        assert_eq!(addrs, ["127.0.0.1:9000", "10.0.0.9:8080"]);
+        // With no configured targets it loads and waits for some.
+        snap.upstreams[0].targets.clear();
+        crate::validate(&snap).unwrap();
+        assert!(
+            Runtime::build(&snap).unwrap().upstreams[0]
+                .targets
+                .is_empty()
+        );
     }
 
     #[test]

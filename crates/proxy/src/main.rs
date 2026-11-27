@@ -547,11 +547,17 @@ impl Node {
     /// Serves `snap`, resolving its `resolve` names now.
     fn install(&mut self, snap: Snapshot) -> Result<(), String> {
         let names = proxelo_server::resolve_names(&snap);
-        let resolved = if names.is_empty() {
+        let mut resolved = if names.is_empty() {
             proxelo_snapshot::Resolved::new()
         } else {
             block_in_place(proxelo_server::resolve_all(&names))
         };
+        // Discovered targets outlive snapshots: they come apart from them.
+        for (k, v) in &self.resolved {
+            if k.starts_with("discovered:") {
+                resolved.insert(k.clone(), v.clone());
+            }
+        }
         let rt = Runtime::build_with(&snap, &resolved).map_err(|e| e.to_string())?;
         self.listeners
             .apply(&self.server, rt)
@@ -613,6 +619,37 @@ impl Apply for Node {
 
     fn tap_events(&mut self) -> Option<proxelo_sync::TapEvents> {
         proxelo_server::take_tap_events()
+    }
+
+    /// Discovered targets apply at once: the snapshot is rebuilt with them,
+    /// as for re-resolved names.
+    fn discovered(&mut self, d: proxelo_sync::DiscoveredTargets) {
+        let key = proxelo_snapshot::discovered_key(&d.upstream_id);
+        let mut addrs: Vec<std::net::SocketAddr> = Vec::with_capacity(d.addresses.len());
+        for a in &d.addresses {
+            match a.parse() {
+                Ok(addr) => addrs.push(addr),
+                Err(_) => eprintln!("discovered target {a} of {}: not an address", d.upstream_id),
+            }
+        }
+        addrs.sort();
+        addrs.dedup();
+        let addrs: Box<[std::net::SocketAddr]> = addrs.into();
+        if self.resolved.get(&key) == Some(&addrs) {
+            return;
+        }
+        self.resolved.insert(key, addrs);
+        let Some(snap) = &self.snap else {
+            return;
+        };
+        match Runtime::build_with(snap, &self.resolved) {
+            Ok(rt) => {
+                if let Err(e) = self.listeners.apply(&self.server, rt) {
+                    eprintln!("discovered targets: {e}");
+                }
+            }
+            Err(e) => eprintln!("discovered targets: {e}"),
+        }
     }
 
     fn wasm_modules(&self) -> Vec<String> {

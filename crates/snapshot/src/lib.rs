@@ -30,7 +30,7 @@ pub use runtime::{
     ClientAuthMode, ErrorPage, ErrorTarget, Fallback, Gateway, GatewayParam, GatewayProtocol,
     HeaderOps, HeaderValue, HealthCheck, Listener, ListenerTls, MatchError, Memcached, NextOn,
     Pattern, Proxy, Resolved, Return, Rewrite, RewriteFlag, Route, Runtime, Site, Sticky,
-    StickyCookie, Stream, StreamRoute, Target, TryFiles, Upstream, UpstreamTls,
+    StickyCookie, Stream, StreamRoute, Target, TryFiles, Upstream, UpstreamTls, discovered_key,
 };
 pub use template::{Part, Template, Var};
 pub use wasm::{WasmFilter, WasmModule, hex};
@@ -402,7 +402,11 @@ pub fn validate(snap: &Snapshot) -> Result<(), LoadError> {
             .map_err(|(field, error)| at(field, error))?;
     }
 
-    if let Some(u) = snap.upstreams.iter().position(|u| u.targets.is_empty()) {
+    if let Some(u) = snap
+        .upstreams
+        .iter()
+        .position(|u| u.targets.is_empty() && !u.discovered)
+    {
         return Err(LoadError::EmptyUpstream { upstream: u });
     }
 
