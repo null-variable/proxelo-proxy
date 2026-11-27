@@ -166,7 +166,15 @@ pub(crate) fn record(x: &Exchange, site: &str, route: Option<&str>) {
         upstream_status: u32::from(x.sent.upstream_status),
         bytes_sent: x.sent.bytes,
         headers,
-        protocol: if x.h2 { "2" } else { "1.1" }.to_owned(),
+        protocol: if x.h3 {
+            "3"
+        } else if x.h2 {
+            "2"
+        } else {
+            "1.1"
+        }
+        .to_owned(),
+        waf_rules: x.waf_rules.clone(),
     });
 }
 

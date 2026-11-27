@@ -235,10 +235,11 @@ impl Conn {
         };
         let keep = self.handle_in(active, &mut done).await;
         self.holds.clear();
-        self.finish(active, &done);
+        // The filters' log phase first: what they matched goes to the tap.
         if !self.wasm.is_empty() || self.wasm_local.is_some() {
             self.wasm_done();
         }
+        self.finish(active, &done);
         keep
     }
 

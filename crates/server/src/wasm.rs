@@ -35,6 +35,9 @@ const TICK: Duration = Duration::from_millis(10);
 const POOL: usize = 8;
 /// Context ID of the plugin; streams count up from it.
 const ROOT: u32 = 1;
+/// Plugin logs below error are dropped; the WAF logs matched rules at
+/// critical and its own diagnostics at warn.
+const LOG_LEVEL: i32 = 4;
 
 // proxy_status_t
 const OK: i32 = 0;
@@ -180,8 +183,10 @@ pub(crate) struct Stream {
     pub properties: HashMap<Vec<u8>, Vec<u8>>,
     /// A response the plugin asked to send instead.
     pub local: Option<Local>,
-    /// Lines the plugin logged at warn or above.
+    /// Lines the plugin logged at [`LOG_LEVEL`] or above.
     pub logs: Vec<String>,
+    /// Rule IDs in those lines, `[id "N"]` as ModSecurity writes them.
+    pub rules: Vec<u32>,
 }
 
 pub(crate) struct Local {
@@ -607,6 +612,18 @@ fn map(s: &mut Stream, id: i32) -> Option<&mut Vec<(Vec<u8>, Vec<u8>)>> {
     }
 }
 
+/// The numbers of `[id "N"]` in a log line.
+fn rule_ids(line: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    line.windows(5)
+        .enumerate()
+        .filter(|(_, w)| *w == b"[id \"")
+        .filter_map(|(i, _)| {
+            let rest = &line[i + 5..];
+            let end = rest.iter().position(|&c| c == b'"')?;
+            std::str::from_utf8(&rest[..end]).ok()?.parse().ok()
+        })
+}
+
 fn level_name(level: i32) -> &'static str {
     match level {
         0 => "trace",
@@ -630,7 +647,7 @@ fn add_host(l: &mut Linker<Host>) -> wasmtime::Result<()> {
             let Some(msg) = read(&mut c, p, n) else {
                 return INVALID_MEMORY_ACCESS;
             };
-            if level >= 3 {
+            if level >= LOG_LEVEL {
                 let line = format!(
                     "wasm {} {}: {}",
                     c.data().name,
@@ -638,9 +655,14 @@ fn add_host(l: &mut Linker<Host>) -> wasmtime::Result<()> {
                     String::from_utf8_lossy(&msg)
                 );
                 eprintln!("{line}");
-                let logs = &mut c.data_mut().stream.logs;
-                if logs.len() < 64 {
-                    logs.push(line);
+                let st = &mut c.data_mut().stream;
+                for id in rule_ids(&msg) {
+                    if st.rules.len() < 64 && !st.rules.contains(&id) {
+                        st.rules.push(id);
+                    }
+                }
+                if st.logs.len() < 64 {
+                    st.logs.push(line);
                 }
             }
             OK
@@ -650,8 +672,7 @@ fn add_host(l: &mut Linker<Host>) -> wasmtime::Result<()> {
         env,
         "proxy_get_log_level",
         |mut c: C<'_>, ret: i32| -> i32 {
-            // Warn: below it nothing is printed.
-            if write_u32(&mut c, ret, 3) {
+            if write_u32(&mut c, ret, LOG_LEVEL as u32) {
                 OK
             } else {
                 INVALID_MEMORY_ACCESS
@@ -1514,9 +1535,14 @@ impl Conn {
         self.wasm_local = None;
         let status = self.x.sent.status;
         for mut s in self.wasm.drain(..) {
-            s.stream()
-                .properties
+            let st = s.stream();
+            st.properties
                 .insert(b"response\0code".to_vec(), u64_le(status.into()));
+            for &id in &st.rules {
+                if !self.x.waf_rules.contains(&id) {
+                    self.x.waf_rules.push(id);
+                }
+            }
             s.close();
         }
     }
@@ -1525,6 +1551,12 @@ impl Conn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule_ids_from_logs() {
+        let line = br#"Coraza: Access denied [file "x"] [id "949110"] [msg ""] [id "1"] [id "x"]"#;
+        assert_eq!(rule_ids(line).collect::<Vec<_>>(), [949110, 1]);
+    }
 
     #[test]
     fn map_serialization_round_trips() {

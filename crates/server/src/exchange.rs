@@ -132,6 +132,8 @@ pub(crate) struct Exchange {
     /// The Alt-Svc line every response of this connection carries; empty
     /// unless the listener serves HTTP/3.
     pub alt_svc: Vec<u8>,
+    /// Rule IDs proxy-wasm filters logged as matching.
+    pub waf_rules: Vec<u32>,
 }
 
 /// Lowercases `raw` into `out` without the port and a trailing dot.
@@ -206,6 +208,7 @@ impl Exchange {
             cache_cond: Vec::new(),
             as_get_upstream: false,
             alt_svc: Vec::new(),
+            waf_rules: Vec::new(),
         }
     }
 
@@ -251,6 +254,7 @@ impl Exchange {
         self.jwt = None;
         self.oidc_sub.clear();
         self.oidc_email.clear();
+        self.waf_rules.clear();
         self.bandwidth = None;
         self.paced = 0;
         self.lookup_vals.clear();
