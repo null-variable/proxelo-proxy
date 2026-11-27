@@ -305,7 +305,7 @@ impl Conn {
     }
 
     /// Writes `out` followed by `span` of the file, leaving `out` empty.
-    async fn send_span(&mut self, file: &mut File, span: Span) -> bool {
+    pub(crate) async fn send_span(&mut self, file: &mut File, span: Span) -> bool {
         if file.seek(SeekFrom::Start(span.start)).is_err() {
             return false;
         }

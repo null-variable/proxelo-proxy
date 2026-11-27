@@ -9,6 +9,8 @@
 mod access;
 mod acme;
 mod buf;
+mod cache;
+mod cache_serve;
 mod compress;
 mod conn;
 pub mod drain;
@@ -73,6 +75,8 @@ pub struct Active {
     metrics: metrics::Table,
     logs: log::Logs,
     zones: limits::Zones,
+    /// Indexed like `rt.cache_zones`.
+    caches: Box<[std::sync::Arc<cache::Zone>]>,
 }
 
 pub struct Server {
@@ -98,6 +102,15 @@ impl Server {
     /// installed outside one.
     pub fn set_background(&self, h: tokio::runtime::Handle) {
         let _ = self.background.set(h);
+    }
+
+    /// Removes cached responses of the active snapshot's zone `p.zone_id`.
+    /// Blocks on the disk.
+    pub fn purge(
+        &self,
+        p: &proxelo_api::distrib::v1::Purge,
+    ) -> proxelo_api::distrib::v1::PurgeDone {
+        cache::purge(&self.active(), p)
     }
 
     pub fn active(&self) -> Arc<Active> {
@@ -252,6 +265,7 @@ fn build(
 ) -> Result<Active, String> {
     let rt = Arc::new(rt);
     let zones = limits::Zones::new(&rt, old.map(|o| (&*o.rt, &o.zones)));
+    let caches = cache::zones(&rt, old.map(|o| (&*o.rt, &*o.caches)));
     let tls = tls::build(&rt)?;
     let stream_tls = tls::build_streams(&rt)?;
     let upstreams = rt
@@ -267,6 +281,7 @@ fn build(
         metrics: metrics::Table::new(&rt),
         logs: log::Logs::new(&rt.access_logs),
         zones,
+        caches,
         upstreams,
         tls,
         stream_tls,

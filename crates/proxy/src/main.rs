@@ -595,6 +595,19 @@ impl Apply for Node {
         proxelo_server::set_tap_filter(f);
     }
 
+    async fn purge(&self, p: proxelo_sync::Purge) -> proxelo_sync::PurgeDone {
+        let server = self.server.clone();
+        let id = p.id.clone();
+        match tokio::task::spawn_blocking(move || server.purge(&p)).await {
+            Ok(done) => done,
+            Err(e) => proxelo_sync::PurgeDone {
+                id,
+                removed: 0,
+                error: e.to_string(),
+            },
+        }
+    }
+
     fn tap_events(&mut self) -> Option<proxelo_sync::TapEvents> {
         proxelo_server::take_tap_events()
     }

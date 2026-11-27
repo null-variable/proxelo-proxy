@@ -17,7 +17,7 @@ use proxelo_api::distrib::v1::{
     sync_response,
 };
 pub use proxelo_api::distrib::v1::{
-    Challenges, RouteStats, SiteStats, Stats, TapEvents, TapFilter, TargetStats,
+    Challenges, Purge, PurgeDone, RouteStats, SiteStats, Stats, TapEvents, TapFilter, TargetStats,
 };
 use proxelo_api::snapshot::v1::Snapshot;
 use tokio::net::UnixStream;
@@ -49,6 +49,16 @@ pub trait Apply {
     /// [`TAP_INTERVAL`].
     fn tap_events(&mut self) -> Option<TapEvents> {
         None
+    }
+    /// Removes cached responses; answered with what was removed.
+    fn purge(&self, p: Purge) -> impl std::future::Future<Output = PurgeDone> + Send {
+        async move {
+            PurgeDone {
+                id: p.id,
+                removed: 0,
+                error: "no response cache".into(),
+            }
+        }
     }
     /// Periodic work, every [`TICK_INTERVAL`], also while the control plane
     /// is unreachable.
@@ -182,6 +192,14 @@ impl Client {
                 }
                 Some(sync_response::Kind::Tap(f)) => {
                     target.tap(f);
+                    continue;
+                }
+                Some(sync_response::Kind::Purge(p)) => {
+                    let done = target.purge(p).await;
+                    let req = SyncRequest {
+                        kind: Some(sync_request::Kind::PurgeDone(done)),
+                    };
+                    tx.send(req).await.map_err(Session::after)?;
                     continue;
                 }
                 // The deprecated embedded form cannot be verified.

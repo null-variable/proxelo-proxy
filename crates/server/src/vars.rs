@@ -402,6 +402,9 @@ fn var(x: &mut Exchange, v: Var, out: &mut Vec<u8>) {
         }
         Var::FastcgiScriptName => out.extend_from_slice(&x.script_name),
         Var::FastcgiPathInfo => out.extend_from_slice(&x.path_info),
+        Var::ProxyHost => out.extend_from_slice(&x.proxy_host),
+        Var::SliceRange => out.extend_from_slice(&x.slice_range),
+        Var::UpstreamCacheStatus => out.extend_from_slice(x.cache_status),
         Var::Capture(i) => {
             if let Some(c) = x.caps.get(usize::from(i)) {
                 out.extend_from_slice(c);

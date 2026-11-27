@@ -17,6 +17,7 @@ use proxelo_api::snapshot::v1::{
 };
 
 use crate::access::{self, Access, Bandwidth, ConnZone, RateZone, RealIp};
+use crate::cache::{self, Cache, CacheZone};
 use crate::compression::{self, Compression};
 use crate::cond::{Cond, Facts};
 use crate::lookup::{self, Lookup};
@@ -40,6 +41,7 @@ pub struct Runtime {
     pub lookups: Arc<[Lookup]>,
     /// Compression settings of routes and sites, by their index.
     pub compressions: Arc<[Compression]>,
+    pub cache_zones: Box<[CacheZone]>,
 }
 
 /// A parsed certificate chain and its private key.
@@ -370,6 +372,7 @@ pub struct Route {
     pub bandwidth: Option<Bandwidth>,
     /// Index into `Runtime::compressions`.
     pub compression: Option<u32>,
+    pub cache: Option<Box<Cache>>,
     children: Option<Level>,
 }
 
@@ -1014,6 +1017,7 @@ impl Runtime {
                 rate_zones: snap.rate_zones.len(),
                 conn_zones: snap.conn_zones.len(),
                 upstreams: snap.upstreams.len(),
+                cache_zones: snap.cache_zones.len(),
                 names: &names,
                 compressions: &mut compressions,
             };
@@ -1195,6 +1199,17 @@ impl Runtime {
             .enumerate()
             .map(|(i, s)| stream(s, &format!("streams[{i}]")))
             .collect::<Result<_, _>>()?;
+        let cache_zones = snap
+            .cache_zones
+            .iter()
+            .enumerate()
+            .map(|(i, z)| {
+                cache::zone(z).map_err(|(f, error)| BuildError::Field {
+                    field: format!("cache_zones[{i}].{f}"),
+                    error,
+                })
+            })
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             revision: snap.revision,
             streams,
@@ -1207,6 +1222,7 @@ impl Runtime {
             conn_zones,
             lookups: lookups.into(),
             compressions: compressions.into(),
+            cache_zones,
         })
     }
 }
@@ -1233,6 +1249,7 @@ struct SiteBuilder<'a> {
     rate_zones: usize,
     conn_zones: usize,
     upstreams: usize,
+    cache_zones: usize,
     /// Lookup variable names templates may use.
     names: &'a [Box<str>],
     /// Compression settings built so far, shared across sites.
@@ -1401,6 +1418,12 @@ impl SiteBuilder<'_> {
             bandwidth: route.bandwidth.as_ref().and_then(access::bandwidth),
             compression: self
                 .compression(route.compression.as_ref(), &format!("{at}.compression"))?,
+            cache: route
+                .cache
+                .as_ref()
+                .map(|c| cache::build(c, self.cache_zones, self.names).map(Box::new))
+                .transpose()
+                .map_err(|(f, e)| self.err(format!("{at}.cache.{f}"), e))?,
             children: None,
         })
     }
@@ -1566,6 +1589,7 @@ impl Runtime {
             streams: Box::default(),
             lookups: Arc::from([]),
             compressions: Arc::from([]),
+            cache_zones: Box::default(),
         }
     }
 

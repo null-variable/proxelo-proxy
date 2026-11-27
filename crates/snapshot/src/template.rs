@@ -87,6 +87,13 @@ pub enum Var {
     ContentType,
     FastcgiScriptName,
     FastcgiPathInfo,
+    /// `$proxy_host`: the upstream's host name, or its first address.
+    ProxyHost,
+    /// `$slice_range`: `bytes=<start>-<end>` of the slice being fetched.
+    SliceRange,
+    /// `$upstream_cache_status`: MISS, HIT, EXPIRED, STALE, UPDATING,
+    /// REVALIDATED or BYPASS.
+    UpstreamCacheStatus,
     /// `$0`..`$9`: groups of the last regex that matched.
     Capture(u8),
 }
@@ -265,6 +272,9 @@ fn var(name: &str) -> Option<Part> {
         "content_type" => Var::ContentType,
         "fastcgi_script_name" => Var::FastcgiScriptName,
         "fastcgi_path_info" => Var::FastcgiPathInfo,
+        "proxy_host" => Var::ProxyHost,
+        "slice_range" => Var::SliceRange,
+        "upstream_cache_status" => Var::UpstreamCacheStatus,
         _ => {
             let header = |h: &str| -> Box<[u8]> {
                 h.bytes()

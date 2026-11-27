@@ -168,7 +168,7 @@ fn expired(v: &[u8]) -> bool {
 
 /// Seconds since the epoch of an IMF-fixdate ("Sun, 06 Nov 1994 08:49:37
 /// GMT"); other forms are not parsed.
-fn httpdate_secs(s: &str) -> Option<u64> {
+pub(crate) fn httpdate_secs(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     if b.len() != 29 || &b[25..] != b" GMT" {
         return None;

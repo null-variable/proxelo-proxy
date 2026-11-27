@@ -56,9 +56,28 @@ enum Op {
     Regex(Pattern),
 }
 
-pub(crate) struct Expr {
+pub struct Expr {
     source: Box<str>,
     program: Program,
+}
+
+impl Expr {
+    /// Compiles a CEL expression over `request`.
+    pub(crate) fn compile(source: &str) -> Result<Self, String> {
+        let program = ENV.compile(source).map_err(|e| e.to_string())?;
+        Ok(Self {
+            source: source.into(),
+            program,
+        })
+    }
+
+    /// Whether the expression is true for the request; an evaluation error
+    /// is false.
+    pub fn eval(&self, f: &dyn Facts) -> bool {
+        let mut ctx = Context::with_env(Arc::clone(&ENV));
+        ctx.add_variable_from_value("request", request(f));
+        matches!(self.program.execute(&ctx), Ok(Value::Bool(true)))
+    }
 }
 
 impl std::fmt::Debug for Expr {
@@ -86,13 +105,7 @@ impl Cond {
         let expr = if r.expr.is_empty() {
             None
         } else {
-            let program = ENV
-                .compile(&r.expr)
-                .map_err(|e| ("expr".to_string(), e.to_string()))?;
-            Some(Expr {
-                source: r.expr.as_str().into(),
-                program,
-            })
+            Some(Expr::compile(&r.expr).map_err(|e| ("expr".to_string(), e))?)
         };
         Ok(Some(Self {
             methods: r.methods.iter().map(|m| m.as_bytes().into()).collect(),
@@ -144,10 +157,8 @@ impl Cond {
             }
         }
         if let Some(e) = &self.expr {
-            let mut ctx = Context::with_env(Arc::clone(&ENV));
-            ctx.add_variable_from_value("request", request(f));
             // An evaluation error, such as a missing map key, is no match.
-            return Ok(matches!(e.program.execute(&ctx), Ok(Value::Bool(true))));
+            return Ok(e.eval(f));
         }
         Ok(true)
     }

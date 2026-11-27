@@ -64,6 +64,15 @@ Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
 - L4 streams (nginx `stream`): TCP and UDP relays, TLS termination,
   ClientHello preread for SNI routing, PROXY protocol v1 to upstreams,
   allow/deny, connection limits and session logs.
+- Response cache as nginx `proxy_cache`: one file per entry named by the MD5
+  of the key under `levels` directories, an index rebuilt at start, eviction
+  by size, entry count and inactivity, freshness from X-Accel-Expires,
+  Cache-Control and Expires before the route's valid times, Vary, min_uses,
+  cache lock, stale answers on error, timeout, update and listed statuses
+  (with stale-while-revalidate and stale-if-error), background update,
+  revalidation with conditional requests, HEAD fetched as GET, Range and
+  conditional requests on hits, and `$upstream_cache_status`. The control
+  plane purges by key, key prefix, Cache-Tag or a whole zone.
 - HTTP/2 through ALPN (the `h2` crate) on TLS listeners. Each stream runs
   through the same phases, proxying, logs and metrics as HTTP/1.1.
 - Response and upstream request headers set, added or removed per route

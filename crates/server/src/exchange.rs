@@ -112,6 +112,16 @@ pub(crate) struct Exchange {
     pub body_len: Option<u64>,
     /// Groups of fastcgi_split_path_info, kept apart from `$1`..`$9`.
     pub gw_caps: Captures,
+    /// $proxy_host of the upstream being proxied to.
+    pub proxy_host: Vec<u8>,
+    /// $upstream_cache_status; empty when the route is not cached.
+    pub cache_status: &'static [u8],
+    /// $slice_range while a slice is fetched.
+    pub slice_range: Vec<u8>,
+    /// Conditional header lines of a cache revalidation, sent upstream.
+    pub cache_cond: Vec<u8>,
+    /// The upstream request goes out as GET (a cached HEAD).
+    pub as_get_upstream: bool,
 }
 
 /// Lowercases `raw` into `out` without the port and a trailing dot.
@@ -176,6 +186,11 @@ impl Exchange {
             path_info: Vec::new(),
             body_len: None,
             gw_caps: Captures::default(),
+            proxy_host: Vec::new(),
+            cache_status: b"",
+            slice_range: Vec::new(),
+            cache_cond: Vec::new(),
+            as_get_upstream: false,
         }
     }
 
@@ -223,6 +238,9 @@ impl Exchange {
         self.script_name.clear();
         self.path_info.clear();
         self.body_len = None;
+        self.proxy_host.clear();
+        self.cache_status = b"";
+        self.slice_range.clear();
         self.uri_changed = false;
         self.error_paged = false;
         self.err_status = 0;

@@ -90,6 +90,10 @@ pub(crate) struct Conn {
     /// Gateway request body and request or response head scratch.
     pub gw_body: Vec<u8>,
     pub gw_buf: Vec<u8>,
+    /// The cache side of a proxied request, while it goes upstream.
+    pub fill: Option<Box<crate::cache_serve::Fill>>,
+    /// The body of a response being stored arrived complete.
+    pub fill_done: bool,
 }
 
 /// Bytes after the head in a response built in one buffer.
@@ -136,6 +140,8 @@ impl Conn {
             zout: Vec::new(),
             gw_body: Vec::new(),
             gw_buf: Vec::new(),
+            fill: None,
+            fill_done: false,
         }
     }
 
@@ -322,7 +328,11 @@ impl Conn {
                         return false;
                     }
                     let route = &site.routes[phases.route.expect("proxy has a route") as usize];
-                    match self.proxy(active, &p, route).await {
+                    let r = match &route.cache {
+                        Some(c) => self.proxy_cached(active, &p, route, c).await,
+                        None => self.proxy(active, &p, route).await,
+                    };
+                    match r {
                         Ok(keep) => keep,
                         Err(status) => {
                             phases.fail(status);

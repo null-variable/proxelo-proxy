@@ -5,6 +5,7 @@
 //! at an existing object and every match and action is fully specified.
 
 mod access;
+mod cache;
 mod compression;
 mod cond;
 mod lookup;
@@ -17,8 +18,9 @@ pub use access::{
     Access, AccessRule, Bandwidth, BasicAuth, BasicUser, Cidr, ConnZone, ForwardAuth, RateZone,
     RealIp, allowed,
 };
+pub use cache::{Cache, CacheZone, Ignore as CacheIgnore, Stale, Valid};
 pub use compression::{Compression, Encoding, Proxied, StaticGz};
-pub use cond::{Cond, Facts};
+pub use cond::{Cond, Expr, Facts};
 pub use lookup::{GeoTable, Lookup, MapTable, SplitTable, Table, murmur2};
 pub use runtime::{
     AccessLog, Action, Balancing, BuildError, Captures, Certificate, CheckKind, ClientAuth,
@@ -165,6 +167,9 @@ impl SiteCheck {
             }
             Some(action::Kind::Return(r)) => check_return(r, format!("{at}.action.return"))?,
             Some(action::Kind::Proxy(_)) => {}
+            _ if route.cache.is_some() => {
+                return Err((format!("{at}.cache"), "only proxy routes are cached"));
+            }
             Some(action::Kind::Gateway(g)) => self.upstream(g.proxy.as_ref(), at, "gateway")?,
             Some(action::Kind::Memcached(m)) => self.upstream(m.proxy.as_ref(), at, "memcached")?,
             Some(action::Kind::Grpc(g)) => self.upstream(g.proxy.as_ref(), at, "grpc")?,

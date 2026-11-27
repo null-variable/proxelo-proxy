@@ -189,7 +189,27 @@ impl Conn {
                     let keep_up = ups.keepalive
                         && up.used < ups.keepalive_requests
                         && up.opened.elapsed() < ups.keepalive_time;
-                    let (keep, complete) = self.relay(&mut up.stream, route, p.read_timeout).await;
+                    let (relay, quiet) = match (route.cache.as_deref(), self.fill.as_deref()) {
+                        (Some(c), Some(f)) => {
+                            let silent = f.silent;
+                            (self.cache_head(c), silent)
+                        }
+                        _ => (true, false),
+                    };
+                    if !relay {
+                        // A stored entry answers; the upstream body is left.
+                        self.x.sent.upstream_response = Some(connect.elapsed().as_secs_f64());
+                        active
+                            .metrics
+                            .upstream_response(p.upstream, i, st, started.elapsed());
+                        return Ok(self.x.req.keep_alive);
+                    }
+                    let (keep, complete) = if quiet {
+                        let r = self.body_store(&mut up.stream, p.read_timeout).await;
+                        (self.x.req.keep_alive, r)
+                    } else {
+                        self.relay(&mut up.stream, route, p.read_timeout).await
+                    };
                     if complete && self.resp.keep_alive && keep_up && self.ubuf.end == 0 {
                         pool.put(up);
                     }
@@ -309,7 +329,7 @@ impl Conn {
     ) {
         let mut out = std::mem::take(&mut self.out);
         out.clear();
-        if self.x.as_get {
+        if self.x.as_get || self.x.as_get_upstream {
             out.extend_from_slice(b"GET");
         } else {
             out.extend_from_slice(self.x.req.method_span.get(&self.x.head));
@@ -336,6 +356,7 @@ impl Conn {
                 || h.kind == HeaderKind::Expect
                 || (self.x.as_get && h.kind == HeaderKind::ContentLength)
                 || (!ops.is_empty() && ops.drops(name))
+                || (self.fill.is_some() && crate::cache_serve::dropped_on_fill(name))
             {
                 continue;
             }
@@ -357,6 +378,7 @@ impl Conn {
             headers::request(&mut self.x, ops, &mut out);
         }
         out.extend_from_slice(&self.x.auth_resp);
+        out.extend_from_slice(&self.x.cache_cond);
         if self.x.req.body == Body::Chunked && !self.x.as_get {
             out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
         }
@@ -394,7 +416,7 @@ impl Conn {
             .await
             .map_err(Err)?;
 
-        let head = self.x.req.method == Method::Head;
+        let head = self.x.req.method == Method::Head && !self.x.as_get_upstream;
         self.ubuf.end = 0;
         loop {
             if self.ubuf.end > 0
@@ -555,7 +577,14 @@ impl Conn {
         self.x.sent.bytes = 0;
         let head_bytes = out.len() as u64;
 
+        let head_only = self.fill.as_deref().is_some_and(|f| f.head_only);
         let complete = match coder.take() {
+            // A HEAD fetched as GET: the client gets the head, the store
+            // the body.
+            _ if head_only => match self.flush().await {
+                Ok(()) => self.store_body(up, mode, read_timeout).await,
+                Err(()) => Err(()),
+            },
             Some((k, _)) if mode != Mode::None => {
                 let k = k.into_coder(&std::sync::Arc::clone(&self.x.compressions));
                 self.body_coded(up, mode, read_timeout, k, client_chunked)
@@ -564,6 +593,7 @@ impl Conn {
             _ => self.body_out(up, mode, read_timeout).await,
         };
         self.x.sent.body_bytes = self.x.sent.bytes.saturating_sub(head_bytes);
+        self.fill_done = complete.is_ok();
         match complete {
             Ok(complete) => (keep, complete),
             Err(()) => (false, false),
@@ -667,6 +697,9 @@ impl Conn {
                     false
                 }
             };
+            if let Some(f) = &mut self.fill {
+                f.tee(&plain);
+            }
             coded.clear();
             if coder.write(&plain, &mut coded).is_err() {
                 break Err(());
@@ -749,6 +782,9 @@ impl Conn {
                 Mode::Length(_) => {
                     let take = left.min(self.ubuf.end as u64) as usize;
                     self.out.extend_from_slice(&self.ubuf.data[..take]);
+                    if let Some(f) = &mut self.fill {
+                        f.tee(&self.ubuf.data[..take]);
+                    }
                     self.ubuf.consume(take);
                     left -= take as u64;
                     left == 0
@@ -756,12 +792,18 @@ impl Conn {
                 Mode::Chunked | Mode::Dechunk => {
                     let data = &self.ubuf.data[..self.ubuf.end];
                     let out = &mut self.out;
-                    let take = if mode == Mode::Chunked {
-                        dec.advance(data)
-                    } else {
-                        dec.advance_with(data, |r| out.extend_from_slice(&data[r]))
-                    }
-                    .map_err(|_| ())?;
+                    let mut fill = self.fill.as_deref_mut();
+                    let chunked = mode == Mode::Chunked;
+                    let take = dec
+                        .advance_with(data, |r| {
+                            if let Some(f) = &mut fill {
+                                f.tee(&data[r.clone()]);
+                            }
+                            if !chunked {
+                                out.extend_from_slice(&data[r]);
+                            }
+                        })
+                        .map_err(|_| ())?;
                     if mode == Mode::Chunked {
                         self.out.extend_from_slice(&self.ubuf.data[..take]);
                     }
@@ -776,6 +818,9 @@ impl Conn {
                             self.out.extend_from_slice(b"\r\n");
                         }
                         self.out.extend_from_slice(&self.ubuf.data[..n]);
+                        if let Some(f) = &mut self.fill {
+                            f.tee(&self.ubuf.data[..n]);
+                        }
                         if mode == Mode::Encode {
                             self.out.extend_from_slice(b"\r\n");
                         }
@@ -811,6 +856,78 @@ impl Conn {
                     let _ = self.flush().await;
                     return Err(());
                 }
+                Ok(_) => {}
+            }
+        }
+    }
+
+    /// Reads the upstream response body into the cache only: a background
+    /// update, whose client was answered from the stale entry.
+    async fn body_store<S: AsyncRead + Unpin>(&mut self, up: &mut S, t: Duration) -> bool {
+        let mode = match self.resp.body {
+            Body::None => Mode::None,
+            Body::Length(n) => Mode::Length(n),
+            Body::Chunked => Mode::Dechunk,
+            Body::Close => Mode::Raw,
+        };
+        self.ubuf.consume(self.resp.head_len);
+        let r = self.store_body(up, mode, t).await;
+        self.fill_done = r.is_ok();
+        r == Ok(true)
+    }
+
+    /// Reads the upstream body in `mode` into the cache without sending it.
+    /// Returns whether the upstream is at a message boundary afterwards.
+    async fn store_body<S: AsyncRead + Unpin>(
+        &mut self,
+        up: &mut S,
+        mode: Mode,
+        t: Duration,
+    ) -> Result<bool, ()> {
+        let mut left = match mode {
+            Mode::Length(n) => n,
+            _ => 0,
+        };
+        let mut dec = ChunkedDecoder::new();
+        loop {
+            let data = &self.ubuf.data[..self.ubuf.end];
+            let mut fill = self.fill.as_deref_mut();
+            let done = match mode {
+                Mode::None => true,
+                Mode::Length(_) => {
+                    let take = left.min(data.len() as u64) as usize;
+                    if let Some(f) = &mut fill {
+                        f.tee(&data[..take]);
+                    }
+                    self.ubuf.consume(take);
+                    left -= take as u64;
+                    left == 0
+                }
+                Mode::Chunked | Mode::Dechunk => {
+                    let take = dec
+                        .advance_with(data, |r| {
+                            if let Some(f) = &mut fill {
+                                f.tee(&data[r]);
+                            }
+                        })
+                        .map_err(|_| ())?;
+                    self.ubuf.consume(take);
+                    dec.is_done()
+                }
+                Mode::Encode | Mode::Raw => {
+                    if let Some(f) = &mut fill {
+                        f.tee(data);
+                    }
+                    self.ubuf.end = 0;
+                    false
+                }
+            };
+            if done {
+                return Ok(true);
+            }
+            match read(up, &mut self.ubuf, BODY_BUF, t).await {
+                Ok(0) if matches!(mode, Mode::Encode | Mode::Raw) => return Ok(false),
+                Ok(0) | Err(_) => return Err(()),
                 Ok(_) => {}
             }
         }
