@@ -42,6 +42,7 @@ pub struct Runtime {
     /// Compression settings of routes and sites, by their index.
     pub compressions: Arc<[Compression]>,
     pub cache_zones: Box<[CacheZone]>,
+    pub wasm_modules: Box<[crate::wasm::WasmModule]>,
 }
 
 /// A parsed certificate chain and its private key.
@@ -1020,6 +1021,7 @@ impl Runtime {
                 rate_zones: snap.rate_zones.len(),
                 conn_zones: snap.conn_zones.len(),
                 upstreams: snap.upstreams.len(),
+                wasm_modules: snap.wasm_modules.len(),
                 cache_zones: snap.cache_zones.len(),
                 names: &names,
                 compressions: &mut compressions,
@@ -1213,8 +1215,20 @@ impl Runtime {
                 })
             })
             .collect::<Result<_, _>>()?;
+        let wasm_modules = snap
+            .wasm_modules
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                crate::wasm::module(m).map_err(|error| BuildError::Field {
+                    field: format!("wasm_modules[{i}].sha256"),
+                    error,
+                })
+            })
+            .collect::<Result<_, _>>()?;
         Ok(Self {
             revision: snap.revision,
+            wasm_modules,
             streams,
             listeners: listeners.into(),
             sites: sites.into(),
@@ -1252,6 +1266,7 @@ struct SiteBuilder<'a> {
     rate_zones: usize,
     conn_zones: usize,
     upstreams: usize,
+    wasm_modules: usize,
     cache_zones: usize,
     /// Lookup variable names templates may use.
     names: &'a [Box<str>],
@@ -1413,6 +1428,7 @@ impl SiteBuilder<'_> {
                     self.rate_zones,
                     self.conn_zones,
                     self.upstreams,
+                    self.wasm_modules,
                     self.names,
                 )
                 .map_err(|(f, e)| self.err(format!("{at}.access.{f}"), e))?,
@@ -1593,6 +1609,7 @@ impl Runtime {
             lookups: Arc::from([]),
             compressions: Arc::from([]),
             cache_zones: Box::default(),
+            wasm_modules: Box::default(),
         }
     }
 

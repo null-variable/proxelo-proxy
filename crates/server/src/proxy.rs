@@ -347,11 +347,15 @@ impl Conn {
         out.extend_from_slice(b" HTTP/1.1\r\n");
         let ops = &route.request_headers;
         let has_host = ops.drops(b"host");
+        let wasm = self.wasm_req.take();
         for h in self.x.req.headers.iter() {
             // Expect is answered here, not by the upstream. A request an
             // error page turned into a GET has no body any more.
             let name = h.name.get(&self.x.head);
             if h.kind.is_hop_by_hop()
+                || wasm
+                    .as_ref()
+                    .is_some_and(|(_, now)| !crate::wasm::has(now, name, h.value.get(&self.x.head)))
                 || h.kind == HeaderKind::Host
                 || h.kind == HeaderKind::Expect
                 || (self.x.as_get && h.kind == HeaderKind::ContentLength)
@@ -377,6 +381,10 @@ impl Conn {
         if !ops.is_empty() {
             headers::request(&mut self.x, ops, &mut out);
         }
+        if let Some((before, now)) = &wasm {
+            crate::wasm::push_added(&mut out, now, before);
+        }
+        self.wasm_req = wasm;
         out.extend_from_slice(&self.x.auth_resp);
         out.extend_from_slice(&self.x.cache_cond);
         if self.fill.is_some() && !self.x.slice_range.is_empty() {
@@ -487,6 +495,10 @@ impl Conn {
         } else {
             self.resp.status
         };
+        let wasm = match self.wasm_response(status) {
+            Ok(w) => w,
+            Err(st) => return (self.page(st).await, false),
+        };
         let ops = &route.response_headers;
         if ops.is_empty() {
             self.x.reset_extra();
@@ -525,6 +537,9 @@ impl Conn {
                     HeaderKind::Date | HeaderKind::Server | HeaderKind::Internal
                 )
                 || (!ops.is_empty() && ops.drops(name))
+                || wasm.as_ref().is_some_and(|(_, now)| {
+                    !crate::wasm::has(now, name, h.value.get(&self.ubuf.data))
+                })
             {
                 continue;
             }
@@ -574,6 +589,9 @@ impl Conn {
             out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
         }
         out.extend_from_slice(&self.x.sticky_cookie);
+        if let Some((before, now)) = &wasm {
+            crate::wasm::push_added(out, now, before);
+        }
         reply::connection(out, keep, &self.x.resp_extra);
         out.extend_from_slice(b"\r\n");
         self.ubuf.consume(self.resp.head_len);

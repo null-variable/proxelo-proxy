@@ -42,6 +42,7 @@ mod tap;
 mod tls;
 mod upstream;
 mod vars;
+mod wasm;
 mod worker;
 
 use std::net::{SocketAddr, TcpListener};
@@ -64,6 +65,10 @@ pub use log::reopen as reopen_logs;
 pub use sim::simulate;
 pub use tap::{set_filter as set_tap_filter, take as take_tap_events};
 pub use tls::set_tls_challenges;
+pub use wasm::{
+    set_dir as set_wasm_dir, store_module as store_wasm_module,
+    stored_modules as stored_wasm_modules,
+};
 pub use worker::set_id as set_worker_id;
 
 /// nginx's client_header_timeout bounds the TLS handshake too.
@@ -84,6 +89,8 @@ pub struct Active {
     caches: Box<[std::sync::Arc<cache::Zone>]>,
     /// QUIC settings of HTTP/3 listeners, indexed like `rt.listeners`.
     quic: Box<[Option<quinn::ServerConfig>]>,
+    /// proxy-wasm plugins of route filters, by site and route.
+    wasm: wasm::Table,
 }
 
 pub struct Server {
@@ -281,6 +288,7 @@ fn build(
         .enumerate()
         .map(|(i, l)| l.http3.then(|| h3::config(&rt, i)).transpose())
         .collect::<Result<_, _>>()?;
+    let wasm = wasm::build(&rt, old.map(|o| &o.wasm))?;
     let upstreams = rt
         .upstreams
         .iter()
@@ -299,6 +307,7 @@ fn build(
         tls,
         stream_tls,
         quic,
+        wasm,
         rt,
     })
 }

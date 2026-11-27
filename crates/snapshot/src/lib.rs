@@ -12,6 +12,7 @@ mod cond;
 mod lookup;
 mod runtime;
 mod template;
+mod wasm;
 
 use std::fmt;
 
@@ -32,6 +33,7 @@ pub use runtime::{
     StickyCookie, Stream, StreamRoute, Target, TryFiles, Upstream, UpstreamTls,
 };
 pub use template::{Part, Template, Var};
+pub use wasm::{WasmFilter, WasmModule, hex};
 
 use prost::Message;
 use proxelo_api::snapshot::v1::{

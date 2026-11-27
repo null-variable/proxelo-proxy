@@ -147,6 +147,7 @@ pub struct Access {
     pub basic_auth: Option<BasicAuth>,
     pub jwt: Option<crate::auth::Jwt>,
     pub oidc: Option<crate::auth::Oidc>,
+    pub wasm: Box<[crate::wasm::WasmFilter]>,
     pub forward_auth: Option<ForwardAuth>,
 }
 
@@ -158,6 +159,7 @@ impl Access {
             && self.basic_auth.is_none()
             && self.jwt.is_none()
             && self.oidc.is_none()
+            && self.wasm.is_empty()
             && self.forward_auth.is_none()
     }
 
@@ -271,6 +273,7 @@ pub(crate) fn access(
     rate_zones: usize,
     conn_zones: usize,
     upstreams: usize,
+    wasm_modules: usize,
     names: &[Box<str>],
 ) -> Result<Access, Invalid> {
     if let Some(i) = a.rate_limits.iter().position(|&z| z as usize >= rate_zones) {
@@ -337,6 +340,14 @@ pub(crate) fn access(
             .map(|j| crate::auth::jwt(j, names))
             .transpose()?,
         oidc: a.oidc.as_ref().map(crate::auth::oidc).transpose()?,
+        wasm: a
+            .wasm
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                crate::wasm::filter(f, wasm_modules).map_err(|(p, e)| (format!("wasm[{i}].{p}"), e))
+            })
+            .collect::<Result<_, _>>()?,
         forward_auth,
     })
 }
@@ -391,6 +402,7 @@ mod tests {
                 ],
                 ..Default::default()
             },
+            0,
             0,
             0,
             0,

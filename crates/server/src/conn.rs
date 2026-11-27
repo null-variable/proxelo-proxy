@@ -94,6 +94,13 @@ pub(crate) struct Conn {
     pub fill: Option<Box<crate::cache_serve::Fill>>,
     /// The body of a response being stored arrived complete.
     pub fill_done: bool,
+    /// Stream contexts of the route's proxy-wasm filters, open until the
+    /// request is logged.
+    pub wasm: Vec<crate::wasm::Session>,
+    /// The request headers before and after the filters changed them.
+    pub wasm_req: Option<(crate::wasm::Pairs, crate::wasm::Pairs)>,
+    /// A response a filter sends instead.
+    pub wasm_local: Option<crate::wasm::Local>,
 }
 
 /// Bytes after the head in a response built in one buffer.
@@ -142,6 +149,9 @@ impl Conn {
             gw_buf: Vec::new(),
             fill: None,
             fill_done: false,
+            wasm: Vec::new(),
+            wasm_req: None,
+            wasm_local: None,
         }
     }
 
@@ -226,6 +236,9 @@ impl Conn {
         let keep = self.handle_in(active, &mut done).await;
         self.holds.clear();
         self.finish(active, &done);
+        if !self.wasm.is_empty() || self.wasm_local.is_some() {
+            self.wasm_done();
+        }
         keep
     }
 
@@ -577,6 +590,22 @@ impl Conn {
             self.out.extend_from_slice(&self.x.auth_header);
         }
         let head = self.x.req.method == Method::Head;
+        // A filter's response; without a body it gets the default page.
+        if self.wasm_local.is_some()
+            && let Some(body) = self.wasm_local_head(wire)
+            && !body.is_empty()
+        {
+            self.out.extend_from_slice(b"Content-Length: ");
+            push_u64(&mut self.out, body.len() as u64);
+            self.out.extend_from_slice(b"\r\n");
+            reply::connection(&mut self.out, keep, &self.x.resp_extra);
+            self.out.extend_from_slice(b"\r\n");
+            let n = if head { 0 } else { body.len() };
+            if !head {
+                self.out.extend_from_slice(&body);
+            }
+            return self.send(keep, wire, n).await;
+        }
         reply::page(&mut self.out, status, keep, head, &self.x.resp_extra);
         let body = body_len(&self.out);
         self.send(keep, wire, body).await

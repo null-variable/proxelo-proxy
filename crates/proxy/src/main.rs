@@ -307,6 +307,7 @@ fn describe(o: &Options) -> String {
 
 /// Serves one snapshot file until terminated.
 fn serve(path: &Path, o: &Options) -> Result<(), String> {
+    proxelo_server::set_wasm_dir(o.data.join("proxy").join("wasm"));
     let (_, rt) = load(path)?;
     let workers = start_workers(o.workers, o.kind).map_err(|e| e.to_string())?;
     let revision = rt.revision;
@@ -328,6 +329,7 @@ fn serve(path: &Path, o: &Options) -> Result<(), String> {
 fn run(o: Options) -> Result<(), String> {
     let lkg = o.data.join("proxy").join("lkg.snap");
     proxelo_server::set_cache_dir(o.data.join("proxy").join("cache"));
+    proxelo_server::set_wasm_dir(o.data.join("proxy").join("wasm"));
     let upgrade = o.data.join("proxy").join("upgrade.sock");
     // A proxy already running on this data directory hands over its
     // listening sockets: this is a binary upgrade.
@@ -611,6 +613,14 @@ impl Apply for Node {
 
     fn tap_events(&mut self) -> Option<proxelo_sync::TapEvents> {
         proxelo_server::take_tap_events()
+    }
+
+    fn wasm_modules(&self) -> Vec<String> {
+        proxelo_server::stored_wasm_modules()
+    }
+
+    fn store_wasm(&mut self, sha256: &str, bytes: &[u8]) -> Result<(), String> {
+        proxelo_server::store_wasm_module(sha256, bytes)
     }
 
     fn challenges(&mut self, c: proxelo_sync::Challenges) {

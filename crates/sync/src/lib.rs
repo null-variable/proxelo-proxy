@@ -41,6 +41,15 @@ pub trait Apply {
     fn apply(&mut self, snap: Snapshot, bytes: &[u8]) -> Result<(), String>;
     /// Replaces the ACME challenges answered.
     fn challenges(&mut self, c: Challenges);
+    /// SHA-256 (lowercase hex) of the WebAssembly modules stored, reported
+    /// in Hello so only missing ones are sent.
+    fn wasm_modules(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Stores a WebAssembly module received whole.
+    fn store_wasm(&mut self, _sha256: &str, _bytes: &[u8]) -> Result<(), String> {
+        Err("no wasm host".into())
+    }
     /// Traffic counters since start, sent every [`STATS_INTERVAL`].
     fn stats(&self) -> Stats;
     /// Replaces the Live Tap filter.
@@ -137,6 +146,7 @@ impl Client {
                 node_id: self.node_id.clone(),
                 proxy_version: self.version.clone(),
                 active_revision: target.active_revision(),
+                wasm_modules: target.wasm_modules(),
             })),
         };
         tx.send(hello).await.map_err(Session::before)?;
@@ -156,6 +166,8 @@ impl Client {
         // A tap does not survive a reconnect: the control plane sends the
         // filter again if it is still wanted.
         target.tap(TapFilter::default());
+        // The module being received, (sha256, bytes so far).
+        let mut wasm: Option<(String, Vec<u8>)> = None;
         loop {
             let msg = tokio::select! {
                 _ = tick.tick() => {
@@ -192,6 +204,25 @@ impl Client {
                 }
                 Some(sync_response::Kind::Tap(f)) => {
                     target.tap(f);
+                    continue;
+                }
+                Some(sync_response::Kind::WasmChunk(c)) => {
+                    let (sha, bytes) = match wasm.take() {
+                        Some((sha, b)) if sha == c.sha256 && b.len() as u64 == c.offset => (sha, b),
+                        _ if c.offset == 0 => (c.sha256, Vec::new()),
+                        // A chunk out of order: the module is sent again
+                        // after the next reconnect.
+                        _ => continue,
+                    };
+                    let mut bytes = bytes;
+                    bytes.extend_from_slice(&c.data);
+                    if c.last {
+                        if let Err(e) = target.store_wasm(&sha, &bytes) {
+                            log(&format!("wasm module {sha}: {e}"));
+                        }
+                    } else {
+                        wasm = Some((sha, bytes));
+                    }
                     continue;
                 }
                 Some(sync_response::Kind::Purge(p)) => {

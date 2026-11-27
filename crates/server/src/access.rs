@@ -208,6 +208,10 @@ impl Conn {
         if let Some(o) = &a.oidc {
             crate::oidc::check(&mut self.x, o).await?;
         }
+        if !a.wasm.is_empty() {
+            let plugins = &active.wasm[site as usize][route as usize];
+            self.wasm_request(plugins).await?;
+        }
         if let Some(f) = &a.forward_auth {
             self.forward_auth(active, f).await?;
         }
