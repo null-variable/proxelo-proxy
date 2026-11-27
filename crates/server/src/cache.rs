@@ -192,7 +192,7 @@ pub(crate) fn zones(rt: &Runtime, old: Option<(&Runtime, &[Arc<Zone>])>) -> Box<
             let reused = old.and_then(|(ort, oz)| {
                 let i = ort.cache_zones.iter().position(|o| o.id == z.id)?;
                 let o = &oz[i];
-                (o.path == z.path && o.levels == z.levels).then(|| o.clone())
+                (o.path == base().join(&z.path) && o.levels == z.levels).then(|| o.clone())
             });
             if let Some(o) = reused {
                 *o.limits.lock().unwrap_or_else(|e| e.into_inner()) = limits;
@@ -200,7 +200,7 @@ pub(crate) fn zones(rt: &Runtime, old: Option<(&Runtime, &[Arc<Zone>])>) -> Box<
             }
             let zone = Arc::new(Zone {
                 id: z.id.clone(),
-                path: z.path.clone(),
+                path: base().join(&z.path),
                 levels: z.levels.clone(),
                 limits: Mutex::new(limits),
                 index: Mutex::new(Index::default()),
@@ -210,6 +210,18 @@ pub(crate) fn zones(rt: &Runtime, old: Option<(&Runtime, &[Arc<Zone>])>) -> Box<
             zone
         })
         .collect()
+}
+
+static BASE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Sets the directory relative zone paths are under, once at start.
+pub fn set_dir(dir: PathBuf) {
+    let _ = BASE.set(dir);
+}
+
+/// Where relative zone paths are; the working directory until set.
+fn base() -> &'static Path {
+    BASE.get().map_or(Path::new(""), PathBuf::as_path)
 }
 
 /// Loads the zone's files, then manages it until the zone is dropped.

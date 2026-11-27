@@ -120,15 +120,22 @@ impl Cache {
 }
 
 pub(crate) fn zone(z: &ir::CacheZone) -> Result<CacheZone, (&'static str, String)> {
-    if !z.path.starts_with('/') {
-        return Err(("path", "must be an absolute path".into()));
+    let path = PathBuf::from(&z.path);
+    let parts_ok = path.components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::RootDir
+        )
+    });
+    if z.path.is_empty() || !parts_ok {
+        return Err(("path", "must be a directory without . or .. parts".into()));
     }
     if z.levels.len() > 3 || z.levels.iter().any(|&l| !(1..=2).contains(&l)) {
         return Err(("levels", "at most three levels of 1 or 2".into()));
     }
     Ok(CacheZone {
         id: z.id.as_str().into(),
-        path: PathBuf::from(&z.path),
+        path,
         levels: z.levels.iter().map(|&l| l as u8).collect(),
         max_size: z.max_size,
         max_entries: if z.max_entries == 0 {

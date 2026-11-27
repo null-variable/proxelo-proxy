@@ -327,6 +327,7 @@ fn serve(path: &Path, o: &Options) -> Result<(), String> {
 /// while the control plane is down.
 fn run(o: Options) -> Result<(), String> {
     let lkg = o.data.join("proxy").join("lkg.snap");
+    proxelo_server::set_cache_dir(o.data.join("proxy").join("cache"));
     let upgrade = o.data.join("proxy").join("upgrade.sock");
     // A proxy already running on this data directory hands over its
     // listening sockets: this is a binary upgrade.

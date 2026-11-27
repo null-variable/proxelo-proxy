@@ -49,6 +49,7 @@ use proxelo_snapshot::Runtime;
 use socket2::{Domain, Protocol, Socket, Type};
 
 pub use acme::set_http_challenges;
+pub use cache::set_dir as set_cache_dir;
 pub use handoff::{
     Handoff, Inherited, Predecessor, Successor, UpgradeListener, listen as listen_upgrade,
     take_over,

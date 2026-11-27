@@ -1126,8 +1126,8 @@ dependencies = [
 
 [[package]]
 name = "proxelo-api"
-version = "0.15.0"
-source = "git+https://github.com/null-variable/proxelo-api?tag=v0.15.0#745d561016f3e4310dd4544d42cffc6fee032ec4"
+version = "0.15.1"
+source = "git+https://github.com/null-variable/proxelo-api?tag=v0.15.1#6f6aebe51a1eea308bd56e126e8c66f66be50d2e"
 dependencies = [
  "prost",
  "protox",
