@@ -50,7 +50,9 @@ Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
   with burst, delay and nodelay, as `limit_req`) and requests in progress
   per key (`limit_conn`), zones kept across swaps; allow/deny by address;
   basic auth with htpasswd hashes (bcrypt, `$apr1$`, `$1$`, `$5$`, `$6$`,
-  `{SHA}`, `{SSHA}`); forward auth to an upstream as `auth_request`.
+  `{SHA}`, `{SSHA}`); forward auth to an upstream as `auth_request`;
+  `real_ip` per site from trusted proxies, and `limit_rate` with
+  `limit_rate_after` on responses.
 - JWT as nginx `auth_jwt`: HMAC, RSA (PKCS#1 and PSS), ECDSA and EdDSA
   signatures against inline or fetched JSON Web Key Sets (refetched on an
   unknown `kid`), `exp`/`nbf` with leeway, issuer and audience, and the
@@ -64,8 +66,6 @@ Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
   data directory with their compiled code; started instances are pooled
   and carried across snapshots. Memory and per-callback time limits, no
   file system or network, and fail open or closed per filter.
-  `real_ip` per site from trusted proxies, and `limit_rate` with
-  `limit_rate_after` on responses.
 - TLS with OpenSSL 3: protocol versions, ciphers, groups, session cache and
   tickets, DH parameters and client certificates per listener, one
   certificate per site chosen by SNI with the same lookup as `Host`, a
