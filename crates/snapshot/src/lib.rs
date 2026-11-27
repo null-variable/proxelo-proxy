@@ -26,11 +26,12 @@ pub use compression::{Compression, Encoding, Proxied, StaticGz};
 pub use cond::{Cond, Expr, Facts};
 pub use lookup::{GeoTable, Lookup, MapTable, SplitTable, Table, murmur2};
 pub use runtime::{
-    AccessLog, Action, Balancing, BuildError, Captures, Certificate, CheckKind, ClientAuth,
-    ClientAuthMode, ErrorPage, ErrorTarget, Fallback, Gateway, GatewayParam, GatewayProtocol,
-    HeaderOps, HeaderValue, HealthCheck, Listener, ListenerTls, MatchError, Memcached, NextOn,
-    Pattern, Proxy, Resolved, Return, Rewrite, RewriteFlag, Route, Runtime, Site, Sticky,
-    StickyCookie, Stream, StreamRoute, Target, TryFiles, Upstream, UpstreamTls, discovered_key,
+    AccessLog, Action, Autoindex, AutoindexFormat, Balancing, BuildError, Captures, Certificate,
+    CheckKind, ClientAuth, ClientAuthMode, Dav, ErrorPage, ErrorTarget, Fallback, Gateway,
+    GatewayParam, GatewayProtocol, HeaderOps, HeaderValue, HealthCheck, Listener, ListenerTls,
+    MatchError, Memcached, NextOn, Pattern, Proxy, Resolved, Return, Rewrite, RewriteFlag, Route,
+    Runtime, Site, StaticHandlers, Sticky, StickyCookie, Stream, StreamRoute, Target, TryFiles,
+    Upstream, UpstreamTls, discovered_key,
 };
 pub use template::{Part, Template, Var};
 pub use wasm::{WasmFilter, WasmModule, hex};

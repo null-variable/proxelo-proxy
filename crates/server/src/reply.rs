@@ -180,6 +180,7 @@ pub(crate) fn mime(path: &[u8]) -> &'static [u8] {
         (b"woff2", b"font/woff2"),
         (b"mp4", b"video/mp4"),
         (b"webm", b"video/webm"),
+        (b"flv", b"video/x-flv"),
         (b"mp3", b"audio/mpeg"),
     ];
     TABLE

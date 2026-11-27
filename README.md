@@ -37,11 +37,14 @@ Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
   snapshots and simulate requests with this engine (same parser, site lookup
   and phases; proxying reports the upstream instead of connecting).
 - Static files (`root`, `index`) with byte ranges (single, multipart,
-  `If-Range`, 416 as nginx) and reverse proxying with smooth weighted
+  `If-Range`, 416 as nginx), directory listings (`autoindex` in HTML, JSON,
+  JSONP or XML), `random_index`, WebDAV (`dav_methods` PUT, DELETE, MKCOL,
+  COPY, MOVE), `flv` seeking, and reverse proxying with smooth weighted
   round robin, least_conn, ip_hash, hash and hash consistent (the same
   targets as nginx), random and random two; backup and down targets,
   `max_conns` with a request queue, slow start, sticky sessions by cookie or
-  route, targets re-resolved through DNS; passive health (`max_fails`,
+  route, targets re-resolved through DNS or sent by the control plane's
+  discovery (Docker, Kubernetes, Consul) without a new snapshot; passive health (`max_fails`,
   `fail_timeout`) and active HTTP or TCP health checks; `proxy_next_upstream`
   retries on errors, timeouts and listed statuses, per-route timeouts and
   keepalive upstream connections with an idle timeout, a request limit and

@@ -369,6 +369,59 @@ impl Conn {
         self.respond(keep).await
     }
 
+    /// nginx flv: the file from byte `start`, after the 13-byte FLV header,
+    /// as a 200 without ranges.
+    pub async fn send_flv(
+        &mut self,
+        mut file: File,
+        meta: &Metadata,
+        start: u64,
+        ops: &HeaderOps,
+    ) -> KeepAlive {
+        const HEADER: &[u8] = b"FLV\x01\x05\0\0\0\x09\0\0\0\0";
+        let len = meta.len();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+        let status = self.x.status(200);
+        self.extra(ops, status);
+        let keep = self.x.req.keep_alive;
+        let body_len = HEADER.len() as u64 + len - start;
+        let out = &mut self.out;
+        out.clear();
+        reply::start(out, status, b"");
+        out.extend_from_slice(b"Content-Type: ");
+        out.extend_from_slice(reply::mime(&self.x.path));
+        out.extend_from_slice(b"\r\nContent-Length: ");
+        push_u64(out, body_len);
+        out.extend_from_slice(b"\r\nLast-Modified: ");
+        out.extend_from_slice(&http_date(mtime));
+        out.extend_from_slice(b"\r\nETag: \"");
+        push_hex(out, mtime);
+        out.push(b'-');
+        push_hex(out, len);
+        out.extend_from_slice(b"\"\r\nAccept-Ranges: bytes\r\n");
+        reply::connection(out, keep, &self.x.resp_extra);
+        out.extend_from_slice(b"\r\n");
+        self.x.sent.status = status;
+        self.x.sent.bytes = out.len() as u64;
+        if self.x.req.method == Method::Head {
+            return self.respond(keep).await;
+        }
+        self.x.sent.bytes += body_len;
+        self.x.sent.body_bytes = body_len;
+        if keep && self.pump_body(crate::conn::Sink::Drop).await.is_err() {
+            return false;
+        }
+        self.out.extend_from_slice(HEADER);
+        if !self.send_span(&mut file, Span { start, end: len }).await {
+            return false;
+        }
+        keep
+    }
+
     /// A directory without a trailing slash gets a 301 to the same URI with
     /// one, absolute, from the Host header and the listen port.
     pub async fn redirect_dir(&mut self) -> KeepAlive {

@@ -71,6 +71,11 @@ thread_local! {
 }
 
 /// The local time, formatted at most once per second per thread.
+/// The local time zone's offset from UTC now, in seconds.
+pub(crate) fn utc_offset() -> i32 {
+    ZONE.to_offset(Timestamp::now()).seconds()
+}
+
 pub(crate) fn clock() -> Clock {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

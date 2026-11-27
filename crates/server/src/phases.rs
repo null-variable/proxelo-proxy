@@ -40,6 +40,12 @@ pub(crate) enum Outcome {
     File(File, Metadata, bool),
     /// A directory without a trailing slash: 301 to the path with one.
     Directory,
+    /// A directory listing (autoindex) of the directory in `scratch`.
+    Autoindex(proxelo_snapshot::Autoindex),
+    /// A WebDAV method of the route's static action.
+    Dav,
+    /// An FLV file from this byte, after the FLV header (nginx flv).
+    Flv(File, Metadata, u64),
     /// Proxy to this upstream with these settings.
     Proxy(proxelo_snapshot::Proxy),
     /// A gateway, memcached or grpc action of the route, with its upstream
@@ -233,8 +239,24 @@ impl<'s> Phases<'s> {
                 root,
                 index,
                 try_files,
+                handlers,
             } => {
+                if let Some(d) = &handlers.dav
+                    && crate::dav::method(x, d).is_some()
+                {
+                    return Ok(Outcome::Dav);
+                }
                 if !matches!(x.req.method, Method::Get | Method::Head) {
+                    // POST to a directory: nginx index takes it; with no
+                    // index file every handler declines and the answer is
+                    // 403. Other methods get static's 405.
+                    if x.req.method == Method::Post && x.path.ends_with(b"/") {
+                        if let Static::Index = resolve_static(x, root, index) {
+                            x.uri_changed = true;
+                            return Err(Next::Server);
+                        }
+                        return Err(Next::Error(403));
+                    }
                     return Err(Next::Error(405));
                 }
                 if let Some(t) = try_files
@@ -255,7 +277,30 @@ impl<'s> Phases<'s> {
                         Fallback::Route(r) => Next::Route(*r, true),
                     });
                 }
+                if handlers.random_index
+                    && x.path.ends_with(b"/")
+                    && crate::autoindex::random_file(x, root)
+                {
+                    x.uri_changed = true;
+                    self.note(|| format!("random_index {}", String::from_utf8_lossy(&x.path)));
+                    return Err(Next::Server);
+                }
+                if handlers.flv
+                    && !x.path.ends_with(b"/")
+                    && let Some(start) = flv_start(x)
+                    && let Static::File(f, m) = resolve_static(x, root, index)
+                {
+                    if start < m.len() {
+                        return Ok(Outcome::Flv(f, m, start));
+                    }
+                    return Ok(Outcome::File(f, m, false));
+                }
                 match resolve_static(x, root, index) {
+                    Static::Status(403)
+                        if x.path.ends_with(b"/") && handlers.autoindex.is_some() =>
+                    {
+                        Ok(Outcome::Autoindex(handlers.autoindex.expect("checked")))
+                    }
                     Static::Index => {
                         x.uri_changed = true;
                         self.note(|| format!("index {}", String::from_utf8_lossy(&x.path)));
@@ -446,6 +491,15 @@ pub(crate) enum Static {
     /// A directory addressed without a trailing slash.
     Directory,
     Status(u16),
+}
+
+/// The `start` argument of an FLV request when it is a positive offset.
+fn flv_start(x: &Exchange) -> Option<u64> {
+    let v = x
+        .args
+        .split(|&c| c == b'&')
+        .find_map(|kv| kv.strip_prefix(b"start="))?;
+    std::str::from_utf8(v).ok()?.parse().ok().filter(|&n| n > 0)
 }
 
 /// nginx `root` + `index`. The file system path is left in `scratch`.

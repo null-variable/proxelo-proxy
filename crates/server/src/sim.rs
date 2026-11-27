@@ -168,7 +168,11 @@ pub fn simulate(rt: &Runtime, r: &HttpRequest) -> SimResult {
             out.kind = Kind::Response as i32;
             out.status = s.into();
         }
-        Outcome::File(..) => {
+        Outcome::Autoindex(_) | Outcome::Dav => {
+            out.kind = Kind::Response as i32;
+            out.status = x.status(200).into();
+        }
+        Outcome::File(..) | Outcome::Flv(..) => {
             out.kind = Kind::File as i32;
             out.status = x.status(200).into();
             out.file = text(&x.scratch);

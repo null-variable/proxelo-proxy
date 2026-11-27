@@ -386,6 +386,8 @@ pub enum Action {
         root: Box<[u8]>,
         index: Box<[Box<[u8]>]>,
         try_files: Option<TryFiles>,
+        /// The content handlers besides the file itself.
+        handlers: Box<StaticHandlers>,
     },
     Proxy(Proxy),
     Return(Return),
@@ -525,6 +527,44 @@ pub struct Rewrite {
     /// The replacement starts with `http://`, `https://` or `$scheme`, which
     /// makes the rewrite a redirect whatever the flag.
     pub absolute: bool,
+}
+
+/// nginx content handlers of a static location other than the file one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StaticHandlers {
+    pub autoindex: Option<Autoindex>,
+    pub random_index: bool,
+    pub dav: Option<Dav>,
+    pub flv: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoindexFormat {
+    Html,
+    Json,
+    Jsonp,
+    Xml,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Autoindex {
+    pub format: AutoindexFormat,
+    pub localtime: bool,
+    pub exact_size: bool,
+}
+
+/// nginx dav_methods and its settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dav {
+    pub put: bool,
+    pub delete: bool,
+    pub mkcol: bool,
+    pub copy: bool,
+    pub moves: bool,
+    pub create_full_put_path: bool,
+    pub min_delete_depth: u32,
+    /// Mode bits of created files.
+    pub access: u32,
 }
 
 #[derive(Debug)]
@@ -1401,10 +1441,38 @@ impl SiteBuilder<'_> {
                     Some(t) => Some(self.try_files(t, &format!("{at}.action.static.try_files"))?),
                     None => None,
                 };
+                let at = format!("{at}.action.static");
+                if st.dav.as_ref().is_some_and(|d| d.access > 0o777) {
+                    return Err(self.err(format!("{at}.dav.access"), "must be at most 0777"));
+                }
                 Action::Static {
                     root: st.root.trim_end_matches('/').as_bytes().into(),
                     index: st.index.iter().map(|i| i.as_bytes().into()).collect(),
                     try_files,
+                    handlers: Box::new(StaticHandlers {
+                        autoindex: st.autoindex.as_ref().map(|a| Autoindex {
+                            format: match a.format() {
+                                ir::autoindex::Format::Unspecified => AutoindexFormat::Html,
+                                ir::autoindex::Format::Json => AutoindexFormat::Json,
+                                ir::autoindex::Format::Jsonp => AutoindexFormat::Jsonp,
+                                ir::autoindex::Format::Xml => AutoindexFormat::Xml,
+                            },
+                            localtime: a.localtime,
+                            exact_size: !a.approximate_size,
+                        }),
+                        random_index: st.random_index,
+                        dav: st.dav.as_ref().map(|d| Dav {
+                            put: d.put,
+                            delete: d.delete,
+                            mkcol: d.mkcol,
+                            copy: d.copy,
+                            moves: d.r#move,
+                            create_full_put_path: d.create_full_put_path,
+                            min_delete_depth: d.min_delete_depth,
+                            access: if d.access == 0 { 0o600 } else { d.access },
+                        }),
+                        flv: st.flv,
+                    }),
                 }
             }
             Some(action::Kind::Proxy(p)) => Action::Proxy(proxy(p)),

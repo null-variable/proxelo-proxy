@@ -8,11 +8,13 @@
 
 mod access;
 mod acme;
+mod autoindex;
 mod buf;
 mod cache;
 mod cache_serve;
 mod compress;
 mod conn;
+mod dav;
 pub mod drain;
 mod exchange;
 mod fetch;

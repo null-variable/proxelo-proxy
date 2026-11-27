@@ -396,6 +396,28 @@ impl Conn {
                     self.extra(ops, 301);
                     self.redirect_dir().await
                 }
+                Outcome::Autoindex(ai) => {
+                    self.extra(ops, 200);
+                    match self.send_autoindex(ai).await {
+                        Ok(keep) => keep,
+                        Err(status) => {
+                            phases.fail(status);
+                            continue;
+                        }
+                    }
+                }
+                Outcome::Dav => {
+                    let route = &site.routes[phases.route.expect("dav has a route") as usize];
+                    self.extra(ops, 204);
+                    match self.dav(&route.action).await {
+                        Ok(keep) => keep,
+                        Err(status) => {
+                            phases.fail(status);
+                            continue;
+                        }
+                    }
+                }
+                Outcome::Flv(f, m, start) => self.send_flv(f, &m, start, ops).await,
                 Outcome::Close => {
                     self.x.sent.status = 444;
                     false
@@ -420,7 +442,7 @@ impl Conn {
 
     /// Writes `out` and records what was sent, encoded when the response
     /// is to be compressed.
-    async fn send(&mut self, keep: KeepAlive, status: u16, body: usize) -> KeepAlive {
+    pub(crate) async fn send(&mut self, keep: KeepAlive, status: u16, body: usize) -> KeepAlive {
         let head = self.out.len() - body;
         // Encode first: `&&` would skip it for responses that close anyway.
         let close = self.encode_buffered(status, body);

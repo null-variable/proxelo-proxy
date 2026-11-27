@@ -180,7 +180,7 @@ thread_local! {
 }
 
 /// xorshift64: the random methods need spread, not secrecy.
-fn rand() -> u64 {
+pub(crate) fn rand() -> u64 {
     RNG.with(|r| {
         let mut x = r.get();
         x ^= x << 13;
