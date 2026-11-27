@@ -41,8 +41,6 @@ pub struct Cache {
     pub revalidate: bool,
     pub ignore: Ignore,
     pub keep_head: bool,
-    /// Bytes per slice; 0 for whole responses.
-    pub slice: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +203,9 @@ pub(crate) fn build(
             I::Vary => ignore.vary = true,
         }
     }
+    if c.slice != 0 {
+        return Err(("slice", "slices are not supported".into()));
+    }
     if c.background_update && !stale.updating {
         return Err(("background_update", "needs use_stale updating".into()));
     }
@@ -243,6 +244,5 @@ pub(crate) fn build(
         revalidate: c.revalidate,
         ignore,
         keep_head: c.keep_head,
-        slice: c.slice,
     })
 }
