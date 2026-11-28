@@ -149,6 +149,8 @@ pub(crate) struct Plan {
     pub weak: bool,
     sub: Option<Sub>,
     recode: Option<Recoder>,
+    /// addition: the filters whose before and after URIs wrap the body.
+    addition: Option<Arc<Filters>>,
 }
 
 impl Plan {
@@ -179,6 +181,8 @@ impl Plan {
             g: Vec::new(),
             sub: self.sub.take(),
             recode: self.recode.take(),
+            addition: self.addition.take(),
+            started: false,
             coder,
             a: Vec::new(),
             b: Vec::new(),
@@ -209,8 +213,21 @@ pub(crate) fn plan(
         p.drop_validators = !s.last_modified;
         p.weak = s.last_modified;
     }
-    if let Some(c) = &f.charset {
+    if let Some(c) = &f.charset
+        && !x.is_sub()
+    {
         charset(&f, c, status, ctype, encoded, &mut p);
+    }
+    // nginx addition: the main request's 200 only.
+    if let Some(a) = &f.addition
+        && status == 200
+        && !x.is_sub()
+        && (!a.before.is_empty() || !a.after.is_empty())
+        && a.types.matches(ctype)
+    {
+        p.addition = Some(Arc::clone(&f));
+        p.reframe = true;
+        p.weak = true;
     }
     p
 }
@@ -467,27 +484,85 @@ pub(crate) struct Chain {
     g: Vec<u8>,
     sub: Option<Sub>,
     recode: Option<Recoder>,
+    addition: Option<Arc<Filters>>,
+    /// Body bytes went through: the before part was added.
+    started: bool,
     coder: Option<Coder>,
     a: Vec<u8>,
     b: Vec<u8>,
 }
 
+/// Feeds `data` to the encoder, or appends it to `out` without one.
+fn emit(coder: &mut Option<Coder>, data: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+    match coder {
+        Some(k) => k.write(data, out),
+        None => {
+            out.extend_from_slice(data);
+            Ok(())
+        }
+    }
+}
+
 impl Chain {
-    /// Feeds body bytes; the output goes to the end of `out`.
-    pub fn write(&mut self, data: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
-        self.run(data, false, out)
+    /// Feeds body bytes of the request `x`; the output goes to the end of
+    /// `out`.
+    pub async fn write(
+        &mut self,
+        x: &mut Exchange,
+        data: &[u8],
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        self.run(x, data, false, out).await
     }
 
     /// Ends the body.
-    pub fn finish(mut self, out: &mut Vec<u8>) -> io::Result<()> {
-        self.run(&[], true, out)?;
+    pub async fn finish(mut self, x: &mut Exchange, out: &mut Vec<u8>) -> io::Result<()> {
+        self.run(x, &[], true, out).await?;
         match self.coder.take() {
             Some(k) => k.finish(out),
             None => Ok(()),
         }
     }
 
-    fn run(&mut self, data: &[u8], last: bool, out: &mut Vec<u8>) -> io::Result<()> {
+    /// The answer of addition's `uri`, whatever its status, as nginx
+    /// outputs it in place.
+    async fn addition(&mut self, x: &Exchange, before: bool, out: &mut Vec<u8>) -> io::Result<()> {
+        let Some(f) = &self.addition else {
+            return Ok(());
+        };
+        let Some(a) = &f.addition else {
+            return Ok(());
+        };
+        let uri = if before { &a.before } else { &a.after };
+        if uri.is_empty() {
+            return Ok(());
+        }
+        let Some(r) = crate::subrequest::run(x, b"GET", uri, b"", None).await else {
+            return Err(io::ErrorKind::Other.into());
+        };
+        emit(&mut self.coder, &r.body, out)
+    }
+
+    async fn run(
+        &mut self,
+        x: &mut Exchange,
+        data: &[u8],
+        last: bool,
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        if !self.started {
+            self.started = true;
+            self.addition(x, true, out).await?;
+        }
+        self.filters(data, last, out)?;
+        if last {
+            self.addition(x, false, out).await?;
+        }
+        Ok(())
+    }
+
+    /// The synchronous filters, then the encoder.
+    fn filters(&mut self, data: &[u8], last: bool, out: &mut Vec<u8>) -> io::Result<()> {
         let mut a = std::mem::take(&mut self.a);
         let mut b = std::mem::take(&mut self.b);
         let mut g = std::mem::take(&mut self.g);
@@ -522,13 +597,7 @@ impl Chain {
             r.write(cur, last, &mut b);
             cur = &b;
         }
-        let r = match &mut self.coder {
-            Some(k) => k.write(cur, out),
-            None => {
-                out.extend_from_slice(cur);
-                Ok(())
-            }
-        };
+        let r = emit(&mut self.coder, cur, out);
         self.a = a;
         self.b = b;
         self.g = g;
@@ -541,7 +610,11 @@ impl crate::conn::Conn {
     /// bytes after the head). Returns the new body length, whether the body
     /// still needs framing (its length changed) and whether the connection
     /// closes after it.
-    pub(crate) fn filter_buffered(&mut self, status: u16, body: usize) -> (usize, bool, bool) {
+    pub(crate) async fn filter_buffered(
+        &mut self,
+        status: u16,
+        body: usize,
+    ) -> (usize, bool, bool) {
         if self.x.filters.is_none() {
             return (body, false, false);
         }
@@ -573,9 +646,12 @@ impl crate::conn::Conn {
         let start = out.len();
         if p.reframe && !head_only {
             let mut chain = p.chain(None);
-            let r = chain
-                .write(&self.out[head_end..], &mut out)
-                .and_then(|()| chain.finish(&mut out));
+            let mut r = chain
+                .write(&mut self.x, &self.out[head_end..], &mut out)
+                .await;
+            if r.is_ok() {
+                r = chain.finish(&mut self.x, &mut out).await;
+            }
             if r.is_err() {
                 out.truncate(start);
             }

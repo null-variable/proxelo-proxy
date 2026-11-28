@@ -112,6 +112,11 @@ pub(crate) struct RespFacts<'a> {
 /// nginx ngx_http_gzip_ok for this request, without the token: HTTP
 /// version, gzip_proxied for requests with Via, and gzip_disable.
 fn request_ok(x: &Exchange, c: &Compression, resp: &RespFacts) -> bool {
+    // nginx ngx_http_gzip_ok declines subrequests: their output goes into
+    // the main response, which is compressed (or not) as a whole.
+    if x.is_sub() {
+        return false;
+    }
     if x.req.version == Version::Http10 && !x.h2 && !c.http10 {
         return false;
     }

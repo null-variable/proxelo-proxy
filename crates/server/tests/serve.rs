@@ -748,8 +748,23 @@ fn response_filters() {
         }),
         ..Default::default()
     });
+    std::fs::create_dir_all(root.join("hidden")).unwrap();
+    std::fs::write(root.join("hidden/top.html"), "<h1>top</h1>").unwrap();
+    std::fs::write(root.join("hidden/end.html"), "<i>end</i>").unwrap();
+    std::fs::create_dir_all(root.join("add")).unwrap();
+    std::fs::write(root.join("add/body.html"), "body").unwrap();
+    std::fs::write(root.join("add/data.json"), "{}").unwrap();
     let mut internal = route(Prefix, "/hidden/", static_root(&root));
     internal.internal = true;
+    let mut added = route(Prefix, "/add/", static_root(&root));
+    added.filters = Some(ir::Filters {
+        addition: Some(ir::Addition {
+            before: "/hidden/top.html".into(),
+            after: "/hidden/end.html".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
     let up = canned(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 11\r\nETag: \"x\"\r\n\r\nsay hello!\n");
     let mut proxied = route(Prefix, "/up/", proxy(0));
     proxied.filters = Some(ir::Filters {
@@ -764,7 +779,7 @@ fn response_filters() {
         ..Default::default()
     });
     let (_, addr) = start(&snapshot(
-        vec![static_route, internal, proxied],
+        vec![static_route, internal, proxied, added],
         vec![upstream(&[up], 0)],
     ));
     let host = "Host: example.com\r\n";
@@ -819,4 +834,29 @@ fn response_filters() {
     assert!(h.contains("ETag: W/\"x\"\r\n"), "{h}");
     assert!(!h.contains("Content-Length"), "{h}");
     assert_eq!(dechunk(&b), b"say hi!\n");
+
+    // addition wraps a 200 of its types with the internal routes' answers.
+    let (h, b) = get(addr, &format!("GET /add/body.html HTTP/1.1\r\n{host}\r\n"));
+    assert_eq!(status(&h), 200, "{h}");
+    assert!(
+        !h.contains("Content-Length") && !h.contains("Accept-Ranges"),
+        "{h}"
+    );
+    assert!(h.contains("ETag: W/\""), "{h}");
+    assert_eq!(dechunk(&b), b"<h1>top</h1>body<i>end</i>");
+    // HTTP/1.0 gets it unframed, then the connection closes.
+    let (h, b) = get(addr, &format!("GET /add/body.html HTTP/1.0\r\n{host}\r\n"));
+    assert!(!h.contains("Transfer-Encoding"), "{h}");
+    assert_eq!(b, b"<h1>top</h1>body<i>end</i>");
+    // Other types and statuses pass as they are.
+    let (_, b) = get(addr, &format!("GET /add/data.json HTTP/1.1\r\n{host}\r\n"));
+    assert_eq!(b, b"{}");
+    let (h, _) = get(addr, &format!("GET /add/nope.html HTTP/1.1\r\n{host}\r\n"));
+    assert_eq!(status(&h), 404, "{h}");
+    let (h, b) = get(
+        addr,
+        &format!("GET /add/body.html HTTP/1.1\r\n{host}Range: bytes=0-1\r\n\r\n"),
+    );
+    assert_eq!(status(&h), 200, "{h}");
+    assert_eq!(dechunk(&b), b"<h1>top</h1>body<i>end</i>");
 }

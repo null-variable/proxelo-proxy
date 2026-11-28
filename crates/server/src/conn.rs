@@ -72,8 +72,6 @@ pub(crate) type KeepAlive = bool;
 
 pub(crate) struct Conn {
     pub client: Stream,
-    /// Address of the socket that accepted the connection.
-    listener: SocketAddr,
     served: bool,
     pub buf: Buf,
     pub ubuf: Buf,
@@ -132,9 +130,9 @@ impl Conn {
     pub fn new(client: Stream, listener: SocketAddr, local: SocketAddr, peer: SocketAddr) -> Self {
         let mut x = Exchange::new(local, peer);
         x.conn_id = next_id();
+        x.listener = listener;
         Self {
             client,
-            listener,
             served: false,
             buf: Buf::new(),
             ubuf: Buf::new(),
@@ -172,11 +170,38 @@ impl Conn {
             if self.x.requests >= KEEPALIVE_REQUESTS || drain::draining() {
                 self.x.req.keep_alive = false;
             }
-            if !self.handle(&active).await {
+            self.x.active = Some(std::sync::Arc::clone(&active));
+            let keep = self.handle(&active).await;
+            self.x.active = None;
+            if !keep {
                 return;
             }
             self.served = true;
         }
+    }
+
+    /// Serves the one request of a subrequest (see `subrequest`). Returns
+    /// whether the answer was a generated error page. The future is boxed
+    /// with its type spelled out: filters that make subrequests run inside
+    /// it, so its `Send` bound cannot be inferred through the recursion.
+    pub(crate) fn serve_sub(
+        mut self,
+        active: std::sync::Arc<Active>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+        Box::pin(async move {
+            match self.read_head().await {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(e) => {
+                    self.error(e.status()).await;
+                    return true;
+                }
+            }
+            self.x.req.keep_alive = false;
+            self.x.active = Some(std::sync::Arc::clone(&active));
+            self.handle(&active).await;
+            self.x.paged
+        })
     }
 
     /// Reads until a full request head is buffered. `Ok(false)` means the
@@ -245,6 +270,10 @@ impl Conn {
 
     /// Logs the request and counts it.
     fn finish(&mut self, active: &Active, done: &Done) {
+        // nginx log_subrequest off.
+        if self.x.is_sub() {
+            return;
+        }
         let Some(site) = done.site else {
             return;
         };
@@ -305,7 +334,7 @@ impl Conn {
         }
         // The listener was removed by a swap after this connection was
         // accepted. Its socket is closed; close the connection too.
-        let Some(listener) = active.rt.listener(self.listener) else {
+        let Some(listener) = active.rt.listener(self.x.listener) else {
             return false;
         };
         // nginx add_header Alt-Svc 'h3=":port"' for listen ... quic.
@@ -338,9 +367,12 @@ impl Conn {
         loop {
             let outcome = phases.run(&mut self.x);
             done.route = phases.route;
-            crate::filter::userid_lines(&mut self.x);
-            if !self.x.uid_lines.is_empty() {
-                self.x.reset_extra();
+            // userid runs for the main request only.
+            if !self.x.is_sub() {
+                crate::filter::userid_lines(&mut self.x);
+                if !self.x.uid_lines.is_empty() {
+                    self.x.reset_extra();
+                }
             }
             let ops = match phases.route {
                 Some(r) => &site.routes[r as usize].response_headers,
@@ -426,6 +458,11 @@ impl Conn {
                     self.x.sent.status = 444;
                     false
                 }
+                // nginx skips the access phase for subrequests.
+                Outcome::Access(r) if self.x.is_sub() => {
+                    phases.accessed(r, Ok(()));
+                    continue;
+                }
                 Outcome::Access(r) => {
                     let result = self.access(active, site_index, r).await;
                     phases.accessed(r, result);
@@ -447,7 +484,7 @@ impl Conn {
     /// Writes `out` and records what was sent, encoded when the response
     /// is to be compressed.
     pub(crate) async fn send(&mut self, keep: KeepAlive, status: u16, body: usize) -> KeepAlive {
-        let (body, frame, filter_close) = self.filter_buffered(status, body);
+        let (body, frame, filter_close) = self.filter_buffered(status, body).await;
         let head = self.out.len() - body;
         // Encode first: `&&` would skip it for responses that close anyway.
         let (close, encoded) = self.encode_buffered(status, body);
@@ -606,6 +643,7 @@ impl Conn {
     }
 
     pub async fn page(&mut self, status: u16) -> KeepAlive {
+        self.x.paged = true;
         let keep = self.x.req.keep_alive && keeps_alive(status);
         self.out.clear();
         // 495 and 496 are nginx's internal codes; the client sees 400.

@@ -286,8 +286,11 @@ impl Conn {
             coded.clear();
             let last = n == 0;
             let r = match (last, coder.as_mut()) {
-                (false, Some(k)) => k.write(&plain[..n], &mut coded),
-                _ => coder.take().map_or(Ok(()), |k| k.finish(&mut coded)),
+                (false, Some(k)) => k.write(&mut self.x, &plain[..n], &mut coded).await,
+                _ => match coder.take() {
+                    Some(k) => k.finish(&mut self.x, &mut coded).await,
+                    None => Ok(()),
+                },
             };
             if r.is_err() {
                 ok = false;
@@ -349,15 +352,20 @@ impl Conn {
             let last = left == 0;
             coded.clear();
             let r = if last {
-                chain.take().map_or(Ok(()), |c| c.finish(&mut coded))
+                match chain.take() {
+                    Some(c) => c.finish(&mut self.x, &mut coded).await,
+                    None => Ok(()),
+                }
             } else {
                 plain.resize(left.min(FILE_CHUNK as u64) as usize, 0);
-                match file.read(&mut plain) {
-                    Ok(n) if n > 0 => {
+                match (file.read(&mut plain), chain.as_mut()) {
+                    (Ok(n), Some(c)) if n > 0 => {
                         left -= n as u64;
-                        chain
-                            .as_mut()
-                            .map_or(Ok(()), |c| c.write(&plain[..n], &mut coded))
+                        c.write(&mut self.x, &plain[..n], &mut coded).await
+                    }
+                    (Ok(n), None) if n > 0 => {
+                        left -= n as u64;
+                        Ok(())
                     }
                     _ => Err(std::io::ErrorKind::UnexpectedEof.into()),
                 }

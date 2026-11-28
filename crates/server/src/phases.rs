@@ -215,8 +215,9 @@ impl<'s> Phases<'s> {
             let kind = if named { "named route" } else { "route" };
             format!("{kind} {}", route.id)
         });
-        // nginx `internal`: only internal redirects reach the route.
-        if route.internal && !x.uri_changed {
+        // nginx `internal`: only internal redirects and subrequests reach
+        // the route.
+        if route.internal && !x.uri_changed && !x.is_sub() {
             self.note(|| "internal route".into());
             return Err(Next::Error(404));
         }

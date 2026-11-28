@@ -41,6 +41,7 @@ mod reply;
 mod sim;
 mod static_file;
 mod stream;
+mod subrequest;
 mod tap;
 mod tls;
 mod upstream;

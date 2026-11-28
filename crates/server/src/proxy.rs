@@ -771,7 +771,7 @@ impl Conn {
                 f.tee(&plain);
             }
             coded.clear();
-            if coder.write(&plain, &mut coded).is_err() {
+            if coder.write(&mut self.x, &plain, &mut coded).await.is_err() {
                 break Err(());
             }
             if chunked {
@@ -797,7 +797,7 @@ impl Conn {
         let result = match result {
             Ok(complete) => {
                 coded.clear();
-                if coder.finish(&mut coded).is_err() {
+                if coder.finish(&mut self.x, &mut coded).await.is_err() {
                     Err(())
                 } else {
                     if chunked {

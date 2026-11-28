@@ -140,6 +140,16 @@ pub(crate) struct Exchange {
     pub uid: crate::filter::Uid,
     /// Its Set-Cookie and P3P lines, in every response head.
     pub uid_lines: Vec<u8>,
+    /// Address of the socket that accepted the connection.
+    pub listener: SocketAddr,
+    /// Subrequest nesting: 0 for a client's request.
+    pub depth: u8,
+    /// The snapshot answering the request, for its subrequests. `None`
+    /// between requests and in the simulator.
+    pub active: Option<std::sync::Arc<crate::Active>>,
+    /// The response is a generated error page (nginx without
+    /// `r->request_output`).
+    pub paged: bool,
 }
 
 /// Lowercases `raw` into `out` without the port and a trailing dot.
@@ -218,7 +228,16 @@ impl Exchange {
             filters: None,
             uid: crate::filter::Uid::default(),
             uid_lines: Vec::new(),
+            listener: local,
+            depth: 0,
+            active: None,
+            paged: false,
         }
+    }
+
+    /// A subrequest (nginx `r != r->main`).
+    pub fn is_sub(&self) -> bool {
+        self.depth > 0
     }
 
     pub fn https(&self) -> bool {
@@ -286,6 +305,7 @@ impl Exchange {
         self.error_paged = false;
         self.err_status = 0;
         self.as_get = false;
+        self.paged = false;
         match self.req.host {
             Some(h) => host_key(h.get(&self.head), &mut self.host),
             None => self.host.clear(),
