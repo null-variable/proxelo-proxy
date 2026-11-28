@@ -99,6 +99,13 @@ Both serve HTTP/1.1, and HTTP/2 and TLS on TLS listeners:
 - Response and upstream request headers set, added or removed per route
   (nginx `add_header` with `always`, `proxy_set_header`,
   `proxy_hide_header`), with variables such as `$request_id` and `$scheme`.
+- Response filters per route in nginx order: `sub_filter`, `charset`
+  recoding, `userid` cookies, `addition` (before and after URIs) and `ssi`
+  (`include` virtual, file, set and stub, `echo`, `set`, `config`,
+  `if`/`elif`/`else` with regexes, `block`), with gzip and gunzip around
+  them. `addition`, `ssi` includes and `mirror` (copies of a request with
+  its body to other URIs, answers dropped) run as nginx subrequests
+  through the same phases, reaching `internal` routes.
 - Redirect to https per site, and ACME HTTP-01 and TLS-ALPN-01 challenges
   handed down by the control plane.
 - Access logs per route in nginx `log_format` syntax with `escape=json`,

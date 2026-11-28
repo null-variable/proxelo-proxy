@@ -100,6 +100,9 @@ pub(crate) struct Phases<'s> {
     pub route: Option<u32>,
     /// Steps taken, for the simulator. `None` when serving.
     pub trace: Option<Vec<String>>,
+    /// Routes whose mirrors are due (nginx mirrors in the precontent phase,
+    /// after try_files).
+    pub mirrors: Vec<u32>,
 }
 
 impl<'s> Phases<'s> {
@@ -111,6 +114,7 @@ impl<'s> Phases<'s> {
             changes: 0,
             route: None,
             trace: trace.then(Vec::new),
+            mirrors: Vec::new(),
         }
     }
 
@@ -173,7 +177,7 @@ impl<'s> Phases<'s> {
                 Next::Content(r) => {
                     let route = &site.routes[r as usize];
                     x.bandwidth = route.bandwidth;
-                    self.content(x, &route.action)
+                    self.content(x, r, &route.action)
                 }
                 Next::Error(status) => self.error_page(x, status),
             };
@@ -236,7 +240,26 @@ impl<'s> Phases<'s> {
         }
     }
 
-    fn content(&mut self, x: &mut Exchange, action: &Action) -> Step {
+    /// Marks the mirrors of route `r` due; a subrequest has none.
+    fn mirror(&mut self, x: &Exchange, r: u32) {
+        if self.site.routes[r as usize].mirror.is_some() && !x.is_sub() {
+            self.note(|| "mirror".into());
+            self.mirrors.push(r);
+        }
+    }
+
+    fn content(&mut self, x: &mut Exchange, r: u32, action: &Action) -> Step {
+        // `return` answers in the rewrite phase, before any mirror.
+        if !matches!(
+            action,
+            Action::Return(_)
+                | Action::Static {
+                    try_files: Some(_),
+                    ..
+                }
+        ) {
+            self.mirror(x, r);
+        }
         match action {
             Action::Return(r) => self.ret(x, r),
             Action::Proxy(p) => Ok(Outcome::Proxy(*p)),
@@ -284,6 +307,9 @@ impl<'s> Phases<'s> {
                         Fallback::Status(s) => Next::Error(*s),
                         Fallback::Route(r) => Next::Route(*r, true),
                     });
+                }
+                if try_files.is_some() {
+                    self.mirror(x, r);
                 }
                 if handlers.random_index
                     && x.path.ends_with(b"/")

@@ -115,11 +115,12 @@ fn head(x: &Exchange, method: &[u8], path: &[u8], args: &[u8], body_len: Option<
 /// `None` past the nesting limit or when nothing answers.
 pub(crate) fn run(
     x: &Exchange,
-    method: &'static [u8],
+    method: &[u8],
     path: &[u8],
     args: &[u8],
     body: Option<Vec<u8>>,
 ) -> impl Future<Output = Option<Reply>> + Send + 'static {
+    let head_only = method == b"HEAD";
     let start = match &x.active {
         Some(_) if x.depth >= MAX_DEPTH => {
             eprintln!(
@@ -160,7 +161,7 @@ pub(crate) fn run(
         let (_, received) = tokio::join!(send, rd.read_to_end(&mut raw));
         let paged = served.await.unwrap_or(false);
         received.ok()?;
-        parse(&raw, method == b"HEAD", paged)
+        parse(&raw, head_only, paged)
     }
 }
 

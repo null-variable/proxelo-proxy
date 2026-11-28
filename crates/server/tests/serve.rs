@@ -905,3 +905,100 @@ fn response_filters() {
         "part 2 |&lt;h1&gt;top&lt;/h1&gt;|[]|none"
     );
 }
+
+/// Accepts connections and sends each request head and body it reads down
+/// `tx`, answering 200 with an empty body.
+fn recorder() -> (SocketAddr, std::sync::mpsc::Receiver<String>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for s in l.incoming() {
+            let mut s = s.unwrap();
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut b = [0u8; 4096];
+                let end = loop {
+                    if let Some(e) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break e + 4;
+                    }
+                    match s.read(&mut b) {
+                        Ok(n) if n > 0 => buf.extend_from_slice(&b[..n]),
+                        _ => return,
+                    }
+                };
+                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length: "))
+                    .map_or(0, |v| v.parse().unwrap());
+                while buf.len() < end + len {
+                    let n = s.read(&mut b).unwrap();
+                    buf.extend_from_slice(&b[..n]);
+                }
+                let _ = tx.send(String::from_utf8_lossy(&buf[..end + len]).into_owned());
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            });
+        }
+    });
+    (addr, rx)
+}
+
+#[test]
+fn mirror() {
+    use path_match::Kind::Prefix;
+    let (up, seen) = recorder();
+    let app = echo("app");
+    let mut internal = route(Prefix, "/copy/", proxy(1));
+    internal.internal = true;
+    let mut main = route(Prefix, "/api/", proxy(0));
+    main.mirror = Some(ir::Mirror {
+        uris: vec!["/copy/a".into(), "/copy/b".into()],
+        request_body: true,
+    });
+    let mut bodiless = route(Prefix, "/nobody/", proxy(0));
+    bodiless.mirror = Some(ir::Mirror {
+        uris: vec!["/copy/c".into()],
+        request_body: false,
+    });
+    let (_, addr) = start(&snapshot(
+        vec![internal, main, bodiless],
+        vec![upstream(&[app.addr], 0), upstream(&[up], 0)],
+    ));
+    let host = "Host: example.com\r\n";
+    let recv = || seen.recv_timeout(Duration::from_secs(5)).expect("mirrored");
+
+    // The client gets the main answer; each mirror URI sees the method,
+    // arguments and body.
+    let (h, b) = get(
+        addr,
+        &format!("POST /api/x?q=1 HTTP/1.1\r\n{host}Content-Length: 4\r\n\r\nping"),
+    );
+    assert_eq!(status(&h), 200, "{h}");
+    let b = String::from_utf8(b).unwrap();
+    assert!(b.starts_with("app POST /api/x?q=1 HTTP/1.1 "), "{b}");
+    assert!(b.ends_with(" body=ping"), "{b}");
+    let mut got = [recv(), recv()];
+    got.sort();
+    for (m, uri) in got.iter().zip(["/copy/a?q=1", "/copy/b?q=1"]) {
+        assert!(m.starts_with(&format!("POST {uri} HTTP/1.1\r\n")), "{m}");
+        assert!(m.ends_with("\r\n\r\nping"), "{m}");
+    }
+
+    let (h, _) = get(
+        addr,
+        &format!("PUT /nobody/ HTTP/1.1\r\n{host}Content-Length: 2\r\n\r\nhi"),
+    );
+    assert_eq!(status(&h), 200, "{h}");
+    let m = recv();
+    assert!(m.starts_with("PUT /copy/c HTTP/1.1\r\n"), "{m}");
+    assert!(m.ends_with("\r\n\r\n"), "{m}");
+
+    // The internal route is not reachable from outside.
+    let (h, _) = get(addr, &format!("GET /copy/a HTTP/1.1\r\n{host}\r\n"));
+    assert_eq!(status(&h), 404, "{h}");
+    assert!(seen.recv_timeout(Duration::from_millis(200)).is_err());
+}

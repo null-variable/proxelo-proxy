@@ -204,6 +204,39 @@ impl Conn {
         })
     }
 
+    /// nginx mirror: a background subrequest to each mirror URI of the
+    /// routes `due`, with the method, arguments and (unless turned off) body
+    /// of the request; the answers are dropped. `Err` is the status to
+    /// answer when the body cannot be read.
+    async fn mirror(&mut self, site: &proxelo_snapshot::Site, due: &[u32]) -> Result<(), u16> {
+        // Read once, kept in front of the connection for the request itself.
+        let mut body: Option<Option<Vec<u8>>> = None;
+        for &r in due {
+            let Some(m) = &site.routes[r as usize].mirror else {
+                continue;
+            };
+            if m.request_body && body.is_none() {
+                body = Some(self.peek_body(MAX_BODY).await?);
+            }
+            let method = self.x.req.method_span.get(&self.x.head).to_vec();
+            for uri in &m.uris {
+                let b = if m.request_body {
+                    body.clone().flatten()
+                } else {
+                    None
+                };
+                tokio::spawn(crate::subrequest::run(
+                    &self.x,
+                    &method,
+                    uri,
+                    &self.x.args,
+                    b,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Reads until a full request head is buffered. `Ok(false)` means the
     /// connection ended or timed out; nginx closes silently then.
     async fn read_head(&mut self) -> Result<bool, ParseError> {
@@ -367,6 +400,12 @@ impl Conn {
         loop {
             let outcome = phases.run(&mut self.x);
             done.route = phases.route;
+            if !phases.mirrors.is_empty() {
+                let due = std::mem::take(&mut phases.mirrors);
+                if let Err(status) = self.mirror(site, &due).await {
+                    return self.page(status).await;
+                }
+            }
             // userid runs for the main request only.
             if !self.x.is_sub() {
                 crate::filter::userid_lines(&mut self.x);

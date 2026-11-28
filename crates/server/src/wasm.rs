@@ -1336,7 +1336,7 @@ impl Conn {
         self.wasm_req = None;
         let max = plugins.iter().filter_map(|p| p.request_body).max();
         let body = match max {
-            Some(max) => self.wasm_body(max).await?,
+            Some(max) => self.peek_body(max).await?,
             None => None,
         };
         let headers = request_pairs(&self.x);
@@ -1394,10 +1394,10 @@ impl Conn {
         Ok(())
     }
 
-    /// Reads the request body for the filters and puts it back in front of
-    /// what follows on the connection, framed as it came, so the request
-    /// goes on as if unread. `None` without a body or past `max`.
-    async fn wasm_body(&mut self, max: u64) -> Result<Option<Vec<u8>>, u16> {
+    /// Reads the request body for the filters or a mirror and puts it back
+    /// in front of what follows on the connection, framed as it came, so the
+    /// request goes on as if unread. `None` without a body or past `max`.
+    pub(crate) async fn peek_body(&mut self, max: u64) -> Result<Option<Vec<u8>>, u16> {
         if matches!(self.body, BodyLeft::None) {
             return Ok(None);
         }
