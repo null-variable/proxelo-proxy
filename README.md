@@ -178,6 +178,33 @@ Connections accepted on a removed address close at their next request.
 `check` builds the runtime form too, so it rejects anything `serve` would,
 including listener and target addresses that do not resolve.
 
+### Docker
+
+The `Dockerfile` builds a Debian image that runs as an unprivileged user and
+starts `proxelo-proxy run`, with its data in the `/var/lib/proxelo` volume and
+the control socket in `/run/proxelo`. `--build-arg FEATURES=jemalloc` (or
+`mimalloc`) picks the allocator.
+
+```sh
+docker build -t proxelo-proxy .
+```
+
+`compose.yaml` serves a compiled snapshot file without a control plane,
+for trying a configuration:
+
+```sh
+(cd ../proxelo && go run ./cmd/proxelo compile examples/basic.json ../proxelo-proxy/snapshot.bin)
+docker compose up --build              # listener 8080, metrics on 127.0.0.1:9145
+curl -H 'Host: example.com' http://127.0.0.1:8080/
+```
+
+`PROXELO_SNAPSHOT` points at another snapshot file, `PROXELO_HTTP_PORT` and
+`PROXELO_METRICS_PORT` change the host ports, and `PROXELO_FEATURES` picks the
+allocator. A snapshot with listeners on other ports needs matching `ports:`
+entries. To run the proxy under the control plane, use the `compose.yaml` in
+[proxelo](https://github.com/null-variable/proxelo), which builds this
+repository next to it.
+
 ### Runtime and allocator candidates
 
 The runtime and allocator are still being chosen by benchmark. Both candidates of each are built in:
