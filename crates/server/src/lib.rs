@@ -39,6 +39,7 @@ mod proxy;
 mod range;
 mod reply;
 mod sim;
+mod ssi;
 mod static_file;
 mod stream;
 mod subrequest;

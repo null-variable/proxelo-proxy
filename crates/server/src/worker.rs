@@ -57,6 +57,10 @@ fn civil(days: i64) -> (i64, u32, u32) {
 /// system zone). An unreadable zone is UTC.
 static ZONE: LazyLock<TimeZone> = LazyLock::new(TimeZone::system);
 
+pub(crate) fn zone() -> &'static TimeZone {
+    &ZONE
+}
+
 /// `$time_local` ("26/Nov/2026:16:55:00 +0900") and `$time_iso8601`
 /// ("2026-11-26T16:55:00+09:00") of one second.
 #[derive(Clone, Copy)]

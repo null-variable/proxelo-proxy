@@ -765,6 +765,30 @@ fn response_filters() {
         }),
         ..Default::default()
     });
+    std::fs::create_dir_all(root.join("ssi")).unwrap();
+    std::fs::write(
+        root.join("ssi/page.html"),
+        concat!(
+            r#"<!--#set var="who" value="$arg_who" -->"#,
+            r#"<!--#include virtual="part.html?n=2" -->|"#,
+            r#"<!--#include virtual="/hidden/top.html" set="top" -->"#,
+            r#"<!--#echo var="top" -->|"#,
+            r#"<!--#block name="miss" -->[<!--#echo var="who" -->]<!--#endblock -->"#,
+            r#"<!--#include virtual="/hidden/nope.html" stub="miss" -->|"#,
+            r#"<!--#if expr="$who = /^(?<first>.)/" --><!--#echo var="first" --><!--#else -->none<!--#endif -->"#,
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("ssi/part.html"),
+        r#"part <!--#echo var="arg_n" --> <!--#echo var="who" -->"#,
+    )
+    .unwrap();
+    let mut ssi = route(Prefix, "/ssi/", static_root(&root));
+    ssi.filters = Some(ir::Filters {
+        ssi: Some(ir::Ssi::default()),
+        ..Default::default()
+    });
     let up = canned(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 11\r\nETag: \"x\"\r\n\r\nsay hello!\n");
     let mut proxied = route(Prefix, "/up/", proxy(0));
     proxied.filters = Some(ir::Filters {
@@ -779,7 +803,7 @@ fn response_filters() {
         ..Default::default()
     });
     let (_, addr) = start(&snapshot(
-        vec![static_route, internal, proxied, added],
+        vec![static_route, internal, proxied, added, ssi],
         vec![upstream(&[up], 0)],
     ));
     let host = "Host: example.com\r\n";
@@ -859,4 +883,25 @@ fn response_filters() {
     );
     assert_eq!(status(&h), 200, "{h}");
     assert_eq!(dechunk(&b), b"<h1>top</h1>body<i>end</i>");
+
+    // ssi: includes run in place, through the filters of their route, and
+    // share the variables of the page.
+    let (h, b) = get(
+        addr,
+        &format!("GET /ssi/page.html?who=ann HTTP/1.1\r\n{host}\r\n"),
+    );
+    assert_eq!(status(&h), 200, "{h}");
+    assert!(
+        !h.contains("Content-Length") && !h.contains("ETag") && !h.contains("Last-Modified"),
+        "{h}"
+    );
+    assert_eq!(
+        String::from_utf8(dechunk(&b)).unwrap(),
+        "part 2 ann|&lt;h1&gt;top&lt;/h1&gt;|[ann]|a"
+    );
+    let (_, b) = get(addr, &format!("GET /ssi/page.html HTTP/1.0\r\n{host}\r\n"));
+    assert_eq!(
+        String::from_utf8(b).unwrap(),
+        "part 2 |&lt;h1&gt;top&lt;/h1&gt;|[]|none"
+    );
 }

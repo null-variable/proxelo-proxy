@@ -22,12 +22,10 @@ const PIPE: usize = 64 * 1024;
 
 /// What a subrequest answered.
 pub(crate) struct Reply {
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by ssi include"))]
     pub status: u16,
     pub body: Vec<u8>,
     /// The body is a generated error page, not the handler's output
     /// (nginx `r->request_output` unset).
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by ssi include"))]
     pub paged: bool,
 }
 
@@ -139,6 +137,7 @@ pub(crate) fn run(
             c.x.depth = x.depth + 1;
             c.x.conn_id = x.conn_id;
             c.x.requests = x.requests.saturating_sub(1);
+            c.x.ssi.clone_from(&x.ssi);
             let req = head(x, method, path, args, body.as_ref().map(Vec::len));
             Some((ours, c.serve_sub(Arc::clone(active)), req))
         }

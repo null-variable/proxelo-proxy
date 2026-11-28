@@ -150,6 +150,9 @@ pub(crate) struct Exchange {
     /// The response is a generated error page (nginx without
     /// `r->request_output`).
     pub paged: bool,
+    /// ssi variables and blocks of the main request, shared with its
+    /// subrequests.
+    pub ssi: Option<crate::ssi::SharedRef>,
 }
 
 /// Lowercases `raw` into `out` without the port and a trailing dot.
@@ -232,6 +235,7 @@ impl Exchange {
             depth: 0,
             active: None,
             paged: false,
+            ssi: None,
         }
     }
 
@@ -306,6 +310,9 @@ impl Exchange {
         self.err_status = 0;
         self.as_get = false;
         self.paged = false;
+        if !self.is_sub() {
+            self.ssi = None;
+        }
         match self.req.host {
             Some(h) => host_key(h.get(&self.head), &mut self.host),
             None => self.host.clear(),

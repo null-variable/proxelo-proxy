@@ -59,52 +59,13 @@ pub(crate) fn escape(buf: &mut Vec<u8>, start: usize, mode: Escape) {
 /// Appends the expansion of `t` to `out`. With `log`, variable values are
 /// escaped and unset ones expand to "-", as in nginx access logs.
 pub(crate) fn expand_into(x: &mut Exchange, t: &Template, out: &mut Vec<u8>, log: Option<Escape>) {
-    for part in t.parts() {
+    for p in t.parts() {
         let start = out.len();
-        match part {
-            Part::Lit(l) => {
-                out.extend_from_slice(l);
-                continue;
-            }
-            Part::Var(v) => var(x, *v, out),
-            Part::Header(name) => {
-                if let Some(v) = x.request_header(name) {
-                    out.extend_from_slice(v);
-                }
-            }
-            Part::Cookie(name) => {
-                if let Some(v) = x.cookie(name) {
-                    out.extend_from_slice(v);
-                }
-            }
-            Part::AuthResp(name) => {
-                if let Some(v) = x.auth_resp(name) {
-                    out.extend_from_slice(v);
-                }
-            }
-            Part::JwtClaim(name) => {
-                if let Some(j) = &x.jwt {
-                    crate::jwt::field(&j.claims, name, out);
-                }
-            }
-            Part::JwtHeader(name) => {
-                if let Some(j) = &x.jwt {
-                    crate::jwt::field(&j.header, name, out);
-                }
-            }
-            Part::Lookup(i) => {
-                let (s, e) = lookup(x, *i);
-                out.extend_from_slice(&x.lookup_buf[s as usize..e as usize]);
-            }
-            Part::Arg(name) => {
-                if let Some(v) = x.args.split(|&c| c == b'&').find_map(|kv| {
-                    let (k, v) = kv.split_at(kv.iter().position(|&c| c == b'=')?);
-                    k.eq_ignore_ascii_case(name).then_some(&v[1..])
-                }) {
-                    out.extend_from_slice(v);
-                }
-            }
+        if let Part::Lit(l) = p {
+            out.extend_from_slice(l);
+            continue;
         }
+        part(x, p, out);
         if let Some(mode) = log {
             if out.len() == start {
                 out.push(b'-');
@@ -112,6 +73,49 @@ pub(crate) fn expand_into(x: &mut Exchange, t: &Template, out: &mut Vec<u8>, log
                 escape(out, start, mode);
             }
         }
+    }
+}
+
+/// Appends the value of `p` to `out`. `false` when the variable has no
+/// value in this request (nginx `not_found`): an absent header, cookie,
+/// argument, claim or capture.
+pub(crate) fn part(x: &mut Exchange, p: &Part, out: &mut Vec<u8>) -> bool {
+    let v = match p {
+        Part::Lit(l) => Some(&l[..]),
+        Part::Var(Var::Capture(i)) => x.caps.get(usize::from(*i)),
+        Part::Var(v) => {
+            var(x, *v, out);
+            return true;
+        }
+        Part::Header(name) => x.request_header(name),
+        Part::Cookie(name) => x.cookie(name),
+        Part::AuthResp(name) => x.auth_resp(name),
+        Part::JwtClaim(name) | Part::JwtHeader(name) => {
+            let Some(j) = &x.jwt else { return false };
+            let doc = if matches!(p, Part::JwtClaim(_)) {
+                &j.claims
+            } else {
+                &j.header
+            };
+            let start = out.len();
+            crate::jwt::field(doc, name, out);
+            return out.len() > start;
+        }
+        Part::Lookup(i) => {
+            let (s, e) = lookup(x, *i);
+            Some(&x.lookup_buf[s as usize..e as usize])
+        }
+        Part::Arg(name) => x.args.split(|&c| c == b'&').find_map(|kv| {
+            let (k, v) = kv.split_at(kv.iter().position(|&c| c == b'=')?);
+            k.eq_ignore_ascii_case(name).then_some(&v[1..])
+        }),
+    };
+    match v {
+        Some(v) => {
+            out.extend_from_slice(v);
+            true
+        }
+        None => false,
     }
 }
 

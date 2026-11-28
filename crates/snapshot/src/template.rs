@@ -217,6 +217,18 @@ impl Template {
     }
 }
 
+/// The variable named `name` (without `$`), met while serving, such as in an
+/// SSI command: a built-in one, `$0`..`$9`, or one of `lookups` by name.
+pub fn variable(name: &str, lookups: &[crate::Lookup]) -> Option<Part> {
+    if let [d @ b'0'..=b'9'] = name.as_bytes() {
+        return Some(Part::Var(Var::Capture(d - b'0')));
+    }
+    var(name).or_else(|| {
+        let i = lookups.iter().position(|l| &*l.name == name)?;
+        Some(Part::Lookup(i as u32))
+    })
+}
+
 /// Whether `name` is a built-in variable, which a lookup cannot redefine.
 pub(crate) fn is_builtin(name: &str) -> bool {
     var(name).is_some()

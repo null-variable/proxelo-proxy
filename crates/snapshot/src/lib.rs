@@ -37,7 +37,7 @@ pub use runtime::{
     Route, Runtime, Site, StaticHandlers, Sticky, StickyCookie, Stream, StreamRoute, Target,
     TryFiles, Upstream, UpstreamTls, discovered_key,
 };
-pub use template::{Part, Template, Var};
+pub use template::{Part, Template, Var, variable};
 pub use wasm::{WasmFilter, WasmModule, hex};
 
 use prost::Message;

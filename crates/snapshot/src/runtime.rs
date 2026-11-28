@@ -265,8 +265,18 @@ impl Pattern {
         })
     }
 
+    /// Compiles a pattern met while serving, such as an SSI `if` regex.
+    pub fn compile(source: &str) -> Result<Self, String> {
+        Self::new(source, false)
+    }
+
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// Group names by index, `None` for unnamed groups and group 0.
+    pub fn names(&self) -> &[Option<String>] {
+        self.re.capture_names()
     }
 
     pub fn is_match(&self, subject: &[u8]) -> Result<bool, MatchError> {
@@ -305,6 +315,15 @@ impl Captures {
     pub fn clear(&mut self) {
         self.subject.clear();
         self.spans.clear();
+    }
+
+    /// How many groups the last match had, group 0 included.
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
     }
 
     /// Group `i`, or `None` when it does not exist or did not take part.

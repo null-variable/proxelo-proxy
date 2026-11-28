@@ -151,6 +151,7 @@ pub(crate) struct Plan {
     recode: Option<Recoder>,
     /// addition: the filters whose before and after URIs wrap the body.
     addition: Option<Arc<Filters>>,
+    ssi: Option<crate::ssi::Ssi>,
 }
 
 impl Plan {
@@ -183,6 +184,9 @@ impl Plan {
             recode: self.recode.take(),
             addition: self.addition.take(),
             started: false,
+            ssi: self.ssi.take(),
+            s: Vec::new(),
+            o: Vec::new(),
             coder,
             a: Vec::new(),
             b: Vec::new(),
@@ -212,6 +216,17 @@ pub(crate) fn plan(
         p.reframe = true;
         p.drop_validators = !s.last_modified;
         p.weak = s.last_modified;
+    }
+    if let Some(s) = &f.ssi
+        && length != Some(0)
+        && s.types.matches(ctype)
+    {
+        p.ssi = Some(crate::ssi::Ssi::new(x, s));
+        p.reframe = true;
+        if !x.is_sub() {
+            p.drop_validators |= !s.last_modified;
+            p.weak |= s.last_modified;
+        }
     }
     if let Some(c) = &f.charset
         && !x.is_sub()
@@ -487,6 +502,10 @@ pub(crate) struct Chain {
     addition: Option<Arc<Filters>>,
     /// Body bytes went through: the before part was added.
     started: bool,
+    ssi: Option<crate::ssi::Ssi>,
+    /// The body for ssi, and its output.
+    s: Vec<u8>,
+    o: Vec<u8>,
     coder: Option<Coder>,
     a: Vec<u8>,
     b: Vec<u8>,
@@ -555,6 +574,16 @@ impl Chain {
             self.addition(x, true, out).await?;
         }
         self.filters(data, last, out)?;
+        if let Some(ssi) = &mut self.ssi {
+            let s = std::mem::take(&mut self.s);
+            let mut o = std::mem::take(&mut self.o);
+            o.clear();
+            ssi.write(x, &s, last, &mut o).await;
+            let r = emit(&mut self.coder, &o, out);
+            self.s = s;
+            self.o = o;
+            r?;
+        }
         if last {
             self.addition(x, false, out).await?;
         }
@@ -597,7 +626,13 @@ impl Chain {
             r.write(cur, last, &mut b);
             cur = &b;
         }
-        let r = emit(&mut self.coder, cur, out);
+        let r = if self.ssi.is_some() {
+            self.s.clear();
+            self.s.extend_from_slice(cur);
+            Ok(())
+        } else {
+            emit(&mut self.coder, cur, out)
+        };
         self.a = a;
         self.b = b;
         self.g = g;
