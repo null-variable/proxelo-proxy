@@ -572,6 +572,12 @@ impl Conn {
                         status = 502;
                         continue;
                     }
+                    if self.intercepts(p, route, st) {
+                        active
+                            .metrics
+                            .upstream_response(p.upstream, i, st, started.elapsed());
+                        return Err(st);
+                    }
                     self.sticky_cookie(active, p.upstream, i);
                     let (keep, _) = self.relay(&mut up, route, p.read_timeout).await;
                     self.x.sent.upstream_response = Some(started.elapsed().as_secs_f64());

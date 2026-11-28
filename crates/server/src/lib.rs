@@ -16,6 +16,7 @@ mod compress;
 mod conn;
 mod dav;
 pub mod drain;
+mod edits;
 mod exchange;
 mod fetch;
 mod filter;

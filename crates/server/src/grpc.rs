@@ -218,6 +218,12 @@ impl Conn {
             ) {
                 return Err(502);
             }
+            if self.intercepts(p, route, st) {
+                active
+                    .metrics
+                    .upstream_response(p.upstream, i, st, started.elapsed());
+                return Err(st);
+            }
             let mut rd = Chunked {
                 body,
                 pending: Vec::new(),

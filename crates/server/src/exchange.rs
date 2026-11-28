@@ -140,6 +140,9 @@ pub(crate) struct Exchange {
     pub uid: crate::filter::Uid,
     /// Its Set-Cookie and P3P lines, in every response head.
     pub uid_lines: Vec<u8>,
+    /// WWW-Authenticate lines of an upstream 401 that an error page
+    /// intercepted, which the page keeps (nginx proxy_intercept_errors).
+    pub err_lines: Vec<u8>,
     /// Address of the socket that accepted the connection.
     pub listener: SocketAddr,
     /// Subrequest nesting: 0 for a client's request.
@@ -231,6 +234,7 @@ impl Exchange {
             filters: None,
             uid: crate::filter::Uid::default(),
             uid_lines: Vec::new(),
+            err_lines: Vec::new(),
             listener: local,
             depth: 0,
             active: None,
@@ -272,6 +276,7 @@ impl Exchange {
         self.resp_extra.clear();
         self.resp_extra.extend_from_slice(&self.alt_svc);
         self.resp_extra.extend_from_slice(&self.uid_lines);
+        self.resp_extra.extend_from_slice(&self.err_lines);
     }
 
     pub fn begin(&mut self) -> Result<(), u16> {
@@ -291,6 +296,7 @@ impl Exchange {
         self.filters = None;
         self.uid.reset();
         self.uid_lines.clear();
+        self.err_lines.clear();
         self.bandwidth = None;
         self.paced = 0;
         self.lookup_vals.clear();

@@ -42,6 +42,7 @@ pub(crate) fn response(x: &mut Exchange, ops: &HeaderOps, status: u16) {
     }
     // The userid filter runs after add_header.
     out.extend_from_slice(&x.uid_lines);
+    out.extend_from_slice(&x.err_lines);
     x.resp_extra = out;
 }
 

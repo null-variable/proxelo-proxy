@@ -184,6 +184,12 @@ impl Conn {
                     } else {
                         ups.succeeded(i);
                     }
+                    if self.intercepts(p, route, st) {
+                        active
+                            .metrics
+                            .upstream_response(p.upstream, i, st, started.elapsed());
+                        return Err(st);
+                    }
                     self.sticky_cookie(active, p.upstream, i);
                     up.used += 1;
                     let keep_up = ups.keepalive
@@ -270,6 +276,36 @@ impl Conn {
             self.x.req.keep_alive = false;
         }
         Err(status)
+    }
+
+    /// nginx proxy_intercept_errors: an upstream status of 300 or more that
+    /// the route has an error page for is answered by the page instead; the
+    /// upstream body is not read. A 401 keeps its WWW-Authenticate.
+    pub(crate) fn intercepts(&mut self, p: &Proxy, route: &Route, status: u16) -> bool {
+        if !p.intercept
+            || status < 300
+            || !route.error_pages.iter().any(|e| e.codes.contains(&status))
+        {
+            return false;
+        }
+        // The upstream answered before the request body was all sent.
+        if !matches!(self.body, BodyLeft::None) {
+            self.x.req.keep_alive = false;
+        }
+        self.x.err_lines.clear();
+        if status == 401 {
+            for h in self.resp.headers.iter() {
+                let name = h.name.get(&self.ubuf.data);
+                if name.eq_ignore_ascii_case(b"www-authenticate") {
+                    let out = &mut self.x.err_lines;
+                    out.extend_from_slice(name);
+                    out.extend_from_slice(b": ");
+                    out.extend_from_slice(h.value.get(&self.ubuf.data));
+                    out.extend_from_slice(b"\r\n");
+                }
+            }
+        }
+        true
     }
 
     /// The target a sticky session names: the sticky cookie's value, or the
@@ -580,10 +616,7 @@ impl Conn {
                 }
                 continue;
             }
-            out.extend_from_slice(name);
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(value);
-            out.extend_from_slice(b"\r\n");
+            crate::edits::push_line(&mut self.x, route.edits.as_deref(), name, value, out);
         }
         if vary {
             out.extend_from_slice(b"Vary: Accept-Encoding\r\n");

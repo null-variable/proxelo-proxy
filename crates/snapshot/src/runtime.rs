@@ -401,6 +401,8 @@ pub struct Route {
     /// Reached only by internal redirects and subrequests.
     pub internal: bool,
     pub mirror: Option<Box<Mirror>>,
+    /// Location, Refresh and Set-Cookie edits of a proxy route.
+    pub edits: Option<Box<crate::ProxyEdits>>,
     children: Option<Level>,
 }
 
@@ -464,6 +466,9 @@ pub struct Proxy {
     pub next: NextOn,
     /// Zero: no limit.
     pub tries: u32,
+    /// An upstream status of 300 or more with an error page of the route
+    /// gets the page (nginx proxy_intercept_errors).
+    pub intercept: bool,
 }
 
 /// proxy_next_upstream conditions.
@@ -890,6 +895,7 @@ fn proxy(p: &ir::ProxyAction) -> Proxy {
         read_timeout: ms(p.read_timeout_ms, DEFAULT_TIMEOUT),
         next: NextOn::build(&p.next_upstream),
         tries: p.next_upstream_tries,
+        intercept: p.intercept_errors,
     }
 }
 
@@ -1593,6 +1599,12 @@ impl SiteBuilder<'_> {
                 .map(|m| filters::mirror(m).map(Box::new))
                 .transpose()
                 .map_err(|(f, e)| self.err(format!("{at}.mirror.{f}"), e))?,
+            edits: match route.action.as_ref().and_then(|a| a.kind.as_ref()) {
+                Some(action::Kind::Proxy(p)) => crate::edits::build(p, self.names)
+                    .map_err(|(f, e)| self.err(format!("{at}.action.proxy.{f}"), e))?
+                    .map(Box::new),
+                _ => None,
+            },
             children: None,
         })
     }

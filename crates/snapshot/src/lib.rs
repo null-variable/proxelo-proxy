@@ -9,6 +9,7 @@ mod auth;
 mod cache;
 mod compression;
 mod cond;
+mod edits;
 mod filters;
 mod lookup;
 mod runtime;
@@ -25,6 +26,7 @@ pub use auth::{Jwt, Key, KeyKind, Oidc, SessionKey, Url, parse_jwks};
 pub use cache::{Cache, CacheZone, Ignore as CacheIgnore, Stale, Valid};
 pub use compression::{Compression, Encoding, Proxied, StaticGz};
 pub use cond::{Cond, Expr, Facts};
+pub use edits::{CookieFlags, CookieName, HeaderRewrite, ProxyEdits, RewriteMatch};
 pub use filters::{
     Addition, Charset, Filters, Mirror, Recode, Ssi, SubFilter, Types, Userid, UseridMode,
 };

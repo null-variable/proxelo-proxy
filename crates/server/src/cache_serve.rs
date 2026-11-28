@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use proxelo_http1::{HeaderKind, Method, push_u64};
-use proxelo_snapshot::{Cache, Facts, HeaderOps, Proxy, Route};
+use proxelo_snapshot::{Cache, Facts, Proxy, Route};
 
 use crate::Active;
 use crate::cache::{Hash, Locked, Pending, Zone, now, storable};
@@ -128,7 +128,7 @@ impl Conn {
                 && f.fresh(now)
             {
                 self.x.cache_status = b"HIT";
-                match self.serve_entry(&zone, hash, &route.response_headers).await {
+                match self.serve_entry(&zone, hash, route).await {
                     Some(keep) => return Ok(keep),
                     // Gone from disk: drop it and look again.
                     None => {
@@ -147,9 +147,7 @@ impl Conn {
                         && (c.stale.updating || f.within_swr(now))
                     {
                         self.x.cache_status = b"UPDATING";
-                        if let Some(keep) =
-                            self.serve_entry(&zone, h, &route.response_headers).await
-                        {
+                        if let Some(keep) = self.serve_entry(&zone, h, route).await {
                             return Ok(keep);
                         }
                     }
@@ -180,7 +178,7 @@ impl Conn {
                 && (c.stale.updating || f.within_swr(now))
             {
                 self.x.cache_status = b"UPDATING";
-                if let Some(keep) = self.serve_entry(&zone, h, &route.response_headers).await {
+                if let Some(keep) = self.serve_entry(&zone, h, route).await {
                     let sent = self.x.sent.clone();
                     let _ = self
                         .fetch(active, p, route, c, &zone, key, Some(h), store, true)
@@ -276,9 +274,7 @@ impl Conn {
                 } else {
                     b"REVALIDATED"
                 };
-                self.serve_entry(zone, h, &route.response_headers)
-                    .await
-                    .ok_or(502)
+                self.serve_entry(zone, h, route).await.ok_or(502)
             }
             Took::Relayed => match r {
                 Err(st) => {
@@ -294,9 +290,7 @@ impl Conn {
                     match usable {
                         Some(h) => {
                             self.x.cache_status = b"STALE";
-                            self.serve_entry(zone, h, &route.response_headers)
-                                .await
-                                .ok_or(st)
+                            self.serve_entry(zone, h, route).await.ok_or(st)
                         }
                         None => Err(st),
                     }
@@ -374,8 +368,9 @@ impl Conn {
         &mut self,
         zone: &Zone,
         h: Hash,
-        ops: &HeaderOps,
+        route: &Route,
     ) -> Option<KeepAlive> {
+        let ops = &route.response_headers;
         use std::io::{Seek, SeekFrom};
         let (mut file, e) = zone.open(h).ok()?;
         let len = e.body_len;
@@ -465,7 +460,14 @@ impl Conn {
                     continue;
                 }
             }
-            out.extend_from_slice(line);
+            // Stored as the upstream sent them: the route's edits apply.
+            match line.iter().position(|&c| c == b':') {
+                Some(i) if route.edits.is_some() => {
+                    let value = line[i + 1..].trim_ascii();
+                    crate::edits::push_line(&mut self.x, route.edits.as_deref(), name, value, out);
+                }
+                _ => out.extend_from_slice(line),
+            }
         }
         let body = match parts {
             [one] => one.end - one.start,
@@ -584,10 +586,7 @@ impl Conn {
             // The upstream ignored the Range: the entry is the whole response.
             drop(file);
             let h = zone.lookup(&self.slice_key(c), &self.x).0;
-            return self
-                .serve_entry(zone, h, &route.response_headers)
-                .await
-                .ok_or(502);
+            return self.serve_entry(zone, h, route).await.ok_or(502);
         };
         if e.status != 206 || at != first * size {
             return Err(502);

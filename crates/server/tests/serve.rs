@@ -1086,3 +1086,92 @@ fn charset_table() {
         .unwrap();
     assert_eq!(out, b"ab\xe1?cd");
 }
+
+/// nginx proxy_redirect, proxy_cookie_* and proxy_intercept_errors.
+#[test]
+fn proxy_header_edits() {
+    use path_match::Kind::Prefix;
+    let up = canned(
+        concat!(
+            "HTTP/1.1 302 Found\r\n",
+            "Location: http://up.local:8080/app/next\r\n",
+            "Refresh: 5; url=http://up.local:8080/app/r\r\n",
+            "Set-Cookie: sid=1; Domain=.UP.local; Path=/app/x; Secure\r\n",
+            "Set-Cookie: other=2; path=/elsewhere\r\n",
+            "Set-Cookie: noattrs\r\n",
+            "Content-Length: 0\r\n\r\n",
+        )
+        .as_bytes(),
+    );
+    let missing = canned(b"HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\nnope");
+    let mut edited = route(Prefix, "/app/", proxy(0));
+    let rw = |kind: ir::header_rewrite::Kind, pattern: &str, replacement: &str| ir::HeaderRewrite {
+        kind: kind.into(),
+        pattern: pattern.into(),
+        replacement: replacement.into(),
+    };
+    use ir::header_rewrite::Kind as K;
+    if let Some(ir::Action {
+        kind: Some(action::Kind::Proxy(p)),
+    }) = &mut edited.action
+    {
+        p.redirects = vec![
+            rw(K::Regex, "^nomatch", "/never"),
+            rw(K::Unspecified, "http://up.local:8080/app/", "/"),
+        ];
+        p.cookie_domains = vec![rw(K::Unspecified, "up.local", "example.com")];
+        p.cookie_paths = vec![rw(K::RegexCaseless, "^/APP/(.*)$", "/$1")];
+        p.cookie_flags = vec![ir::CookieFlags {
+            cookie: "SID".into(),
+            regex: false,
+            flags: vec!["nosecure".into(), "httponly".into(), "samesite=lax".into()],
+        }];
+    }
+    let mut intercepted = route(Prefix, "/gone/", proxy(1));
+    if let Some(ir::Action {
+        kind: Some(action::Kind::Proxy(p)),
+    }) = &mut intercepted.action
+    {
+        p.intercept_errors = true;
+    }
+    intercepted.error_pages = vec![ir::ErrorPage {
+        codes: vec![404],
+        target: Some(ir::error_page::Target::Uri("/app/page".into())),
+        status: Some(410),
+    }];
+    let mut passed = route(Prefix, "/pass/", proxy(1));
+    passed.error_pages = intercepted.error_pages.clone();
+    let (_, addr) = start(&snapshot(
+        vec![edited, intercepted, passed],
+        vec![upstream(&[up], 0), upstream(&[missing], 0)],
+    ));
+    let host = "Host: example.com\r\n";
+
+    let (h, _) = get(addr, &format!("GET /app/a HTTP/1.1\r\n{host}\r\n"));
+    assert_eq!(status(&h), 302, "{h}");
+    let port = addr.port();
+    assert!(
+        h.contains(&format!("Location: http://example.com:{port}/next\r\n")),
+        "{h}"
+    );
+    assert!(h.contains("Refresh: 5; url=/r\r\n"), "{h}");
+    assert!(
+        h.contains("Set-Cookie: sid=1; Domain=.example.com; Path=/x; HttpOnly; SameSite=Lax\r\n"),
+        "{h}"
+    );
+    // No rule applied: the bytes stay.
+    assert!(
+        h.contains("Set-Cookie: other=2; path=/elsewhere\r\n"),
+        "{h}"
+    );
+    assert!(h.contains("Set-Cookie: noattrs\r\n"), "{h}");
+
+    // The 404 becomes the error page, a 410 with the other route's body.
+    let (h, b) = get(addr, &format!("GET /gone/x HTTP/1.1\r\n{host}\r\n"));
+    assert_eq!(status(&h), 410, "{h}");
+    assert!(!b.ends_with(b"nope"), "{h}");
+    // Without intercept_errors the upstream's 404 goes through.
+    let (h, b) = get(addr, &format!("GET /pass/x HTTP/1.1\r\n{host}\r\n"));
+    assert_eq!(status(&h), 404, "{h}");
+    assert_eq!(b, b"nope");
+}

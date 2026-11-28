@@ -158,9 +158,14 @@ impl Conn {
             push_u64(out, body_len);
             out.extend_from_slice(b"\r\n");
         }
-        out.extend_from_slice(b"Last-Modified: ");
-        out.extend_from_slice(&modified);
-        out.extend_from_slice(b"\r\nETag: ");
+        // An error page's status: nginx's header filter drops
+        // Last-Modified unless 200, 206 or 304.
+        if matches!(status, 200 | 206 | 304) {
+            out.extend_from_slice(b"Last-Modified: ");
+            out.extend_from_slice(&modified);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"ETag: ");
         out.extend_from_slice(&self.x.scratch);
         out.extend_from_slice(b"\r\n");
         if gz {
@@ -173,7 +178,8 @@ impl Conn {
             out.extend_from_slice(b"Content-Range: bytes ");
             range::push_span(out, *one, len);
             out.extend_from_slice(b"\r\n");
-        } else if status != 304 && parts.is_empty() {
+        } else if status == 200 {
+            // nginx's range filter offers ranges on 200 only.
             out.extend_from_slice(b"Accept-Ranges: bytes\r\n");
         }
         reply::connection(out, keep, &self.x.resp_extra);
@@ -240,9 +246,12 @@ impl Conn {
         out.extend_from_slice(mime);
         out.extend_from_slice(b"\r\n");
         if !plan.drop_validators {
-            out.extend_from_slice(b"Last-Modified: ");
-            out.extend_from_slice(modified);
-            out.extend_from_slice(b"\r\nETag: ");
+            if matches!(status, 200 | 206 | 304) {
+                out.extend_from_slice(b"Last-Modified: ");
+                out.extend_from_slice(modified);
+                out.extend_from_slice(b"\r\n");
+            }
+            out.extend_from_slice(b"ETag: ");
             if plan.etag(token.is_some()) == crate::filter::Etag::Weak {
                 out.extend_from_slice(b"W/");
             }
