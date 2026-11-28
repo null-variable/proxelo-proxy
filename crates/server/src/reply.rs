@@ -9,6 +9,18 @@ use crate::worker;
 
 /// Writes the status line and the headers every response carries.
 pub(crate) fn start(out: &mut Vec<u8>, status: u16, reason_phrase: &[u8]) {
+    start_with(out, status, reason_phrase, None, None);
+}
+
+/// [`start`] with an upstream's Server and Date in place of the proxy's
+/// (nginx proxy_pass_header).
+pub(crate) fn start_with(
+    out: &mut Vec<u8>,
+    status: u16,
+    reason_phrase: &[u8],
+    server: Option<&[u8]>,
+    date: Option<&[u8]>,
+) {
     out.extend_from_slice(b"HTTP/1.1 ");
     push_u64(out, u64::from(status));
     out.push(b' ');
@@ -17,8 +29,13 @@ pub(crate) fn start(out: &mut Vec<u8>, status: u16, reason_phrase: &[u8]) {
     } else {
         out.extend_from_slice(reason_phrase);
     }
-    out.extend_from_slice(b"\r\nServer: proxelo\r\nDate: ");
-    out.extend_from_slice(&worker::date());
+    out.extend_from_slice(b"\r\nServer: ");
+    out.extend_from_slice(server.unwrap_or(b"proxelo"));
+    out.extend_from_slice(b"\r\nDate: ");
+    match date {
+        Some(d) => out.extend_from_slice(d),
+        None => out.extend_from_slice(&worker::date()),
+    }
     out.extend_from_slice(b"\r\n");
 }
 

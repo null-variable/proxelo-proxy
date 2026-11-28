@@ -401,7 +401,7 @@ pub struct Route {
     /// Reached only by internal redirects and subrequests.
     pub internal: bool,
     pub mirror: Option<Box<Mirror>>,
-    /// Location, Refresh and Set-Cookie edits of a proxy route.
+    /// Upstream request and response edits of the route's action.
     pub edits: Option<Box<crate::ProxyEdits>>,
     children: Option<Level>,
 }
@@ -469,6 +469,8 @@ pub struct Proxy {
     /// An upstream status of 300 or more with an error page of the route
     /// gets the page (nginx proxy_intercept_errors).
     pub intercept: bool,
+    /// Upstream bytes read per second for one request. Zero: no limit.
+    pub limit_rate: u64,
 }
 
 /// proxy_next_upstream conditions.
@@ -896,6 +898,7 @@ fn proxy(p: &ir::ProxyAction) -> Proxy {
         next: NextOn::build(&p.next_upstream),
         tries: p.next_upstream_tries,
         intercept: p.intercept_errors,
+        limit_rate: p.limit_rate,
     }
 }
 
@@ -1600,11 +1603,21 @@ impl SiteBuilder<'_> {
                 .transpose()
                 .map_err(|(f, e)| self.err(format!("{at}.mirror.{f}"), e))?,
             edits: match route.action.as_ref().and_then(|a| a.kind.as_ref()) {
-                Some(action::Kind::Proxy(p)) => crate::edits::build(p, self.names)
-                    .map_err(|(f, e)| self.err(format!("{at}.action.proxy.{f}"), e))?
-                    .map(Box::new),
+                Some(action::Kind::Proxy(p)) => Some((p, "proxy")),
+                Some(action::Kind::Gateway(g)) => g.proxy.as_ref().map(|p| (p, "gateway.proxy")),
+                Some(action::Kind::Memcached(m)) => {
+                    m.proxy.as_ref().map(|p| (p, "memcached.proxy"))
+                }
+                Some(action::Kind::Grpc(g)) => g.proxy.as_ref().map(|p| (p, "grpc.proxy")),
                 _ => None,
-            },
+            }
+            .map(|(p, kind)| {
+                crate::edits::build(p, self.names)
+                    .map_err(|(f, e)| self.err(format!("{at}.action.{kind}.{f}"), e))
+            })
+            .transpose()?
+            .flatten()
+            .map(Box::new),
             children: None,
         })
     }

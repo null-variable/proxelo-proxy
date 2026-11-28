@@ -233,7 +233,7 @@ impl Conn {
         let pool = &ups.pools()[i];
         let mut up = match pool.take() {
             Some(c) => c,
-            None => match ups.connect(i, f.timeout).await {
+            None => match ups.connect(i, f.timeout, None).await {
                 Ok(s) => UpConn {
                     stream: s,
                     used: 0,

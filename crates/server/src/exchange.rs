@@ -96,6 +96,11 @@ pub(crate) struct Exchange {
     pub bandwidth: Option<proxelo_snapshot::Bandwidth>,
     /// Bytes written to the client so far, for the bandwidth limit.
     pub paced: u64,
+    /// Upstream body reads of the response being relayed (nginx
+    /// proxy_limit_rate); `rate` zero: no limit.
+    pub upstream_pace: proxelo_snapshot::Bandwidth,
+    pub upstream_read: u64,
+    pub upstream_since: std::time::Instant,
     /// The snapshot's lookup variables, set when the request starts.
     pub lookups: std::sync::Arc<[proxelo_snapshot::Lookup]>,
     /// Lookup values computed in this request: spans into `lookup_buf`,
@@ -129,6 +134,9 @@ pub(crate) struct Exchange {
     pub cache_cond: Vec<u8>,
     /// The upstream request goes out as GET (a cached HEAD).
     pub as_get_upstream: bool,
+    /// A HEAD went upstream as another method (nginx proxy_method): the
+    /// client gets the head only.
+    pub drop_upstream_body: bool,
     /// The Alt-Svc line every response of this connection carries; empty
     /// unless the listener serves HTTP/3.
     pub alt_svc: Vec<u8>,
@@ -212,6 +220,9 @@ impl Exchange {
             oidc_email: Vec::new(),
             bandwidth: None,
             paced: 0,
+            upstream_pace: proxelo_snapshot::Bandwidth { rate: 0, after: 0 },
+            upstream_read: 0,
+            upstream_since: std::time::Instant::now(),
             lookups: std::sync::Arc::from([]),
             lookup_vals: Vec::new(),
             lookup_buf: Vec::new(),
@@ -229,6 +240,7 @@ impl Exchange {
             slice_range: Vec::new(),
             cache_cond: Vec::new(),
             as_get_upstream: false,
+            drop_upstream_body: false,
             alt_svc: Vec::new(),
             waf_rules: Vec::new(),
             filters: None,
@@ -299,6 +311,7 @@ impl Exchange {
         self.err_lines.clear();
         self.bandwidth = None;
         self.paced = 0;
+        self.upstream_pace.rate = 0;
         self.lookup_vals.clear();
         self.lookup_vals.resize(self.lookups.len(), None);
         self.lookup_buf.clear();
@@ -315,6 +328,7 @@ impl Exchange {
         self.error_paged = false;
         self.err_status = 0;
         self.as_get = false;
+        self.drop_upstream_body = false;
         self.paged = false;
         if !self.is_sub() {
             self.ssi = None;

@@ -916,10 +916,15 @@ pub(crate) enum ConnectError {
 impl State {
     /// Opens a connection to target `i`, with TLS when the upstream has it;
     /// `limit` bounds the TCP connect and the handshake together.
-    pub async fn connect(&self, i: usize, limit: Duration) -> Result<UpStream, ConnectError> {
+    pub async fn connect(
+        &self,
+        i: usize,
+        limit: Duration,
+        local: Option<SocketAddr>,
+    ) -> Result<UpStream, ConnectError> {
         let addr = self.pools[i].addr;
         let run = async {
-            let s = TcpStream::connect(addr)
+            let s = tcp_connect(addr, local)
                 .await
                 .map_err(|_| ConnectError::Failed)?;
             let _ = s.set_nodelay(true);
@@ -947,6 +952,28 @@ impl State {
             Err(_) => Err(ConnectError::TimedOut),
         }
     }
+}
+
+/// Connects to `addr` from `local` (nginx proxy_bind), or from an address
+/// the system chooses.
+pub(crate) async fn tcp_connect(
+    addr: SocketAddr,
+    local: Option<SocketAddr>,
+) -> std::io::Result<TcpStream> {
+    let Some(local) = local else {
+        return TcpStream::connect(addr).await;
+    };
+    let s = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    // A fixed port is shared by connections to different targets.
+    if local.port() != 0 {
+        s.set_reuseaddr(true)?;
+    }
+    s.bind(local)?;
+    s.connect(addr).await
 }
 
 /// An idle connection has nothing to read. EOF means the upstream closed it,

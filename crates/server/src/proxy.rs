@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use proxelo_http1::{Body, ChunkedDecoder, HeaderKind, Method, Version, parse_response, push_hex};
-use proxelo_snapshot::{Balancing, Proxy, Route, Sticky};
+use proxelo_snapshot::{Balancing, Proxy, ProxyEdits, Route, Sticky};
 use tokio::io::AsyncRead;
 use tokio::time::timeout;
 
@@ -107,7 +107,12 @@ impl Conn {
         // After the request went out, a retry is only safe when it can be
         // replayed: no body and a method that tolerates repetition, unless
         // the route allows non_idempotent.
-        let replayable = (self.x.req.body == Body::None || self.x.as_get)
+        let replayable = (self.x.req.body == Body::None
+            || self.x.as_get
+            || route
+                .edits
+                .as_deref()
+                .is_some_and(ProxyEdits::replaces_body))
             && (p.next.non_idempotent || idempotent(self.x.req.method));
         let started = Instant::now();
         let mut choice = Choice {
@@ -141,7 +146,14 @@ impl Conn {
             let connect = Instant::now();
             let mut up = match pool.take() {
                 Some(c) => c,
-                None => match ups.connect(i, p.connect_timeout).await {
+                None => match ups
+                    .connect(
+                        i,
+                        p.connect_timeout,
+                        crate::edits::bind(&mut self.x, route.edits.as_deref()),
+                    )
+                    .await
+                {
                     Ok(s) => UpConn {
                         stream: s,
                         used: 0,
@@ -170,10 +182,13 @@ impl Conn {
             };
             let reused = up.used > 0;
             self.x.sent.upstream_connect = Some(connect.elapsed().as_secs_f64());
-            self.upstream_head(pool.addr, &ups.host, ups.keepalive, route);
+            let head = self.upstream_head(pool.addr, &ups.host, ups.keepalive, route);
             let last =
                 !replayable || !ups.has_next(choice.tried) || (p.tries != 0 && tries >= p.tries);
-            match self.exchange(&mut up.stream, p, last).await {
+            match self
+                .exchange(&mut up.stream, p, route.edits.as_deref(), head, last)
+                .await
+            {
                 Ok(()) => {
                     let st = self.resp.status;
                     self.x.sent.upstream_status = st;
@@ -198,7 +213,7 @@ impl Conn {
                     let (relay, quiet) = match (route.cache.as_deref(), self.fill.as_deref()) {
                         (Some(c), Some(f)) => {
                             let silent = f.silent;
-                            (self.cache_head(c), silent)
+                            (self.cache_head(c, route), silent)
                         }
                         _ => (true, false),
                     };
@@ -214,7 +229,10 @@ impl Conn {
                         let r = self.body_store(&mut up.stream, p.read_timeout).await;
                         (self.x.req.keep_alive, r)
                     } else {
-                        self.relay(&mut up.stream, route, p.read_timeout).await
+                        self.pace_upstream(p.limit_rate);
+                        let r = self.relay(&mut up.stream, route, p.read_timeout).await;
+                        self.pace_upstream(0);
+                        r
                     };
                     if complete && self.resp.keep_alive && keep_up && self.ubuf.end == 0 {
                         pool.put(up);
@@ -362,14 +380,26 @@ impl Conn {
         host: &str,
         keepalive: bool,
         route: &Route,
-    ) {
+    ) -> bool {
+        let edits = route.edits.as_deref();
         let mut out = std::mem::take(&mut self.out);
         out.clear();
-        if self.x.as_get || self.x.as_get_upstream {
+        // A cached HEAD goes as GET; otherwise the route's method (nginx
+        // proxy_method), GET after an error page made it one, or the
+        // client's. A HEAD answered by a body-carrying method has its body
+        // dropped.
+        if self.x.as_get_upstream {
             out.extend_from_slice(b"GET");
-        } else {
-            out.extend_from_slice(self.x.req.method_span.get(&self.x.head));
+        } else if !crate::edits::method(&mut self.x, edits, &mut out) {
+            if self.x.as_get {
+                out.extend_from_slice(b"GET");
+            } else {
+                out.extend_from_slice(self.x.req.method_span.get(&self.x.head));
+            }
         }
+        let head = out == b"HEAD";
+        self.x.drop_upstream_body =
+            !head && !self.x.as_get_upstream && self.x.req.method == Method::Head;
         out.push(b' ');
         if self.x.uri_changed {
             reply::push_uri_path(&mut out, &self.x.path);
@@ -384,7 +414,13 @@ impl Conn {
         let ops = &route.request_headers;
         let has_host = ops.drops(b"host");
         let wasm = self.wasm_req.take();
-        for h in self.x.req.headers.iter() {
+        // The client's body goes on unless the route replaces it or an
+        // error page made the request a GET.
+        let set_body = edits.and_then(|e| e.body.as_ref());
+        let client_body = !self.x.as_get && !edits.is_some_and(ProxyEdits::replaces_body);
+        // nginx proxy_pass_request_headers off sends none of the client's.
+        let client_headers = !edits.is_some_and(|e| e.no_request_headers);
+        for h in self.x.req.headers.iter().filter(|_| client_headers) {
             // Expect is answered here, not by the upstream. A request an
             // error page turned into a GET has no body any more.
             let name = h.name.get(&self.x.head);
@@ -394,7 +430,7 @@ impl Conn {
                     .is_some_and(|(_, now)| !crate::wasm::has(now, name, h.value.get(&self.x.head)))
                 || h.kind == HeaderKind::Host
                 || h.kind == HeaderKind::Expect
-                || (self.x.as_get && h.kind == HeaderKind::ContentLength)
+                || (!client_body && h.kind == HeaderKind::ContentLength)
                 || (!ops.is_empty() && ops.drops(name))
                 || (self.fill.is_some() && crate::cache_serve::dropped_on_fill(name))
             {
@@ -428,14 +464,34 @@ impl Conn {
             out.extend_from_slice(&self.x.slice_range);
             out.extend_from_slice(b"\r\n");
         }
-        if self.x.req.body == Body::Chunked && !self.x.as_get {
-            out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+        if client_body {
+            match self.x.req.body {
+                Body::Chunked => out.extend_from_slice(b"Transfer-Encoding: chunked\r\n"),
+                // Without the client's headers its length still frames the
+                // body that follows.
+                Body::Length(n) if !client_headers => {
+                    out.extend_from_slice(b"Content-Length: ");
+                    proxelo_http1::push_u64(&mut out, n);
+                    out.extend_from_slice(b"\r\n");
+                }
+                _ => {}
+            }
         }
         if !keepalive {
             out.extend_from_slice(b"Connection: close\r\n");
         }
+        // nginx proxy_set_body: the expansion with its length.
+        let mut body = Vec::new();
+        if let Some(t) = set_body {
+            crate::vars::expand_into(&mut self.x, t, &mut body, None);
+            out.extend_from_slice(b"Content-Length: ");
+            proxelo_http1::push_u64(&mut out, body.len() as u64);
+            out.extend_from_slice(b"\r\n");
+        }
         out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(&body);
         self.out = out;
+        head
     }
 
     /// Sends the head in `out` and the body, then reads the response head
@@ -446,6 +502,8 @@ impl Conn {
         &mut self,
         up: &mut UpStream,
         p: &Proxy,
+        edits: Option<&ProxyEdits>,
+        head: bool,
         last: bool,
     ) -> Result<(), Result<Retry, Fail>> {
         write_timeout(up, &self.out, p.send_timeout)
@@ -461,11 +519,14 @@ impl Conn {
             .map_err(|_| Err(Fail::Client))?;
             self.x.req.expect_continue = false;
         }
-        self.pump_body(crate::conn::Sink::Upstream(up, p.send_timeout))
-            .await
-            .map_err(Err)?;
+        // A body the route replaces is read and dropped.
+        let sink = if edits.is_some_and(ProxyEdits::replaces_body) {
+            crate::conn::Sink::Drop
+        } else {
+            crate::conn::Sink::Upstream(up, p.send_timeout)
+        };
+        self.pump_body(sink).await.map_err(Err)?;
 
-        let head = self.x.req.method == Method::Head && !self.x.as_get_upstream;
         self.ubuf.end = 0;
         loop {
             if self.ubuf.end > 0
@@ -536,6 +597,8 @@ impl Conn {
             Err(st) => return (self.page(st).await, false),
         };
         let ops = &route.response_headers;
+        let edits = route.edits.as_deref();
+        let passed = |name: &[u8]| edits.is_some_and(|e| e.passes(name));
         if ops.is_empty() {
             self.x.reset_extra();
         } else {
@@ -555,20 +618,33 @@ impl Conn {
         let ctype = plan.ctype.take();
         let out = &mut self.out;
         out.clear();
-        if self.x.err_status != 0 {
-            reply::start(out, self.x.err_status, b"");
+        let status_line = if self.x.err_status != 0 {
+            (self.x.err_status, &b""[..])
         } else {
-            reply::start(out, self.resp.status, self.resp.reason.get(&self.ubuf.data));
-        }
+            (self.resp.status, self.resp.reason.get(&self.ubuf.data))
+        };
+        // A passed Date or Server replaces the proxy's own.
+        let own = |kind: HeaderKind, name: &[u8]| {
+            if !passed(name) {
+                return None;
+            }
+            let h = self.resp.headers.iter().find(|h| h.kind == kind)?;
+            Some(h.value.get(&self.ubuf.data))
+        };
+        reply::start_with(
+            out,
+            status_line.0,
+            status_line.1,
+            own(HeaderKind::Server, b"server"),
+            own(HeaderKind::Date, b"date"),
+        );
         for h in self.resp.headers.iter() {
             // nginx hides Date, Server, X-Pad and X-Accel-* by default and
             // sets its own Date and Server.
             let name = h.name.get(&self.ubuf.data);
             if h.kind.is_hop_by_hop()
-                || matches!(
-                    h.kind,
-                    HeaderKind::Date | HeaderKind::Server | HeaderKind::Internal
-                )
+                || matches!(h.kind, HeaderKind::Date | HeaderKind::Server)
+                || (h.kind == HeaderKind::Internal && !passed(name))
                 || (!ops.is_empty() && ops.drops(name))
                 || wasm.as_ref().is_some_and(|(_, now)| {
                     !crate::wasm::has(now, name, h.value.get(&self.ubuf.data))
@@ -646,7 +722,8 @@ impl Conn {
         self.x.sent.bytes = 0;
         let head_bytes = out.len() as u64;
 
-        let head_only = self.fill.as_deref().is_some_and(|f| f.head_only);
+        let head_only =
+            self.x.drop_upstream_body || self.fill.as_deref().is_some_and(|f| f.head_only);
         let complete = match coder.take() {
             // A HEAD fetched as GET: the client gets the head, the store
             // the body.
@@ -818,7 +895,7 @@ impl Conn {
             if self.out.len() >= BODY_BUF && self.flush().await.is_err() {
                 break Err(());
             }
-            match read(up, &mut self.ubuf, BODY_BUF, t).await {
+            match self.read_upstream(up, BODY_BUF, t).await {
                 Ok(0) if matches!(mode, Mode::Encode | Mode::Raw) => break Ok(false),
                 Ok(0) | Err(_) => {
                     let _ = self.flush().await;
@@ -950,7 +1027,7 @@ impl Conn {
                 }
                 _ => BODY_BUF,
             };
-            match read(up, &mut self.ubuf, max, t).await {
+            match self.read_upstream(up, max, t).await {
                 Ok(0) if matches!(mode, Mode::Encode | Mode::Raw) => {
                     if mode == Mode::Encode {
                         self.out.extend_from_slice(b"0\r\n\r\n");
@@ -967,6 +1044,34 @@ impl Conn {
                 Ok(_) => {}
             }
         }
+    }
+
+    /// Reads more of the upstream body into `ubuf`, then waits as long as
+    /// the route's limit_rate asks: the bytes read so far may be at most a
+    /// second's worth more than the time since the body started allows, as
+    /// nginx's event pipe counts them.
+    async fn read_upstream<S: AsyncRead + Unpin>(
+        &mut self,
+        up: &mut S,
+        max: usize,
+        t: Duration,
+    ) -> Result<usize, Fail> {
+        let n = read(up, &mut self.ubuf, max, t).await?;
+        let pace = self.x.upstream_pace;
+        if pace.rate != 0 {
+            let before = self.x.upstream_read;
+            self.x.upstream_read += n as u64;
+            crate::static_file::throttle(pace, before, self.x.upstream_read, self.x.upstream_since)
+                .await;
+        }
+        Ok(n)
+    }
+
+    /// Starts counting upstream body reads for proxy_limit_rate.
+    pub(crate) fn pace_upstream(&mut self, rate: u64) {
+        self.x.upstream_pace.rate = rate;
+        self.x.upstream_read = 0;
+        self.x.upstream_since = Instant::now();
     }
 
     /// Reads the upstream response body into the cache only: a background
@@ -1033,7 +1138,7 @@ impl Conn {
             if done {
                 return Ok(true);
             }
-            match read(up, &mut self.ubuf, BODY_BUF, t).await {
+            match self.read_upstream(up, BODY_BUF, t).await {
                 Ok(0) if matches!(mode, Mode::Encode | Mode::Raw) => return Ok(false),
                 Ok(0) | Err(_) => return Err(()),
                 Ok(_) => {}

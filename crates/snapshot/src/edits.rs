@@ -1,21 +1,46 @@
-//! The runtime form of nginx proxy_redirect, proxy_cookie_domain,
-//! proxy_cookie_path and proxy_cookie_flags.
+//! The runtime form of the per-route upstream request and response edits:
+//! nginx proxy_redirect, proxy_cookie_*, proxy_pass_header, proxy_method,
+//! proxy_set_body, proxy_pass_request_headers, proxy_pass_request_body and
+//! proxy_bind.
 
 use proxelo_api::snapshot::v1::{self as ir, header_rewrite::Kind};
 
 use crate::runtime::Pattern;
 use crate::template::Template;
 
-/// Upstream response header edits of a proxy route.
+/// Upstream request and response edits of a route's proxy, gateway,
+/// memcached or grpc action.
 #[derive(Debug, Default)]
 pub struct ProxyEdits {
     pub redirects: Box<[HeaderRewrite]>,
     pub cookie_domains: Box<[HeaderRewrite]>,
     pub cookie_paths: Box<[HeaderRewrite]>,
     pub cookie_flags: Box<[CookieFlags]>,
+    /// Hidden upstream response headers passed on, lowercase.
+    pub pass_headers: Box<[Box<[u8]>]>,
+    /// The upstream method; `None`: the client's.
+    pub method: Option<Template>,
+    /// The upstream request body in place of the client's.
+    pub body: Option<Template>,
+    pub no_request_headers: bool,
+    pub no_request_body: bool,
+    /// The local address of upstream connections.
+    pub bind: Option<Template>,
 }
 
 impl ProxyEdits {
+    /// Whether the hidden response header `name` is passed on.
+    pub fn passes(&self, name: &[u8]) -> bool {
+        self.pass_headers
+            .iter()
+            .any(|p| name.eq_ignore_ascii_case(p))
+    }
+
+    /// Whether the client's request body is not sent upstream.
+    pub fn replaces_body(&self) -> bool {
+        self.body.is_some() || self.no_request_body
+    }
+
     pub fn cookies(&self) -> bool {
         !self.cookie_domains.is_empty()
             || !self.cookie_paths.is_empty()
@@ -64,6 +89,12 @@ pub(crate) fn build(
         && p.cookie_domains.is_empty()
         && p.cookie_paths.is_empty()
         && p.cookie_flags.is_empty()
+        && p.pass_headers.is_empty()
+        && p.method.is_empty()
+        && p.body.is_none()
+        && !p.no_request_headers
+        && !p.no_request_body
+        && p.bind.is_empty()
     {
         return Ok(None);
     }
@@ -133,11 +164,26 @@ pub(crate) fn build(
             Ok(CookieFlags { cookie, flags })
         })
         .collect::<Result<_, Invalid>>()?;
+    let optional = |s: &str, f: &str| (!s.is_empty()).then(|| tmpl(s, f.into())).transpose();
     Ok(Some(ProxyEdits {
         redirects: rules(&p.redirects, "redirects", false)?,
         cookie_domains: rules(&p.cookie_domains, "cookie_domains", true)?,
         cookie_paths: rules(&p.cookie_paths, "cookie_paths", false)?,
         cookie_flags,
+        pass_headers: p
+            .pass_headers
+            .iter()
+            .map(|h| h.to_ascii_lowercase().into_bytes().into())
+            .collect(),
+        method: optional(&p.method, "method")?,
+        body: p
+            .body
+            .as_deref()
+            .map(|b| tmpl(b, "body".into()))
+            .transpose()?,
+        no_request_headers: p.no_request_headers,
+        no_request_body: p.no_request_body,
+        bind: optional(&p.bind, "bind")?,
     }))
 }
 
@@ -183,6 +229,24 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(build(&bad, &[]).unwrap_err().0, "cookie_paths[0].kind");
+        let bad = ir::ProxyAction {
+            bind: "$nope".into(),
+            ..Default::default()
+        };
+        assert_eq!(build(&bad, &[]).unwrap_err().0, "bind");
         assert!(build(&ir::ProxyAction::default(), &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn request_edits() {
+        let p = ir::ProxyAction {
+            pass_headers: vec!["X-Accel-Redirect".into()],
+            body: Some(String::new()),
+            ..Default::default()
+        };
+        let e = build(&p, &[]).unwrap().unwrap();
+        assert!(e.passes(b"x-accel-REDIRECT") && !e.passes(b"server"));
+        // An empty body is a body: the client's is still replaced.
+        assert!(e.replaces_body() && e.method.is_none() && !e.cookies());
     }
 }

@@ -294,7 +294,7 @@ async fn connect<'a>(
         let i = picked.index;
         x.sent.upstream_addr = Some(ups.pools()[i].addr);
         let started = Instant::now();
-        match ups.connect(i, s.connect_timeout).await {
+        match ups.connect(i, s.connect_timeout, None).await {
             Ok(up) => {
                 x.sent.upstream_connect = Some(started.elapsed().as_secs_f64());
                 ups.succeeded(i);

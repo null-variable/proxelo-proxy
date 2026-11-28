@@ -1,5 +1,8 @@
 //! nginx proxy_redirect, proxy_cookie_domain, proxy_cookie_path and
-//! proxy_cookie_flags on upstream response headers.
+//! proxy_cookie_flags on upstream response headers, and proxy_bind and
+//! proxy_method on the upstream request.
+
+use std::net::{IpAddr, SocketAddr};
 
 use proxelo_snapshot::{CookieName, HeaderRewrite, MatchError, ProxyEdits, RewriteMatch};
 
@@ -40,6 +43,53 @@ pub(crate) fn push_line(
         out.extend_from_slice(value);
     }
     out.extend_from_slice(b"\r\n");
+}
+
+/// The local address of an upstream connection (nginx proxy_bind): `None`
+/// when the route has none or its expansion is empty or not an address,
+/// which nginx logs and connects without.
+pub(crate) fn bind(x: &mut Exchange, e: Option<&ProxyEdits>) -> Option<SocketAddr> {
+    let t = e?.bind.as_ref()?;
+    let mut out = std::mem::take(&mut x.tmpl);
+    out.clear();
+    expand_into(x, t, &mut out, None);
+    let addr = local_addr(&out);
+    if addr.is_none() && !out.is_empty() {
+        eprintln!(
+            "invalid local address \"{}\"",
+            String::from_utf8_lossy(&out)
+        );
+    }
+    x.tmpl = out;
+    addr
+}
+
+/// An IP address with an optional port, IPv6 in brackets with a port.
+fn local_addr(v: &[u8]) -> Option<SocketAddr> {
+    let s = std::str::from_utf8(v).ok()?;
+    s.parse::<SocketAddr>()
+        .ok()
+        .or_else(|| s.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, 0)))
+}
+
+/// Appends the upstream method (nginx proxy_method) when it expands to an
+/// HTTP token; `false` keeps the client's.
+pub(crate) fn method(x: &mut Exchange, e: Option<&ProxyEdits>, out: &mut Vec<u8>) -> bool {
+    let Some(t) = e.and_then(|e| e.method.as_ref()) else {
+        return false;
+    };
+    let start = out.len();
+    expand_into(x, t, out, None);
+    let ok = out.len() > start && out[start..].iter().all(|&c| is_tchar(c));
+    if !ok {
+        out.truncate(start);
+    }
+    ok
+}
+
+/// RFC 9110 §5.6.2 tchar.
+fn is_tchar(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)
 }
 
 fn edit(
@@ -319,6 +369,16 @@ fn edit_flags(attrs: &mut Vec<Attr<'_>>, mut f: u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_addrs() {
+        assert_eq!(local_addr(b"10.0.0.1"), "10.0.0.1:0".parse().ok());
+        assert_eq!(local_addr(b"10.0.0.1:4000"), "10.0.0.1:4000".parse().ok());
+        assert_eq!(local_addr(b"[::1]:5"), "[::1]:5".parse().ok());
+        assert_eq!(local_addr(b"::1"), "[::1]:0".parse().ok());
+        assert_eq!(local_addr(b"localhost"), None);
+        assert_eq!(local_addr(b""), None);
+    }
 
     fn rebuilt(v: &[u8], f: u8) -> String {
         let mut attrs = parse(v);

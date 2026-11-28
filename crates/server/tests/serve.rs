@@ -1175,3 +1175,158 @@ fn proxy_header_edits() {
     assert_eq!(status(&h), 404, "{h}");
     assert_eq!(b, b"nope");
 }
+
+/// nginx proxy_method, proxy_set_body, proxy_pass_request_headers,
+/// proxy_pass_request_body, proxy_pass_header, proxy_bind and
+/// proxy_limit_rate.
+#[test]
+fn proxy_request_edits() {
+    use path_match::Kind::Prefix;
+    let (rec, seen) = recorder();
+    let hidden = canned(
+        concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Server: backend/1\r\n",
+            "Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n",
+            "X-Accel-Redirect: /kept\r\n",
+            "X-Accel-Buffering: no\r\n",
+            "Content-Length: 2\r\n\r\nok",
+        )
+        .as_bytes(),
+    );
+    let big = canned(
+        Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 40000\r\n\r\n{}",
+                "x".repeat(40000)
+            )
+            .into_boxed_str(),
+        )
+        .as_bytes(),
+    );
+    let with = |path: &str, up: u32, f: &dyn Fn(&mut ProxyAction)| {
+        let mut r = route(Prefix, path, proxy(up));
+        if let Some(Action {
+            kind: Some(action::Kind::Proxy(p)),
+        }) = &mut r.action
+        {
+            f(p);
+        }
+        r
+    };
+    let routes = vec![
+        with("/method/", 0, &|p| p.method = "PUT".into()),
+        with("/body/", 0, &|p| {
+            p.method = "$arg_m".into();
+            p.body = Some("uri=$uri".into());
+        }),
+        with("/bare/", 0, &|p| {
+            p.no_request_headers = true;
+            p.no_request_body = true;
+        }),
+        with("/noheaders/", 0, &|p| p.no_request_headers = true),
+        with("/bind/", 0, &|p| p.bind = "127.0.0.1".into()),
+        with("/badbind/", 0, &|p| p.bind = "$arg_b".into()),
+        with("/hidden/", 1, &|_| {}),
+        with("/passed/", 1, &|p| {
+            p.pass_headers = vec!["x-accel-redirect".into(), "server".into(), "date".into()];
+        }),
+        with("/slow/", 2, &|p| p.limit_rate = 10_000),
+    ];
+    let (_, addr) = start(&snapshot(
+        routes,
+        vec![
+            upstream(&[rec], 0),
+            upstream(&[hidden], 0),
+            upstream(&[big], 0),
+        ],
+    ));
+    let host = "Host: example.com\r\n";
+    let recv = || seen.recv_timeout(Duration::from_secs(5)).unwrap();
+
+    let (h, _) = get(
+        addr,
+        &format!("POST /method/x HTTP/1.1\r\n{host}X-A: 1\r\nContent-Length: 3\r\n\r\nabc"),
+    );
+    assert_eq!(status(&h), 200, "{h}");
+    let r = recv();
+    assert!(r.starts_with("PUT /method/x HTTP/1.1\r\n"), "{r}");
+    assert!(
+        r.contains("X-A: 1\r\n") && r.ends_with("\r\n\r\nabc"),
+        "{r}"
+    );
+
+    // The body is replaced and the client's is dropped; a method that
+    // expands to nothing keeps the client's.
+    let (h, _) = get(
+        addr,
+        &format!("POST /body/x?m=PATCH HTTP/1.1\r\n{host}Content-Length: 3\r\n\r\nabc"),
+    );
+    assert_eq!(status(&h), 200, "{h}");
+    let r = recv();
+    assert!(r.starts_with("PATCH /body/x?m=PATCH HTTP/1.1\r\n"), "{r}");
+    assert!(r.contains("Content-Length: 11\r\n"), "{r}");
+    assert!(!r.contains("Content-Length: 3"), "{r}");
+    assert!(r.ends_with("\r\n\r\nuri=/body/x"), "{r}");
+    let (h, _) = get(addr, &format!("GET /body/y HTTP/1.1\r\n{host}\r\n"));
+    assert_eq!(status(&h), 200, "{h}");
+    assert!(recv().starts_with("GET /body/y"));
+
+    let (h, _) = get(
+        addr,
+        &format!("POST /bare/x HTTP/1.1\r\n{host}X-A: 1\r\nContent-Length: 3\r\n\r\nabc"),
+    );
+    assert_eq!(status(&h), 200, "{h}");
+    let r = recv();
+    assert!(r.starts_with("POST /bare/x HTTP/1.1\r\n"), "{r}");
+    assert!(!r.contains("X-A") && !r.contains("Content-Length"), "{r}");
+    assert!(r.contains("Host: ") && r.ends_with("\r\n\r\n"), "{r}");
+
+    // Without the client's headers its body keeps its length.
+    let (h, _) = get(
+        addr,
+        &format!("POST /noheaders/x HTTP/1.1\r\n{host}X-A: 1\r\nContent-Length: 3\r\n\r\nabc"),
+    );
+    assert_eq!(status(&h), 200, "{h}");
+    let r = recv();
+    assert!(
+        !r.contains("X-A") && r.contains("Content-Length: 3\r\n"),
+        "{r}"
+    );
+    assert!(r.ends_with("\r\n\r\nabc"), "{r}");
+
+    // A valid local address and one that is not: both connect.
+    for path in ["/bind/x", "/badbind/x?b=nonsense", "/badbind/x"] {
+        let (h, _) = get(addr, &format!("GET {path} HTTP/1.1\r\n{host}\r\n"));
+        assert_eq!(status(&h), 200, "{path} {h}");
+        recv();
+    }
+
+    let (h, _) = get(addr, &format!("GET /hidden/ HTTP/1.1\r\n{host}\r\n"));
+    assert!(
+        h.contains("Server: proxelo\r\n") && !h.contains("backend"),
+        "{h}"
+    );
+    assert!(!h.contains("X-Accel") && !h.contains("2030"), "{h}");
+    let (h, _) = get(addr, &format!("GET /passed/ HTTP/1.1\r\n{host}\r\n"));
+    assert!(
+        h.contains("Server: backend/1\r\n") && !h.contains("proxelo"),
+        "{h}"
+    );
+    assert!(h.contains("Date: Tue, 01 Jan 2030 00:00:00 GMT\r\n"), "{h}");
+    assert_eq!(h.matches("Date: ").count(), 1, "{h}");
+    assert!(h.contains("X-Accel-Redirect: /kept\r\n"), "{h}");
+    assert!(!h.contains("X-Accel-Buffering"), "{h}");
+
+    // Past what came with the head, reads go at 10000 bytes a second
+    // after the first second's worth.
+    let t = std::time::Instant::now();
+    let (h, b) = get(addr, &format!("GET /slow/ HTTP/1.1\r\n{host}\r\n"));
+    assert_eq!(status(&h), 200, "{h}");
+    assert_eq!(b.len(), 40000);
+    assert!(
+        t.elapsed() >= Duration::from_millis(1000),
+        "{:?}",
+        t.elapsed()
+    );
+}

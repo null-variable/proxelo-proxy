@@ -14,7 +14,7 @@ use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
 use proxelo_http1::{HeaderKind, Method, parse_response, push_u64};
-use proxelo_snapshot::{Gateway, GatewayProtocol, Memcached, Proxy, Route};
+use proxelo_snapshot::{Gateway, GatewayProtocol, Memcached, Proxy, ProxyEdits, Route};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -22,7 +22,7 @@ use tokio::time::timeout;
 use crate::conn::{BodyLeft, CLIENT_BODY_TIMEOUT, Conn, Fail, KeepAlive, Sink, upstream_fail};
 use crate::io::write_timeout;
 use crate::proxy::{HEAD_BUF, idempotent, read};
-use crate::upstream::{Choice, Picked};
+use crate::upstream::{Choice, Picked, tcp_connect};
 use crate::vars::expand;
 use crate::{Active, reply};
 
@@ -310,6 +310,7 @@ impl Conn {
         choice: &mut Choice,
         tries: &mut u32,
         mut status: u16,
+        edits: Option<&ProxyEdits>,
     ) -> Result<(Picked<'a>, TcpStream, Instant), u16> {
         let ups = &active.upstreams[p.upstream as usize];
         let mut queue_deadline = None;
@@ -331,7 +332,8 @@ impl Conn {
             let addr = ups.pools()[i].addr;
             self.x.sent.upstream_addr = Some(addr);
             let started = Instant::now();
-            match timeout(p.connect_timeout, TcpStream::connect(addr)).await {
+            let local = crate::edits::bind(&mut self.x, edits);
+            match timeout(p.connect_timeout, tcp_connect(addr, local)).await {
                 Ok(Ok(s)) => {
                     let _ = s.set_nodelay(true);
                     self.x.sent.upstream_connect = Some(started.elapsed().as_secs_f64());
@@ -530,7 +532,14 @@ impl Conn {
         let mut status = 502;
         loop {
             let (picked, mut stream, started) = self
-                .connect(active, p, &mut choice, &mut tries, status)
+                .connect(
+                    active,
+                    p,
+                    &mut choice,
+                    &mut tries,
+                    status,
+                    route.edits.as_deref(),
+                )
                 .await?;
             let i = picked.index;
             let last =
@@ -579,7 +588,9 @@ impl Conn {
                         return Err(st);
                     }
                     self.sticky_cookie(active, p.upstream, i);
+                    self.pace_upstream(p.limit_rate);
                     let (keep, _) = self.relay(&mut up, route, p.read_timeout).await;
+                    self.pace_upstream(0);
                     self.x.sent.upstream_response = Some(started.elapsed().as_secs_f64());
                     active
                         .metrics
@@ -641,7 +652,14 @@ impl Conn {
         let mut status = 502;
         loop {
             let (picked, mut stream, started) = self
-                .connect(active, p, &mut choice, &mut tries, status)
+                .connect(
+                    active,
+                    p,
+                    &mut choice,
+                    &mut tries,
+                    status,
+                    route.edits.as_deref(),
+                )
                 .await?;
             let i = picked.index;
             let last = !ups.has_next(choice.tried) || (p.tries != 0 && tries >= p.tries);

@@ -69,18 +69,23 @@ pub(crate) fn dropped_on_fill(name: &[u8]) -> bool {
 }
 
 /// Response headers not stored: per-connection ones and those the proxy
-/// sets itself.
-fn stored_header(kind: HeaderKind, name: &[u8]) -> bool {
-    !(kind.is_hop_by_hop()
-        || matches!(
-            kind,
-            HeaderKind::Date
-                | HeaderKind::Server
-                | HeaderKind::Internal
-                | HeaderKind::ContentLength
-                | HeaderKind::TransferEncoding
-        )
-        || name.eq_ignore_ascii_case(b"set-cookie"))
+/// sets itself, unless the route passes them on (nginx proxy_pass_header).
+fn stored_header(kind: HeaderKind, name: &[u8], route: &Route) -> bool {
+    let passed = matches!(
+        kind,
+        HeaderKind::Date | HeaderKind::Server | HeaderKind::Internal
+    ) && route.edits.as_deref().is_some_and(|e| e.passes(name));
+    passed
+        || !(kind.is_hop_by_hop()
+            || matches!(
+                kind,
+                HeaderKind::Date
+                    | HeaderKind::Server
+                    | HeaderKind::Internal
+                    | HeaderKind::ContentLength
+                    | HeaderKind::TransferEncoding
+            )
+            || name.eq_ignore_ascii_case(b"set-cookie"))
 }
 
 impl Conn {
@@ -304,16 +309,16 @@ impl Conn {
     /// relayed. Returns false when it is not relayed: a stale or
     /// revalidated entry answers instead, and the upstream connection is not
     /// reused.
-    pub(crate) fn cache_head(&mut self, c: &Cache) -> bool {
+    pub(crate) fn cache_head(&mut self, c: &Cache, route: &Route) -> bool {
         let Some(mut fill) = self.fill.take() else {
             return true;
         };
-        let relay = self.decide_fill(&mut fill, c);
+        let relay = self.decide_fill(&mut fill, c, route);
         self.fill = Some(fill);
         relay
     }
 
-    fn decide_fill(&self, fill: &mut Fill, c: &Cache) -> bool {
+    fn decide_fill(&self, fill: &mut Fill, c: &Cache, route: &Route) -> bool {
         let status = self.resp.status;
         let now = now();
         let headers = self.resp_headers();
@@ -347,7 +352,7 @@ impl Conn {
         let mut head = Vec::with_capacity(512);
         for h in self.resp.headers.iter() {
             let name = h.name.get(data);
-            if stored_header(h.kind, name) {
+            if stored_header(h.kind, name, route) {
                 head.extend_from_slice(name);
                 head.extend_from_slice(b": ");
                 head.extend_from_slice(h.value.get(data));
@@ -419,10 +424,15 @@ impl Conn {
         let ops_extra = std::mem::take(&mut self.x.resp_extra);
         let out = &mut self.out;
         out.clear();
-        reply::start(out, status, b"");
+        // A stored Server or Date was passed on (nginx proxy_pass_header)
+        // and replaces the proxy's own.
+        reply::start_with(out, status, b"", e.header(b"server"), e.header(b"date"));
         for line in e.head.split_inclusive(|&c| c == b'\n') {
             let name = line.split(|&c| c == b':').next().unwrap_or_default();
-            if !ops.is_empty() && ops.drops(name) {
+            if (!ops.is_empty() && ops.drops(name))
+                || name.eq_ignore_ascii_case(b"server")
+                || name.eq_ignore_ascii_case(b"date")
+            {
                 continue;
             }
             let is = |n: &[u8]| name.eq_ignore_ascii_case(n);
