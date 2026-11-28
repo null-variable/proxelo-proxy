@@ -60,12 +60,12 @@ impl Conn {
         etag.push(b'-');
         push_hex(etag, len);
         etag.push(b'"');
-        let not_modified = match self.x.request_header(b"if-none-match") {
+        let not_modified = match self.x.main_header(b"if-none-match") {
             Some(v) => v == b"*" || v == &self.x.scratch[..],
-            None => self.x.request_header(b"if-modified-since") == Some(&modified[..]),
+            None => self.x.main_header(b"if-modified-since") == Some(&modified[..]),
         };
         // Ranges apply to a 200 only: not to a 304 or a page error_page set.
-        let ranges = match self.x.request_header(b"range") {
+        let ranges = match self.x.main_header(b"range") {
             Some(v) if !not_modified && self.x.err_status == 0 && self.if_range(&modified) => {
                 range::parse(v, len)
             }
@@ -445,7 +445,7 @@ impl Conn {
     /// nginx If-Range: a quoted value must equal the ETag, anything else the
     /// Last-Modified date; otherwise the whole file is sent.
     fn if_range(&self, modified: &[u8]) -> bool {
-        match self.x.request_header(b"if-range") {
+        match self.x.main_header(b"if-range") {
             None => true,
             Some(v) if v.len() >= 2 && v.ends_with(b"\"") => v == &self.x.scratch[..],
             Some(v) => v == modified,

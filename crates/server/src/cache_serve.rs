@@ -383,13 +383,13 @@ impl Conn {
         let etag = e.header(b"etag");
         let modified = e.header(b"last-modified");
         let not_modified = status == 200
-            && match self.x.request_header(b"if-none-match") {
+            && match self.x.main_header(b"if-none-match") {
                 Some(v) => v == b"*" || etag.is_some_and(|t| t == v),
                 None => {
-                    modified.is_some_and(|m| self.x.request_header(b"if-modified-since") == Some(m))
+                    modified.is_some_and(|m| self.x.main_header(b"if-modified-since") == Some(m))
                 }
             };
-        let ranges = match self.x.request_header(b"range") {
+        let ranges = match self.x.main_header(b"range") {
             Some(v) if status == 200 && !not_modified && self.cached_if_range(etag, modified) => {
                 range::parse(v, len)
             }
@@ -551,7 +551,7 @@ impl Conn {
 
     /// nginx If-Range against a cached response's validators.
     fn cached_if_range(&self, etag: Option<&[u8]>, modified: Option<&[u8]>) -> bool {
-        match self.x.request_header(b"if-range") {
+        match self.x.main_header(b"if-range") {
             None => true,
             Some(v) if v.ends_with(b"\"") => etag == Some(v),
             Some(v) => modified == Some(v),
@@ -574,7 +574,7 @@ impl Conn {
         // relative to the unknown length.
         let first = self
             .x
-            .request_header(b"range")
+            .main_header(b"range")
             .and_then(range_start)
             .map_or(0, |s| s / size);
         let (mut file, e) = self.slice(active, p, route, c, zone, first).await?;
@@ -591,7 +591,7 @@ impl Conn {
             return Err(502);
         }
         let etag: Option<Box<[u8]>> = e.header(b"etag").map(Box::from);
-        let ranges = match self.x.request_header(b"range") {
+        let ranges = match self.x.main_header(b"range") {
             Some(v) if self.cached_if_range(etag.as_deref(), e.header(b"last-modified")) => {
                 range::parse(v, total)
             }
@@ -599,7 +599,7 @@ impl Conn {
         };
         let not_modified = etag
             .as_deref()
-            .is_some_and(|t| self.x.request_header(b"if-none-match") == Some(t));
+            .is_some_and(|t| self.x.main_header(b"if-none-match") == Some(t));
         let (status, span) = match (ranges.answer, ranges.parts()) {
             _ if not_modified => (304, Span::default()),
             (Answer::Unsatisfiable, _) => (416, Span::default()),

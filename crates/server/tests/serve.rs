@@ -904,6 +904,18 @@ fn response_filters() {
         String::from_utf8(b).unwrap(),
         "part 2 |&lt;h1&gt;top&lt;/h1&gt;|[]|none"
     );
+    // A Range or validator of the page leaves the includes whole.
+    let (h, b) = get(
+        addr,
+        &format!(
+            "GET /ssi/page.html?who=ann HTTP/1.1\r\n{host}Range: bytes=0-1\r\nIf-Modified-Since: Thu, 01 Jan 2099 00:00:00 GMT\r\n\r\n"
+        ),
+    );
+    assert_eq!(status(&h), 200, "{h}");
+    assert_eq!(
+        String::from_utf8(dechunk(&b)).unwrap(),
+        "part 2 ann|&lt;h1&gt;top&lt;/h1&gt;|[ann]|a"
+    );
 }
 
 /// Accepts connections and sends each request head and body it reads down

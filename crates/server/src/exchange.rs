@@ -375,6 +375,16 @@ impl Exchange {
             .find(|h| h.name.get(&self.head).eq_ignore_ascii_case(name))
             .map(|h| h.value.get(&self.head))
     }
+
+    /// A Range or conditional request header as answered locally: never in
+    /// a subrequest, which nginx's range and not_modified filters skip.
+    pub(crate) fn main_header(&self, name: &[u8]) -> Option<&[u8]> {
+        if self.is_sub() {
+            None
+        } else {
+            self.request_header(name)
+        }
+    }
 }
 
 impl Facts for Exchange {

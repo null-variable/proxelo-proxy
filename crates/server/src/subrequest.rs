@@ -30,10 +30,11 @@ pub(crate) struct Reply {
 }
 
 /// Request headers a subrequest does not take from the main request: its
-/// own framing, and what would make it partial or conditional (nginx skips
-/// the range and not_modified filters for subrequests).
+/// own framing. Range and conditional headers go along, as nginx shares
+/// `headers_in`: they reach upstreams, and the handlers that answer them
+/// ignore them in subrequests (`Exchange::main_header`).
 fn skipped(name: &[u8]) -> bool {
-    const SKIP: [&[u8]; 13] = [
+    const SKIP: [&[u8]; 8] = [
         b"host",
         b"content-length",
         b"transfer-encoding",
@@ -42,14 +43,8 @@ fn skipped(name: &[u8]) -> bool {
         b"expect",
         b"te",
         b"upgrade",
-        b"range",
-        b"if-range",
-        b"if-none-match",
-        b"if-modified-since",
-        b"if-match",
     ];
     SKIP.iter().any(|s| name.eq_ignore_ascii_case(s))
-        || name.eq_ignore_ascii_case(b"if-unmodified-since")
 }
 
 /// Appends decoded `path` as a request target path: bytes with a meaning
@@ -232,16 +227,17 @@ mod tests {
     }
 
     #[test]
-    fn skips_framing_and_conditions() {
-        for n in [
-            &b"Host"[..],
-            b"content-length",
-            b"Range",
-            b"If-Unmodified-Since",
-        ] {
+    fn skips_framing() {
+        for n in [&b"Host"[..], b"content-length", b"Transfer-Encoding"] {
             assert!(skipped(n));
         }
-        assert!(!skipped(b"accept-encoding"));
-        assert!(!skipped(b"cookie"));
+        for n in [
+            &b"accept-encoding"[..],
+            b"cookie",
+            b"Range",
+            b"If-None-Match",
+        ] {
+            assert!(!skipped(n));
+        }
     }
 }
