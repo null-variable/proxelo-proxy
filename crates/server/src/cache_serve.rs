@@ -525,7 +525,9 @@ impl Conn {
             start: e.body_offset + span.start,
             end: e.body_offset + span.end,
         };
-        if file.seek(SeekFrom::Start(0)).is_err() || !self.send_span(&mut file, span).await {
+        if file.seek(SeekFrom::Start(0)).is_err()
+            || !self.send_span(&mut file, span, plan.table()).await
+        {
             return Some(false);
         }
         if !self.out.is_empty() {
@@ -690,7 +692,7 @@ impl Conn {
                 start: e.body_offset + from,
                 end: e.body_offset + to,
             };
-            if !self.send_span(&mut file, part).await {
+            if !self.send_span(&mut file, part, None).await {
                 return Ok(false);
             }
             n += 1;

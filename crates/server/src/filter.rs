@@ -152,11 +152,23 @@ pub(crate) struct Plan {
     /// addition: the filters whose before and after URIs wrap the body.
     addition: Option<Arc<Filters>>,
     ssi: Option<crate::ssi::Ssi>,
+    /// charset with a byte table and nothing else changing the body: its
+    /// length stays, so the body keeps its framing and ranges and each byte
+    /// is mapped on the way out (nginx keeps Content-Length then).
+    map: Option<Arc<Filters>>,
 }
 
 impl Plan {
     pub fn is_noop(&self) -> bool {
-        self.ctype.is_none() && !self.reframe
+        self.ctype.is_none() && !self.reframe && self.map.is_none()
+    }
+
+    /// The byte table to map the body through as it is sent.
+    pub fn table(&self) -> Option<&[u8; 256]> {
+        match self.map.as_ref()?.charset.as_ref()?.recode.as_ref()? {
+            Recode::Table(t) => Some(t),
+            _ => None,
+        }
     }
 
     /// What happens to the ETag when the body is also `encoded`.
@@ -181,7 +193,15 @@ impl Plan {
             gunzip,
             g: Vec::new(),
             sub: self.sub.take(),
-            recode: self.recode.take(),
+            // A body compressed after the filters goes through the chain,
+            // so a byte table it would have mapped in place maps it here.
+            recode: self.recode.take().or_else(|| {
+                self.map.take().map(|f| Recoder {
+                    f,
+                    saved: [0; 4],
+                    saved_len: 0,
+                })
+            }),
             addition: self.addition.take(),
             started: false,
             ssi: self.ssi.take(),
@@ -244,7 +264,24 @@ pub(crate) fn plan(
         p.reframe = true;
         p.weak = true;
     }
+    if p.recode.is_some() && !p.reframe {
+        match f.charset.as_ref().and_then(|c| c.recode.as_ref()) {
+            // A known length is kept; a body of unknown length is framed
+            // anew anyway, so the chain maps it.
+            Some(Recode::Table(_)) if length.is_some() => p.map = p.recode.take().map(|r| r.f),
+            _ => p.reframe = true,
+        }
+    }
     p
+}
+
+/// Maps `buf` through the charset byte table `t`.
+pub(crate) fn map_bytes(t: Option<&[u8; 256]>, buf: &mut [u8]) {
+    if let Some(t) = t {
+        for b in buf {
+            *b = t[usize::from(*b)];
+        }
+    }
 }
 
 /// nginx charset header filter.
@@ -279,12 +316,12 @@ fn charset(f: &Arc<Filters>, c: &Charset, status: u16, ct: &[u8], encoded: bool,
         if !src.eq_ignore_ascii_case(&c.source) || encoded || c.recode.is_none() {
             return;
         }
+        // plan() decides whether the body is reframed for it.
         p.recode = Some(Recoder {
             f: Arc::clone(f),
             saved: [0; 4],
             saved_len: 0,
         });
-        p.reframe = true;
     }
     p.ctype = Some(if redirect {
         t.base.to_vec()
@@ -667,6 +704,9 @@ impl crate::conn::Conn {
             return (body, false, false);
         }
         let head_only = self.x.req.method == proxelo_http1::Method::Head;
+        if !p.reframe {
+            map_bytes(p.table(), &mut self.out[head_end..]);
+        }
         let close = p.reframe && !head_only && !crate::compress::chunked_for(&self.x);
         let edit = Edit {
             ctype: p.ctype.as_deref(),

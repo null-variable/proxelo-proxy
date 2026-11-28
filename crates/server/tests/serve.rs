@@ -1014,3 +1014,75 @@ fn mirror() {
     assert_eq!(status(&h), 404, "{h}");
     assert!(seen.recv_timeout(Duration::from_millis(200)).is_err());
 }
+
+/// nginx charset with a byte table keeps the length: Content-Length, a
+/// strong ETag and ranges stay, and the bytes are mapped as they go out.
+#[test]
+fn charset_table() {
+    use path_match::Kind::Prefix;
+    use std::io::Read as _;
+    let root = std::env::temp_dir().join(format!("proxelo-charset-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.html"), b"ab\xc1\xc2cd").unwrap();
+    let mut table: Vec<u8> = (0..=255).collect();
+    table[0xc1] = 0xe1;
+    table[0xc2] = b'?';
+    let filters = ir::Filters {
+        charset: Some(ir::Charset {
+            charset: "windows-1251".into(),
+            source: "koi8-r".into(),
+            types: vec!["text/html".into()],
+            recode: Some(ir::charset::Recode::Table(table)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut plain = route(Prefix, "/", static_root(&root));
+    plain.filters = Some(filters.clone());
+    let mut gz = route(Prefix, "/gz/", static_root(&root));
+    gz.filters = Some(filters);
+    gz.rewrites = vec![ir::Rewrite {
+        regex: "^/gz/(.*)$".into(),
+        replacement: "/$1".into(),
+        flag: ir::rewrite::Flag::Break.into(),
+    }];
+    gz.compression = Some(ir::Compression {
+        encodings: vec![ir::compression::Encoding::Gzip.into()],
+        min_length: 1,
+        ..Default::default()
+    });
+    let (_, addr) = start(&snapshot(vec![plain, gz], vec![]));
+    let host = "Host: example.com\r\n";
+
+    let (h, b) = get(addr, &format!("GET /a.html HTTP/1.1\r\n{host}\r\n"));
+    assert_eq!(status(&h), 200, "{h}");
+    assert!(
+        h.contains("Content-Type: text/html; charset=windows-1251\r\n"),
+        "{h}"
+    );
+    assert!(
+        h.contains("Content-Length: 6\r\n") && h.contains("Accept-Ranges: bytes"),
+        "{h}"
+    );
+    assert!(h.contains("ETag: \""), "{h}");
+    assert_eq!(b, b"ab\xe1?cd");
+
+    let (h, b) = get(
+        addr,
+        &format!("GET /a.html HTTP/1.1\r\n{host}Range: bytes=2-3\r\n\r\n"),
+    );
+    assert_eq!(status(&h), 206, "{h}");
+    assert_eq!(b, b"\xe1?");
+
+    // Compressed after the filters: recoded on the way into the encoder.
+    let (h, b) = get(
+        addr,
+        &format!("GET /gz/a.html HTTP/1.1\r\n{host}Accept-Encoding: gzip\r\n\r\n"),
+    );
+    assert!(h.contains("Content-Encoding: gzip\r\n"), "{h}");
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(&dechunk(&b)[..])
+        .read_to_end(&mut out)
+        .unwrap();
+    assert_eq!(out, b"ab\xe1?cd");
+}

@@ -196,7 +196,7 @@ impl Conn {
             if boundary != 0 {
                 range::push_part_head(&mut self.out, boundary, mime, span, len);
             }
-            if !self.send_span(&mut file, span).await {
+            if !self.send_span(&mut file, span, plan.table()).await {
                 return false;
             }
         }
@@ -242,7 +242,10 @@ impl Conn {
         if !plan.drop_validators {
             out.extend_from_slice(b"Last-Modified: ");
             out.extend_from_slice(modified);
-            out.extend_from_slice(b"\r\nETag: W/");
+            out.extend_from_slice(b"\r\nETag: ");
+            if plan.etag(token.is_some()) == crate::filter::Etag::Weak {
+                out.extend_from_slice(b"W/");
+            }
             out.extend_from_slice(&self.x.scratch);
             out.extend_from_slice(b"\r\n");
         }
@@ -404,7 +407,14 @@ impl Conn {
     }
 
     /// Writes `out` followed by `span` of the file, leaving `out` empty.
-    pub(crate) async fn send_span(&mut self, file: &mut File, span: Span) -> bool {
+    /// Sends `span` of `file` after what `out` holds, mapped through the
+    /// charset byte table `map`.
+    pub(crate) async fn send_span(
+        &mut self,
+        file: &mut File,
+        span: Span,
+        map: Option<&[u8; 256]>,
+    ) -> bool {
         if file.seek(SeekFrom::Start(span.start)).is_err() {
             return false;
         }
@@ -425,6 +435,7 @@ impl Conn {
                 _ => return false,
             };
             self.out.truncate(start + n);
+            crate::filter::map_bytes(map, &mut self.out[start..]);
             left -= n as u64;
             if write_timeout(&mut self.client, &self.out, SEND_TIMEOUT)
                 .await
@@ -515,7 +526,10 @@ impl Conn {
             return false;
         }
         self.out.extend_from_slice(HEADER);
-        if !self.send_span(&mut file, Span { start, end: len }).await {
+        if !self
+            .send_span(&mut file, Span { start, end: len }, None)
+            .await
+        {
             return false;
         }
         keep

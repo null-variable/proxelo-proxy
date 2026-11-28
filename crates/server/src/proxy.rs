@@ -632,7 +632,7 @@ impl Conn {
                 self.body_coded(up, mode, read_timeout, chain, client_chunked)
                     .await
             }
-            _ => self.body_out(up, mode, read_timeout).await,
+            _ => self.body_out(up, mode, read_timeout, plan.table()).await,
         };
         self.x.sent.body_bytes = self.x.sent.bytes.saturating_sub(head_bytes);
         self.fill_done = complete.is_ok();
@@ -834,11 +834,14 @@ impl Conn {
     /// Streams the response body. Returns whether the upstream connection is
     /// at a message boundary afterwards. `Err` means the client connection
     /// must close.
+    /// A body of known length is mapped through the charset byte table
+    /// `map` (the plan maps no other).
     async fn body_out<S: AsyncRead + Unpin>(
         &mut self,
         up: &mut S,
         mode: Mode,
         t: Duration,
+        map: Option<&[u8; 256]>,
     ) -> Result<bool, ()> {
         let mut left = match mode {
             Mode::Length(n) => n,
@@ -851,7 +854,9 @@ impl Conn {
                 Mode::None => true,
                 Mode::Length(_) => {
                     let take = left.min(self.ubuf.end as u64) as usize;
+                    let at = self.out.len();
                     self.out.extend_from_slice(&self.ubuf.data[..take]);
+                    crate::filter::map_bytes(map, &mut self.out[at..]);
                     if let Some(f) = &mut self.fill {
                         f.tee(&self.ubuf.data[..take]);
                     }
